@@ -1,0 +1,6 @@
+{
+  "name": "ChromaGrade",
+  "description": "Academic department operations, PostgreSQL backend, WhatsApp-style community messaging, dual-camera timetable attendance verification, HOD approval workflow, and document-based roster management portal.",
+  "requestFramePermissions": ["camera", "microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

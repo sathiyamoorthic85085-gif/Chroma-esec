@@ -1,0 +1,802 @@
+import { type FormEvent, useEffect, useState } from 'react';
+import { signInWithPopup } from 'firebase/auth';
+import { CheckCircle2, Clock, Mail, ShieldCheck, UserPlus } from 'lucide-react';
+import { ApiError, api } from '../lib/api';
+import { auth, googleAuthProvider } from '../lib/firebase';
+import {
+  ROLE_LABELS,
+  type BootstrapStatus,
+  type ServerTimePayload,
+  type UserProfile,
+  type UserRole,
+} from '../types';
+import { ChromaGradeMark } from './ChromaGradeMark';
+import { OfflineIndicator } from './OfflineIndicator';
+import { PWAInstallButton } from './PWAInstallButton';
+
+const CAMPUS_IMAGE_URL = '/src/assets/images/chromagrade_campus_atrium_1795283295260.jpg';
+
+interface AuthPortalProps {
+  serverTime: ServerTimePayload | null;
+  displayTime: string;
+  onAuthenticated: (token: string, user: UserProfile) => void;
+}
+
+type AuthMode = 'login' | 'register' | 'setup_hod' | 'check_status';
+
+export function AuthPortal({
+  serverTime,
+  displayTime,
+  onAuthenticated,
+}: AuthPortalProps) {
+  const [bootstrap, setBootstrap] = useState<BootstrapStatus | null>(null);
+  const [mode, setMode] = useState<AuthMode>('login');
+  const [imageError, setImageError] = useState(false);
+
+  // Login form state
+  const [loginEmail, setLoginEmail] = useState('');
+  const [loginPassword, setLoginPassword] = useState('');
+
+  // HOD First-Run Setup state
+  const [hodName, setHodName] = useState('');
+  const [hodEmail, setHodEmail] = useState('');
+  const [hodDepartment, setHodDepartment] = useState('Computer Science & Engineering');
+  const [hodPassword, setHodPassword] = useState('');
+
+  // Registration form state
+  const [regName, setRegName] = useState('');
+  const [regEmail, setRegEmail] = useState('');
+  const [regPassword, setRegPassword] = useState('');
+  const [regRole, setRegRole] = useState<UserRole>('class_advisor');
+  const [regDepartment, setRegDepartment] = useState('Computer Science & Engineering');
+  const [regId, setRegId] = useState('');
+  const [regYear, setRegYear] = useState('III Year');
+  const [regSection, setRegSection] = useState('A');
+  const [regPhone, setRegPhone] = useState('');
+
+  // Status check state
+  const [statusEmail, setStatusEmail] = useState('');
+  const [statusResult, setStatusResult] = useState<Awaited<
+    ReturnType<typeof api.checkRegistrationStatus>
+  > | null>(null);
+
+  const [submitting, setSubmitting] = useState(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [successMsg, setSuccessMsg] = useState<string | null>(null);
+
+  useEffect(() => {
+    api
+      .getBootstrapStatus()
+      .then((res) => {
+        setBootstrap(res);
+        setHodDepartment(res.departmentName);
+        setRegDepartment(res.departmentName);
+        if (!res.hodExists && !res.envPasscodeConfigured) {
+          setMode('setup_hod');
+        }
+      })
+      .catch(() => {
+        // Handled cleanly
+      });
+  }, []);
+
+  const needsClassFields =
+    regRole === 'student' || regRole === 'class_rep' || regRole === 'class_advisor';
+
+  const handleGoogleSignIn = async () => {
+    setErrorMsg(null);
+    setSuccessMsg(null);
+    setSubmitting(true);
+    try {
+      const cred = await signInWithPopup(auth, googleAuthProvider);
+      const idToken = await cred.user.getIdToken();
+      const res = await api.syncFirebaseLogin(idToken);
+      onAuthenticated(res.token, res.user);
+    } catch (err) {
+      if (err instanceof ApiError) {
+        setErrorMsg(err.message);
+      } else if (err instanceof Error && !err.message.includes('popup-closed-by-user')) {
+        setErrorMsg(err.message);
+      }
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleLogin = async (e: FormEvent) => {
+    e.preventDefault();
+    setErrorMsg(null);
+    setSuccessMsg(null);
+    setSubmitting(true);
+    try {
+      const res = await api.login(loginEmail, loginPassword);
+      onAuthenticated(res.token, res.user);
+    } catch (err) {
+      if (err instanceof ApiError) {
+        setErrorMsg(err.message);
+      } else {
+        setErrorMsg('Unable to sign in right now.');
+      }
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleBootstrapHod = async (e: FormEvent) => {
+    e.preventDefault();
+    setErrorMsg(null);
+    setSuccessMsg(null);
+    setSubmitting(true);
+    try {
+      const res = await api.bootstrapHod({
+        fullName: hodName,
+        email: hodEmail,
+        password: hodPassword,
+        department: hodDepartment,
+      });
+      onAuthenticated(res.token, res.user);
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Unable to initialize HOD account.');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleRegister = async (e: FormEvent) => {
+    e.preventDefault();
+    setErrorMsg(null);
+    setSuccessMsg(null);
+    setSubmitting(true);
+    try {
+      const res = await api.register({
+        fullName: regName,
+        email: regEmail,
+        password: regPassword,
+        role: regRole,
+        department: regDepartment,
+        staffOrRollId: regId,
+        yearOfStudy: needsClassFields ? regYear : '',
+        section: needsClassFields ? regSection : '',
+        phone: regPhone,
+      });
+      setSuccessMsg(res.message);
+      setStatusEmail(regEmail);
+      setRegName('');
+      setRegEmail('');
+      setRegPassword('');
+      setRegId('');
+      setRegPhone('');
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Registration failed.');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleStatusCheck = async (e: FormEvent) => {
+    e.preventDefault();
+    setErrorMsg(null);
+    setStatusResult(null);
+    setSubmitting(true);
+    try {
+      const res = await api.checkRegistrationStatus(statusEmail);
+      setStatusResult(res);
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Could not look up registration.');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const showHodSetupTab = bootstrap && !bootstrap.hodExists && !bootstrap.envPasscodeConfigured;
+
+  return (
+    <div className="min-h-screen bg-slate-50 grid grid-cols-1 lg:grid-cols-12 items-stretch">
+      {/* Left architectural showcase panel */}
+      <aside className="relative lg:col-span-5 bg-slate-900 text-white flex flex-col justify-between p-8 lg:p-12 overflow-hidden min-h-[280px]">
+        {!imageError && (
+          <img
+            src={CAMPUS_IMAGE_URL}
+            alt="Modern engineering department sunlit atrium"
+            referrerPolicy="no-referrer"
+            onError={() => setImageError(true)}
+            className="absolute inset-0 w-full h-full object-cover opacity-55"
+          />
+        )}
+        <div
+          className="absolute inset-0 bg-gradient-to-t from-slate-950/95 via-slate-900/75 to-slate-950/60"
+          aria-hidden="true"
+        />
+
+        <div className="relative z-10 flex items-center justify-between gap-3 pt-safe">
+          <ChromaGradeMark size="md" inverted />
+          <PWAInstallButton variant="inverted" />
+        </div>
+
+        <div className="relative z-10 my-10 space-y-5 max-w-md">
+          <h1 className="text-3xl lg:text-4xl font-semibold tracking-tight leading-tight text-white">
+            Department operations, communities, and dual-camera attendance.
+          </h1>
+          <p className="text-sm lg:text-base text-slate-200 leading-relaxed">
+            Built for Heads of Department, Class Advisors, Faculty, and Students. Document-only roster ingestion, real-time WhatsApp-style communities, and daily timetable attendance verified by live face and environment captures.
+          </p>
+        </div>
+
+        <div className="relative z-10 pt-6 border-t border-white/15 space-y-3">
+          <div className="flex items-center justify-between text-xs text-slate-300">
+            <span>Authoritative Server Clock</span>
+            <span className="font-mono tabular-nums text-slate-200">
+              {serverTime?.academicTimezone ?? 'Syncing...'}
+            </span>
+          </div>
+          <div className="flex items-baseline justify-between gap-4">
+            <span className="font-mono text-2xl font-medium tabular-nums text-white">
+              {displayTime}
+            </span>
+            <span className="text-xs text-slate-300 truncate">
+              {serverTime
+                ? serverTime.activePeriod
+                  ? `${serverTime.activePeriod.label} · ${serverTime.activePeriod.startTime}–${serverTime.activePeriod.endTime}`
+                  : serverTime.formattedDate
+                : 'Connecting to server time'}
+            </span>
+          </div>
+        </div>
+      </aside>
+
+      {/* Right authentication & registration panel */}
+      <main className="lg:col-span-7 flex flex-col justify-center px-5 py-8 sm:px-12 lg:px-16 bg-white pb-safe">
+        <OfflineIndicator />
+        <div className="w-full max-w-xl mx-auto">
+          <div className="flex flex-wrap items-center justify-between gap-4 pb-6 border-b border-slate-200">
+            <div>
+              <h2 className="text-2xl font-semibold tracking-tight text-slate-900">
+                {mode === 'setup_hod' && 'Initialize HOD Account'}
+                {mode === 'login' && 'Sign in to ChromaGrade'}
+                {mode === 'register' && 'Register for Portal Access'}
+                {mode === 'check_status' && 'Check Approval & Email Intimation'}
+              </h2>
+              <p className="mt-1 text-sm text-slate-600">
+                {mode === 'setup_hod' &&
+                  'Create the Head of Department account or sign in with Google to initialize the department.'}
+                {mode === 'login' &&
+                  'Sign in with Google or your approved institutional email and password.'}
+                {mode === 'register' &&
+                  'Submit your details for HOD approval. An email intimation confirms when you can sign in.'}
+                {mode === 'check_status' &&
+                  'Look up your registration approval status and read your approval email intimation.'}
+              </p>
+            </div>
+          </div>
+
+          {/* Interactive mode switcher */}
+          <div className="mt-6 flex flex-wrap items-center gap-1 p-1 bg-slate-100 rounded-lg">
+            {showHodSetupTab && (
+              <button
+                type="button"
+                onClick={() => {
+                  setMode('setup_hod');
+                  setErrorMsg(null);
+                  setSuccessMsg(null);
+                }}
+                className={`px-3.5 py-2 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
+                  mode === 'setup_hod'
+                    ? 'bg-white text-slate-900 shadow-sm'
+                    : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                Setup HOD
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => {
+                setMode('login');
+                setErrorMsg(null);
+                setSuccessMsg(null);
+              }}
+              className={`px-3.5 py-2 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
+                mode === 'login'
+                  ? 'bg-white text-slate-900 shadow-sm'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              Sign In
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setMode('register');
+                setErrorMsg(null);
+                setSuccessMsg(null);
+              }}
+              className={`px-3.5 py-2 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
+                mode === 'register'
+                  ? 'bg-white text-slate-900 shadow-sm'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              Register
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setMode('check_status');
+                setErrorMsg(null);
+                setSuccessMsg(null);
+              }}
+              className={`px-3.5 py-2 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
+                mode === 'check_status'
+                  ? 'bg-white text-slate-900 shadow-sm'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              Approval Status
+            </button>
+          </div>
+
+          {/* Google Sign-In option on Login & HOD Setup */}
+          {(mode === 'login' || mode === 'setup_hod') && (
+            <div className="mt-5">
+              <button
+                type="button"
+                disabled={submitting}
+                onClick={handleGoogleSignIn}
+                className="w-full flex items-center justify-center gap-2.5 px-4 py-2.5 text-sm font-medium text-slate-800 bg-white border border-slate-300 hover:bg-slate-50 disabled:opacity-60 rounded-lg transition-colors"
+              >
+                <svg className="w-4 h-4 shrink-0" viewBox="0 0 24 24" aria-hidden="true">
+                  <path
+                    fill="#4285F4"
+                    d="M23.745 12.27c0-.79-.07-1.54-.19-2.27h-11.3v4.51h6.47c-.29 1.48-1.14 2.73-2.4 3.58v3h3.86c2.26-2.09 3.56-5.17 3.56-8.82z"
+                  />
+                  <path
+                    fill="#34A853"
+                    d="M12.255 24c3.24 0 5.95-1.08 7.93-2.91l-3.86-3c-1.08.72-2.45 1.16-4.07 1.16-3.13 0-5.78-2.11-6.73-4.96h-3.98v3.09C3.515 21.3 7.615 24 12.255 24z"
+                  />
+                  <path
+                    fill="#FBBC05"
+                    d="M5.525 14.29c-.25-.72-.38-1.49-.38-2.29s.14-1.57.38-2.29V6.62h-3.98a11.86 11.86 0 0 0 0 10.76l3.98-3.09z"
+                  />
+                  <path
+                    fill="#EA4335"
+                    d="M12.255 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C18.205 1.19 15.495 0 12.255 0c-4.64 0-8.74 2.7-10.71 6.62l3.98 3.09c.95-2.85 3.6-4.96 6.73-4.96z"
+                  />
+                </svg>
+                <span>Continue with Google Account</span>
+              </button>
+              <div className="relative my-5">
+                <div className="absolute inset-0 flex items-center" aria-hidden="true">
+                  <div className="w-full border-t border-slate-200" />
+                </div>
+                <div className="relative flex justify-center text-xs">
+                  <span className="bg-white px-3 text-slate-400">or use institutional credentials</span>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {errorMsg && (
+            <div
+              role="alert"
+              className="mt-4 p-4 rounded-lg border border-red-200 bg-red-50 text-sm text-red-800"
+            >
+              {errorMsg}
+            </div>
+          )}
+
+          {successMsg && (
+            <div
+              role="status"
+              className="mt-4 p-4 rounded-lg border border-emerald-200 bg-emerald-50 text-sm text-emerald-900 space-y-2"
+            >
+              <div className="flex items-start gap-2.5">
+                <CheckCircle2 className="w-4 h-4 text-emerald-700 mt-0.5 shrink-0" />
+                <span>{successMsg}</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setMode('check_status');
+                  setSuccessMsg(null);
+                }}
+                className="text-xs font-medium text-emerald-800 underline underline-offset-2 hover:text-emerald-950"
+              >
+                Check approval status & email intimation
+              </button>
+            </div>
+          )}
+
+          {/* Setup HOD Form */}
+          {mode === 'setup_hod' && (
+            <form onSubmit={handleBootstrapHod} className="space-y-4">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                    HOD Full Name
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    value={hodName}
+                    onChange={(e) => setHodName(e.target.value)}
+                    placeholder="Dr. S. Ramanathan"
+                    className="w-full px-3.5 py-2.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-600/20 focus:border-indigo-600"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                    Department Name
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    value={hodDepartment}
+                    onChange={(e) => setHodDepartment(e.target.value)}
+                    className="w-full px-3.5 py-2.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-600/20 focus:border-indigo-600"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                  HOD Institutional Email
+                </label>
+                <input
+                  type="email"
+                  required
+                  value={hodEmail}
+                  onChange={(e) => setHodEmail(e.target.value)}
+                  placeholder="hod.cse@chromagrade.edu"
+                  className="w-full px-3.5 py-2.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-600/20 focus:border-indigo-600"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                  Choose HOD Password
+                </label>
+                <input
+                  type="password"
+                  required
+                  minLength={6}
+                  value={hodPassword}
+                  onChange={(e) => setHodPassword(e.target.value)}
+                  placeholder="Minimum 6 characters"
+                  className="w-full px-3.5 py-2.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-600/20 focus:border-indigo-600"
+                />
+              </div>
+
+              <div className="pt-2 flex flex-wrap items-center justify-between gap-3">
+                <button
+                  type="submit"
+                  disabled={submitting}
+                  className="inline-flex items-center justify-center gap-2 px-5 py-2.5 text-sm font-medium text-white bg-indigo-700 hover:bg-indigo-800 disabled:opacity-60 rounded-lg transition-colors whitespace-nowrap shrink-0"
+                >
+                  <ShieldCheck className="w-4 h-4" />
+                  {submitting ? 'Initializing...' : 'Create HOD Account & Enter'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setMode('register')}
+                  className="text-sm font-medium text-indigo-700 hover:text-indigo-900 whitespace-nowrap"
+                >
+                  Register as Staff or Student
+                </button>
+              </div>
+            </form>
+          )}
+
+          {/* Sign In Form */}
+          {mode === 'login' && (
+            <form onSubmit={handleLogin} className="space-y-4">
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                  Institutional Email
+                </label>
+                <input
+                  type="email"
+                  required
+                  value={loginEmail}
+                  onChange={(e) => setLoginEmail(e.target.value)}
+                  placeholder="name@chromagrade.edu"
+                  className="w-full px-3.5 py-2.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-600/20 focus:border-indigo-600"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                  Password
+                </label>
+                <input
+                  type="password"
+                  required
+                  value={loginPassword}
+                  onChange={(e) => setLoginPassword(e.target.value)}
+                  placeholder="Enter your password"
+                  className="w-full px-3.5 py-2.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-600/20 focus:border-indigo-600"
+                />
+              </div>
+
+              <div className="pt-2 flex flex-wrap items-center justify-between gap-3">
+                <button
+                  type="submit"
+                  disabled={submitting}
+                  className="px-6 py-2.5 text-sm font-medium text-white bg-indigo-700 hover:bg-indigo-800 disabled:opacity-60 rounded-lg transition-colors whitespace-nowrap shrink-0"
+                >
+                  {submitting ? 'Signing in...' : 'Sign In'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMode('register');
+                    setErrorMsg(null);
+                  }}
+                  className="inline-flex items-center gap-1.5 px-4 py-2.5 text-sm font-medium text-slate-700 border border-slate-300 hover:bg-slate-50 rounded-lg transition-colors whitespace-nowrap shrink-0"
+                >
+                  <UserPlus className="w-4 h-4" />
+                  Register New Account
+                </button>
+              </div>
+            </form>
+          )}
+
+          {/* Register Form */}
+          {mode === 'register' && (
+            <form onSubmit={handleRegister} className="mt-6 space-y-4">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                    Full Name
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    value={regName}
+                    onChange={(e) => setRegName(e.target.value)}
+                    placeholder="Prof. Arvind Narayanan"
+                    className="w-full px-3.5 py-2.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-600/20 focus:border-indigo-600"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                    Role
+                  </label>
+                  <select
+                    value={regRole}
+                    onChange={(e) => setRegRole(e.target.value as UserRole)}
+                    className="w-full px-3.5 py-2.5 text-sm border border-slate-300 rounded-lg bg-white focus:outline-none focus:ring-2 focus:ring-indigo-600/20 focus:border-indigo-600"
+                  >
+                    <option value="class_advisor">{ROLE_LABELS.class_advisor}</option>
+                    <option value="dept_staff">{ROLE_LABELS.dept_staff}</option>
+                    <option value="other_dept_staff">{ROLE_LABELS.other_dept_staff}</option>
+                    <option value="student">{ROLE_LABELS.student}</option>
+                    <option value="class_rep">{ROLE_LABELS.class_rep}</option>
+                  </select>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                    Email Address (for Approval Intimation)
+                  </label>
+                  <input
+                    type="email"
+                    required
+                    value={regEmail}
+                    onChange={(e) => setRegEmail(e.target.value)}
+                    placeholder="user@chromagrade.edu"
+                    className="w-full px-3.5 py-2.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-600/20 focus:border-indigo-600"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                    {regRole === 'student' || regRole === 'class_rep'
+                      ? 'Student Roll Number'
+                      : 'Employee ID'}
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    value={regId}
+                    onChange={(e) => setRegId(e.target.value)}
+                    placeholder={
+                      regRole === 'student' || regRole === 'class_rep'
+                        ? '22CSE019'
+                        : 'CSE-FAC-112'
+                    }
+                    className="w-full px-3.5 py-2.5 text-sm font-mono border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-600/20 focus:border-indigo-600"
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                    {regRole === 'other_dept_staff' ? 'Home Department' : 'Department'}
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    value={regDepartment}
+                    onChange={(e) => setRegDepartment(e.target.value)}
+                    placeholder="Computer Science & Engineering"
+                    className="w-full px-3.5 py-2.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-600/20 focus:border-indigo-600"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                    Phone Number
+                  </label>
+                  <input
+                    type="tel"
+                    value={regPhone}
+                    onChange={(e) => setRegPhone(e.target.value)}
+                    placeholder="+91 98401 00000"
+                    className="w-full px-3.5 py-2.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-600/20 focus:border-indigo-600"
+                  />
+                </div>
+              </div>
+
+              {needsClassFields && (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                      {regRole === 'class_advisor' ? 'Advising Year' : 'Year of Study'}
+                    </label>
+                    <select
+                      value={regYear}
+                      onChange={(e) => setRegYear(e.target.value)}
+                      className="w-full px-3.5 py-2.5 text-sm border border-slate-300 rounded-lg bg-white focus:outline-none focus:ring-2 focus:ring-indigo-600/20 focus:border-indigo-600"
+                    >
+                      <option value="I Year">I Year</option>
+                      <option value="II Year">II Year</option>
+                      <option value="III Year">III Year</option>
+                      <option value="IV Year">IV Year</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                      Section
+                    </label>
+                    <select
+                      value={regSection}
+                      onChange={(e) => setRegSection(e.target.value)}
+                      className="w-full px-3.5 py-2.5 text-sm border border-slate-300 rounded-lg bg-white focus:outline-none focus:ring-2 focus:ring-indigo-600/20 focus:border-indigo-600"
+                    >
+                      <option value="A">Section A</option>
+                      <option value="B">Section B</option>
+                      <option value="C">Section C</option>
+                    </select>
+                  </div>
+                </div>
+              )}
+
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                  Create Password
+                </label>
+                <input
+                  type="password"
+                  required
+                  minLength={6}
+                  value={regPassword}
+                  onChange={(e) => setRegPassword(e.target.value)}
+                  placeholder="Minimum 6 characters (used after HOD approval)"
+                  className="w-full px-3.5 py-2.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-600/20 focus:border-indigo-600"
+                />
+              </div>
+
+              <div className="pt-2 flex flex-wrap items-center justify-between gap-3">
+                <button
+                  type="submit"
+                  disabled={submitting}
+                  className="inline-flex items-center gap-2 px-5 py-2.5 text-sm font-medium text-white bg-indigo-700 hover:bg-indigo-800 disabled:opacity-60 rounded-lg transition-colors whitespace-nowrap shrink-0"
+                >
+                  <UserPlus className="w-4 h-4" />
+                  {submitting ? 'Submitting...' : 'Submit Registration for HOD Approval'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setMode('login')}
+                  className="text-sm font-medium text-slate-600 hover:text-slate-900 whitespace-nowrap"
+                >
+                  Back to Sign In
+                </button>
+              </div>
+            </form>
+          )}
+
+          {/* Check Approval Status & Email Intimation */}
+          {mode === 'check_status' && (
+            <div className="mt-6 space-y-5">
+              <form onSubmit={handleStatusCheck} className="flex flex-col sm:flex-row gap-3">
+                <input
+                  type="email"
+                  required
+                  value={statusEmail}
+                  onChange={(e) => setStatusEmail(e.target.value)}
+                  placeholder="Enter your registered email"
+                  className="flex-1 px-3.5 py-2.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-600/20 focus:border-indigo-600"
+                />
+                <button
+                  type="submit"
+                  disabled={submitting}
+                  className="px-5 py-2.5 text-sm font-medium text-white bg-slate-900 hover:bg-slate-800 disabled:opacity-60 rounded-lg transition-colors whitespace-nowrap shrink-0"
+                >
+                  {submitting ? 'Checking...' : 'Check Status'}
+                </button>
+              </form>
+
+              {statusResult && (
+                <div className="border border-slate-200 rounded-lg p-5 space-y-4">
+                  <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-slate-100">
+                    <div>
+                      <p className="text-sm font-semibold text-slate-900">
+                        {statusResult.fullName}
+                      </p>
+                      <p className="text-xs text-slate-500">
+                        {ROLE_LABELS[statusResult.role]} · {statusResult.department}
+                      </p>
+                    </div>
+                    <div className="text-xs font-medium">
+                      {statusResult.status === 'approved' && (
+                        <span className="inline-flex items-center gap-1.5 text-emerald-700">
+                          <CheckCircle2 className="w-4 h-4" />
+                          Approved by {statusResult.approvedBy ?? 'HOD'}
+                        </span>
+                      )}
+                      {statusResult.status === 'pending' && (
+                        <span className="inline-flex items-center gap-1.5 text-amber-700">
+                          <Clock className="w-4 h-4" />
+                          Pending HOD Approval
+                        </span>
+                      )}
+                      {statusResult.status === 'rejected' && (
+                        <span className="text-red-700">Declined by HOD</span>
+                      )}
+                    </div>
+                  </div>
+
+                  {statusResult.intimation ? (
+                    <div className="space-y-2">
+                      <div className="flex items-center gap-2 text-xs font-medium text-slate-700">
+                        <Mail className="w-4 h-4 text-indigo-700" />
+                        <span>Approval Email Intimation Dispatched</span>
+                      </div>
+                      <p className="text-xs font-semibold text-slate-900">
+                        Subject: {statusResult.intimation.subject}
+                      </p>
+                      <pre className="text-xs text-slate-700 whitespace-pre-wrap font-sans bg-slate-50 border border-slate-200 rounded-md p-3.5 leading-relaxed">
+                        {statusResult.intimation.body}
+                      </pre>
+                      <div className="flex items-center justify-between pt-1">
+                        <span className="text-xs text-slate-500">
+                          {statusResult.intimation.deliveryDetail}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setLoginEmail(statusResult.email);
+                            setMode('login');
+                          }}
+                          className="text-xs font-medium text-indigo-700 hover:text-indigo-900 whitespace-nowrap"
+                        >
+                          Proceed to Sign In →
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <p className="text-xs text-slate-600 leading-relaxed">
+                      Once the Head of Department approves your request, an email intimation will appear here and allow you to sign in with your registered credentials.
+                    </p>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </main>
+    </div>
+  );
+}
