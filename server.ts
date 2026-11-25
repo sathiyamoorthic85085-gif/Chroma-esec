@@ -36,12 +36,17 @@ import {
   checkInAcademicGoalToday,
   commitDocumentRowsToDb,
   createAcademicCalendarEvent,
+  createBiometricUnlockRequest,
   createChatMessageInDb,
   createCommunityInDb,
+  createFacultyAlterationRequest,
   createFacultyDelayAlert,
   createOdLeaveRequest,
   createSession,
+  decideBiometricUnlockRequestInDb,
+  decideFacultyAlteration,
   decideOdLeaveRequest,
+  delegateHodRoleInDb,
   deleteAcademicCalendarEvent,
   deleteSession,
   deleteTimetableSlot,
@@ -49,9 +54,12 @@ import {
   enumerateDateRangeInclusive,
   evaluateSessionAttendanceStatus,
   findUserByEmail,
+  findUserByEmailOrIdentifier,
   findUserById,
+  findUserWithMetaById,
   generateSessionToken,
   getAcademicGoalForUser,
+  getActiveHodDelegation,
   getBatchComparisonAnalytics,
   getDepartmentalPerformanceSummary,
   getHodCount,
@@ -60,6 +68,7 @@ import {
   getOdLeaveRequestById,
   getPinnedLocationConfig,
   getPowerBoostEngagementSummary,
+  getSenderMetaLookup,
   getSetting,
   getStudentAchievements,
   getStudentBiometricProfile,
@@ -68,34 +77,46 @@ import {
   listAcademicCalendarEvents,
   listActiveApprovedOdLeaveForDate,
   listActivePowerBoostAlertsForUser,
+  listApprovedStaffForDelegation,
   listArchivalLogs,
   listAttendanceRecords,
   listAttendanceSummaryForMonth,
+  listBiometricUnlockRequests,
   listCommunitiesForUser,
   listDepartmentStaff,
   listDepartmentStudents,
   listEmailIntimations,
+  listFacultyAlterationsForUser,
   listFacultyDelayAlertsForUser,
   listGroupMessages,
+  listHodDirectoryRecords,
   listOdLeaveRequestsForUser,
   listOtherDepartmentStaff,
   listRegistrations,
   listStudentBiometricSummaries,
   listStudentUserIdsNeedingGoalNudge,
+  listSubstituteCandidates,
   listTimetableSlots,
   listUploadBatches,
+  listUsersBiometricLockStatus,
   mapChatMessageRow,
   mapUser,
   recordAttendanceRiskAlertIfNeeded,
+  registerAndLockUserFace,
+  restoreHodRoleInDb,
+  runAutoFacultyDelayScan,
   runDeduplicationSweep,
   saveOdLeaveFormConfig,
   savePinnedLocationConfig,
   saveTimetableSlot,
   setSetting,
+  setUserBiometricLockInDb,
+  setUserPasswordInDb,
   stopPowerBoostMessage,
   syncFirebaseUserToDb,
   updateCommunityInDb,
   updateFacultyDelayAlertStatus,
+  updateUserProfileInDb,
   updateUserTransitBuffer,
   upsertAcademicGoalForUser,
   upsertAttendanceRecord,
@@ -131,7 +152,51 @@ import type {
 } from './src/types.ts';
 
 const app = express();
+app.set('trust proxy', 1);
+app.disable('x-powered-by');
+
+app.use((_req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'camera=(self), microphone=(self), geolocation=(self)');
+  next();
+});
+
 app.use(express.json({ limit: '15mb' }));
+
+// Sliding-window auth rate limiter (per client IP + optional identifier so campus NAT doesn't lock out unrelated users)
+const AUTH_RATE_WINDOW_MS = 15 * 60 * 1000;
+const AUTH_RATE_MAX = 30;
+const authRateBuckets = new Map<string, number[]>();
+
+function buildAuthRateKey(req: express.Request): string {
+  const ip = req.ip || 'unknown';
+  const rawIdent = String(req.body?.email ?? req.body?.identifier ?? '').trim().toLowerCase();
+  return rawIdent ? `${ip}:${rawIdent}` : ip;
+}
+
+function clearAuthRateBucket(req: express.Request): void {
+  authRateBuckets.delete(buildAuthRateKey(req));
+}
+
+function authRateLimit(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction
+): void {
+  const key = buildAuthRateKey(req);
+  const now = Date.now();
+  const timestamps = (authRateBuckets.get(key) || []).filter((ts) => now - ts < AUTH_RATE_WINDOW_MS);
+  if (timestamps.length >= AUTH_RATE_MAX) {
+    res.status(429).json({
+      error: 'Too many authentication attempts. Please wait a few minutes and try again.',
+    });
+    return;
+  }
+  timestamps.push(now);
+  authRateBuckets.set(key, timestamps);
+  next();
+}
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -226,6 +291,27 @@ const ADVISOR_ALLOWED_MODULES: UploadModule[] = [
 // ============================================================
 // 1. Authoritative Server Time Endpoint
 // ============================================================
+app.get('/api/health', async (_req, res) => {
+  try {
+    await ensureBaselineData();
+    res.json({ ok: true, service: 'academia-esec', status: 'healthy' });
+  } catch (error) {
+    res.status(503).json({
+      ok: false,
+      service: 'academia-esec',
+      error: error instanceof Error ? error.message : 'Service unavailable',
+    });
+  }
+});
+
+app.get('/api/config/public', (_req, res) => {
+  const googleMapsApiKey =
+    process.env.GOOGLE_MAPS_API_KEY?.trim() ||
+    process.env.VITE_GOOGLE_MAPS_API_KEY?.trim() ||
+    '';
+  res.json({ googleMapsApiKey });
+});
+
 app.get('/api/server-time', async (_req, res) => {
   try {
     const tz = await getSetting('academic_timezone', 'Asia/Kolkata');
@@ -277,6 +363,7 @@ app.post('/api/auth/firebase-sync', async (req, res) => {
       uid: decoded.uid,
       email: decoded.email,
       displayName: decoded.name || decoded.email.split('@')[0],
+      photoUrl: decoded.picture,
     });
 
     if (syncedUser.status === 'pending') {
@@ -297,14 +384,20 @@ app.post('/api/auth/firebase-sync', async (req, res) => {
       return;
     }
 
-    res.json({ token, user: syncedUser });
+    const sessionToken = await createSession(syncedUser.id);
+    res.json({ token: sessionToken, user: syncedUser });
   } catch (error) {
     console.error('Firebase sync failed:', error);
-    res.status(401).json({ error: 'Could not verify Google Sign-In credentials.' });
+    const code = (error as { code?: string })?.code ?? '';
+    if (code === 'auth/id-token-expired' || code === 'auth/id-token-revoked') {
+      res.status(401).json({ error: 'Google Sign-In session expired. Please click Continue with Google Account again.' });
+      return;
+    }
+    res.status(401).json({ error: 'Could not verify Google Sign-In credentials. Ensure your Google account is authorized or sign in with your institutional email and password.' });
   }
 });
 
-app.post('/api/auth/bootstrap-hod', async (req, res) => {
+app.post('/api/auth/bootstrap-hod', authRateLimit, async (req, res) => {
   try {
     await ensureBaselineData();
     const envPasscode = process.env.HOD_ADMIN_PASSCODE?.trim();
@@ -393,7 +486,8 @@ app.post('/api/auth/bootstrap-hod', async (req, res) => {
     }
 
     const token = await createSession(created.id);
-    res.status(201).json({ token, user: mapUser(created) });
+    const enriched = (await findUserWithMetaById(created.id)) ?? mapUser(created);
+    res.status(201).json({ token, user: enriched });
   } catch (error) {
     console.error('Bootstrap HOD failed:', error);
     res.status(500).json({ error: 'Unable to initialize HOD account.' });
@@ -409,7 +503,7 @@ app.get('/api/auth/pinned-location', async (_req, res) => {
   }
 });
 
-app.post('/api/auth/register', async (req, res) => {
+app.post('/api/auth/register', authRateLimit, async (req, res) => {
   try {
     await ensureBaselineData();
     const fullName = String(req.body?.fullName ?? '').trim();
@@ -561,12 +655,18 @@ app.post('/api/auth/register', async (req, res) => {
         locationVerified,
         pinnedLocationLabel: pinnedLocation.label,
       });
+
+      await registerAndLockUserFace({
+        userId: created.id,
+        faceImageData,
+      });
     }
 
+    const enrichedCreated = (await findUserWithMetaById(created.id)) ?? mapUser(created);
     res.status(201).json({
-      user: mapUser(created),
+      user: enrichedCreated,
       message: isStudentRole
-        ? 'Registration submitted! Your student record, live face baseline, and verified classroom environment photo are saved. Once the HOD approves your account, an email intimation will notify you to sign in.'
+        ? 'Registration submitted! Your student record, live face baseline, and verified classroom environment photo are saved and locked. Once the HOD approves your account, an email intimation will notify you to sign in.'
         : 'Registration submitted. Once the HOD approves your request, an email intimation will notify you to sign in with your registered credentials.',
     });
   } catch (error) {
@@ -575,21 +675,22 @@ app.post('/api/auth/register', async (req, res) => {
   }
 });
 
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', authRateLimit, async (req, res) => {
   try {
     await ensureBaselineData();
-    const email = String(req.body?.email ?? '').trim().toLowerCase();
+    const rawIdentifier = String(req.body?.email ?? req.body?.identifier ?? '').trim();
+    const email = rawIdentifier.toLowerCase();
     const password = String(req.body?.password ?? '');
 
-    if (!email || !password) {
-      res.status(400).json({ error: 'Email and password are required.' });
+    if (!rawIdentifier || !password) {
+      res.status(400).json({ error: 'Institutional email (or Roll / Employee ID) and password are required.' });
       return;
     }
 
     const envPasscode = process.env.HOD_ADMIN_PASSCODE?.trim();
-    const existing = await findUserByEmail(email);
+    const existing = await findUserByEmailOrIdentifier(rawIdentifier);
 
-    if (!existing && envPasscode && password === envPasscode) {
+    if (!existing && envPasscode && password === envPasscode && email.includes('@')) {
       const hodCount = await getHodCount();
       if (hodCount === 0) {
         const dept = await getSetting('department_name', 'Computer Science & Engineering');
@@ -608,22 +709,34 @@ app.post('/api/auth/login', async (req, res) => {
           })
           .returning();
         const token = await createSession(created.id);
-        res.json({ token, user: mapUser(created) });
+        const enriched = (await findUserWithMetaById(created.id)) ?? mapUser(created);
+        clearAuthRateBucket(req);
+        res.json({ token, user: enriched });
         return;
       }
     }
 
     if (!existing) {
-      res.status(401).json({ error: 'Invalid email address or password.' });
+      res.status(401).json({
+        error: 'No matching account found or password is incorrect. Double-check your email / Roll ID or register a new account.',
+      });
       return;
     }
 
     const isHodEnvOverride =
       existing.role === 'hod' && Boolean(envPasscode) && password === envPasscode;
+    if (!isHodEnvOverride && !existing.passwordHash) {
+      res.status(401).json({
+        error:
+          'This account was created via Google Sign-In and does not have an institutional password yet. Click "Continue with Google Account" above to sign in (you can then set a password under My Profile).',
+      });
+      return;
+    }
+
     const passwordOk = isHodEnvOverride || verifyPassword(password, existing.passwordHash);
 
     if (!passwordOk) {
-      res.status(401).json({ error: 'Invalid email address or password.' });
+      res.status(401).json({ error: 'Invalid email / ID or password.' });
       return;
     }
 
@@ -645,7 +758,9 @@ app.post('/api/auth/login', async (req, res) => {
     }
 
     const token = await createSession(existing.id);
-    res.json({ token, user: mapUser(existing) });
+    const enrichedUser = (await findUserWithMetaById(existing.id)) ?? mapUser(existing);
+    clearAuthRateBucket(req);
+    res.json({ token, user: enrichedUser });
   } catch (error) {
     console.error('Login failed:', error);
     res.status(500).json({ error: 'Unable to sign in right now.' });
@@ -749,7 +864,7 @@ app.post(
         .where(eq(users.id, targetId))
         .returning();
 
-      const approvedUser = mapUser(updated);
+      const approvedUser = (await findUserWithMetaById(updated.id)) ?? mapUser(updated);
       // Ensure approved student/class_rep is synced into the main department_students directory
       if ((approvedUser.role === 'student' || approvedUser.role === 'class_rep') && approvedUser.staffOrRollId) {
         await upsertStudentFromRegistration({
@@ -958,14 +1073,19 @@ function parseTimetableSlotBody(body: Record<string, unknown>, defaultDept: stri
   if (!VALID_TIMETABLE_DAYS.includes(dayOfWeek)) {
     return { error: 'Day of week must be Monday through Saturday.' };
   }
-  if (!Number.isInteger(periodNumber) || periodNumber < 1 || periodNumber > 8) {
-    return { error: 'Period number must be between 1 and 8.' };
+  if (!Number.isInteger(periodNumber) || periodNumber < 1 || periodNumber > 12) {
+    return { error: 'Period number must be between 1 and 12.' };
   }
   if (!subjectCode || !subjectName || !facultyName) {
     return { error: 'Subject code, subject name, and faculty name are required.' };
   }
-  if (!startTime || !endTime) {
-    return { error: 'Start time and end time are required.' };
+  if (!/^\d{1,2}:\d{2}$/.test(startTime) || !/^\d{1,2}:\d{2}$/.test(endTime)) {
+    return { error: 'Start time and end time must use valid HH:MM format.' };
+  }
+  const [sh, sm] = startTime.split(':').map(Number);
+  const [eh, em] = endTime.split(':').map(Number);
+  if (sh * 60 + sm >= eh * 60 + em) {
+    return { error: 'End time must be later than start time.' };
   }
 
   return {
@@ -989,7 +1109,7 @@ function parseTimetableSlotBody(body: Record<string, unknown>, defaultDept: stri
 app.post(
   '/api/records/timetable',
   requireAuth,
-  requireRoles('hod', 'class_advisor'),
+  requireRoles('hod', 'class_advisor', 'student', 'class_rep'),
   async (req: AuthenticatedRequest, res) => {
     try {
       const defaultDept = await getSetting('department_name', req.user?.department || 'Computer Science & Engineering');
@@ -1009,7 +1129,7 @@ app.post(
 app.put(
   '/api/records/timetable/:id',
   requireAuth,
-  requireRoles('hod', 'class_advisor'),
+  requireRoles('hod', 'class_advisor', 'student', 'class_rep'),
   async (req: AuthenticatedRequest, res) => {
     try {
       const id = Number(req.params.id);
@@ -1034,7 +1154,7 @@ app.put(
 app.delete(
   '/api/records/timetable/:id',
   requireAuth,
-  requireRoles('hod', 'class_advisor'),
+  requireRoles('hod', 'class_advisor', 'student', 'class_rep'),
   async (req: AuthenticatedRequest, res) => {
     try {
       const id = Number(req.params.id);
@@ -1069,7 +1189,7 @@ app.get('/api/records/batches', requireAuth, async (_req, res) => {
 app.post(
   '/api/uploads/parse',
   requireAuth,
-  requireRoles('hod', 'class_advisor'),
+  requireRoles('hod', 'class_advisor', 'student', 'class_rep'),
   upload.single('document'),
   async (req: AuthenticatedRequest, res) => {
     try {
@@ -1078,9 +1198,15 @@ app.post(
         res.status(400).json({ error: 'Select a valid target record module.' });
         return;
       }
-      if (req.user!.role === 'class_advisor' && !ADVISOR_ALLOWED_MODULES.includes(targetModule)) {
+      if (
+        (req.user!.role === 'class_advisor' ||
+          req.user!.role === 'student' ||
+          req.user!.role === 'class_rep') &&
+        !ADVISOR_ALLOWED_MODULES.includes(targetModule)
+      ) {
         res.status(403).json({
-          error: 'Class Advisors can upload Student lists, Class Representative rosters, and Timetable documents.',
+          error:
+            'Class Advisors, Students, and Class Representatives can upload Student lists, Class Representative rosters, and Timetable documents.',
         });
         return;
       }
@@ -1108,7 +1234,7 @@ app.post(
 app.post(
   '/api/uploads/commit',
   requireAuth,
-  requireRoles('hod', 'class_advisor'),
+  requireRoles('hod', 'class_advisor', 'student', 'class_rep'),
   async (req: AuthenticatedRequest, res) => {
     try {
       const targetModule = String(req.body?.targetModule ?? '') as UploadModule;
@@ -1122,7 +1248,12 @@ app.post(
         res.status(400).json({ error: 'Invalid target record module.' });
         return;
       }
-      if (req.user!.role === 'class_advisor' && !ADVISOR_ALLOWED_MODULES.includes(targetModule)) {
+      if (
+        (req.user!.role === 'class_advisor' ||
+          req.user!.role === 'student' ||
+          req.user!.role === 'class_rep') &&
+        !ADVISOR_ALLOWED_MODULES.includes(targetModule)
+      ) {
         res.status(403).json({ error: 'You are not authorized to commit records to this module.' });
         return;
       }
@@ -1215,7 +1346,7 @@ app.post('/api/communities', requireAuth, async (req: AuthenticatedRequest, res)
   try {
     if (!canUserCreateCommunity(req.user!.role)) {
       res.status(403).json({
-        error: 'Only HOD, Class Advisors, Faculty, and Class Representatives can create communities.',
+        error: 'Only authenticated department members can create communities.',
       });
       return;
     }
@@ -2002,6 +2133,9 @@ app.patch(
         .from(messageAcknowledgements)
         .where(eq(messageAcknowledgements.messageId, messageId));
 
+      const senderMetaLookup = await getSenderMetaLookup(
+        updated.senderUserId !== null ? [updated.senderUserId] : []
+      );
       const mapped = mapChatMessageRow(
         updated,
         ackRows.map((a) => ({
@@ -2013,7 +2147,8 @@ app.patch(
           responseNote: a.responseNote,
           acknowledgedAt: a.acknowledgedAt.toISOString().replace('T', ' ').slice(0, 19),
         })),
-        req.user!.id
+        req.user!.id,
+        updated.senderUserId !== null ? senderMetaLookup.get(updated.senderUserId) : undefined
       );
 
       wsHub.emitMessageUpdated(mapped);
@@ -2372,7 +2507,7 @@ app.get('/api/attendance/pinned-location', requireAuth, async (_req, res) => {
 app.patch(
   '/api/attendance/pinned-location',
   requireAuth,
-  requireRoles('hod'),
+  requireRoles('hod', 'class_advisor'),
   async (req: AuthenticatedRequest, res) => {
     try {
       const label = String(req.body?.label ?? '').trim() || 'Department Classroom Zone';
@@ -2600,6 +2735,445 @@ app.patch('/api/auth/profile-settings', requireAuth, async (req: AuthenticatedRe
   }
 });
 
+// ============================================================
+// Profile Editing, Biometric Photo Lock, Wake-Up Page-Call,
+// HOD Leave Delegation & Faculty Alteration Workflows
+// ============================================================
+app.get('/api/profile/me', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const user = await findUserWithMetaById(req.user!.id);
+    res.json({ user: user ?? req.user! });
+  } catch (error) {
+    res.status(500).json({
+      error: error instanceof Error ? error.message : 'Unable to fetch profile details.',
+    });
+  }
+});
+
+app.patch('/api/profile/me', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    if (
+      req.body?.staffOrRollId !== undefined &&
+      String(req.body.staffOrRollId).trim().toUpperCase() !== (req.user!.staffOrRollId || '').toUpperCase() &&
+      req.user!.faceRegisteredLocked
+    ) {
+      res.status(403).json({
+        error: 'Roll / Employee ID is locked after face registration for attendance integrity.',
+      });
+      return;
+    }
+
+    const updated = await updateUserProfileInDb({
+      userId: req.user!.id,
+      fullName: req.body?.fullName !== undefined ? String(req.body.fullName) : undefined,
+      phone: req.body?.phone !== undefined ? String(req.body.phone) : undefined,
+      designation: req.body?.designation !== undefined ? String(req.body.designation) : undefined,
+      specialization:
+        req.body?.specialization !== undefined ? String(req.body.specialization) : undefined,
+      bio: req.body?.bio !== undefined ? String(req.body.bio) : undefined,
+      transitBufferMinutes:
+        req.body?.transitBufferMinutes !== undefined
+          ? Number(req.body.transitBufferMinutes)
+          : undefined,
+      profileImageData:
+        req.body?.profileImageData !== undefined ? String(req.body.profileImageData) : undefined,
+    });
+    res.json({ user: updated });
+  } catch (error) {
+    const status = (error as Error & { statusCode?: number }).statusCode || 500;
+    res.status(status).json({
+      error: error instanceof Error ? error.message : 'Unable to update profile.',
+    });
+  }
+});
+
+app.post('/api/profile/password', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const currentPassword =
+      req.body?.currentPassword !== undefined ? String(req.body.currentPassword) : undefined;
+    const newPassword = String(req.body?.newPassword ?? '');
+    await setUserPasswordInDb({
+      userId: req.user!.id,
+      currentPassword,
+      newPassword,
+    });
+    res.json({ ok: true, message: 'Institutional password saved successfully.' });
+  } catch (error) {
+    const status = (error as Error & { statusCode?: number }).statusCode || 500;
+    res.status(status).json({
+      error: error instanceof Error ? error.message : 'Unable to update password.',
+    });
+  }
+});
+
+app.post('/api/profile/register-face', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const faceImageData = String(req.body?.faceImageData ?? '').trim();
+    if (!faceImageData || !faceImageData.startsWith('data:image/')) {
+      res.status(400).json({ error: 'Capture or upload a valid image before locking your face photo.' });
+      return;
+    }
+    if (req.user!.faceRegisteredLocked) {
+      res.status(403).json({
+        error: 'Face registration photo is already permanently locked and cannot be edited.',
+      });
+      return;
+    }
+    const updated = await registerAndLockUserFace({
+      userId: req.user!.id,
+      faceImageData,
+    });
+    res.json({ user: updated ?? req.user! });
+  } catch (error) {
+    res.status(500).json({
+      error: error instanceof Error ? error.message : 'Unable to lock registered face photo.',
+    });
+  }
+});
+
+// Biometric Photo Unlock Governance (Students, Faculty & HOD)
+app.get('/api/profile/biometric-unlock', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const allRequests = await listBiometricUnlockRequests();
+    if (req.user!.role === 'hod') {
+      const usersList = await listUsersBiometricLockStatus();
+      res.json({ requests: allRequests, users: usersList });
+      return;
+    }
+    const mine = allRequests.filter((r) => r.userId === req.user!.id);
+    res.json({ requests: mine, users: [] });
+  } catch (error) {
+    res.status(500).json({
+      error: error instanceof Error ? error.message : 'Unable to load biometric unlock status.',
+    });
+  }
+});
+
+app.post('/api/profile/biometric-unlock/request', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    if (!req.user!.faceRegisteredLocked) {
+      res.status(400).json({ error: 'Your biometric photo is already unlocked and ready for retake.' });
+      return;
+    }
+    const reason = String(req.body?.reason ?? '').trim();
+    const requestItem = await createBiometricUnlockRequest({
+      user: req.user!,
+      reason,
+    });
+    wsHub.broadcastAll({
+      type: 'biometric:unlock_changed',
+      userId: req.user!.id,
+      action: 'requested',
+    });
+    res.status(201).json({ request: requestItem });
+  } catch (error) {
+    res.status(500).json({
+      error: error instanceof Error ? error.message : 'Unable to submit biometric unlock request.',
+    });
+  }
+});
+
+app.post('/api/hod/biometric-unlock', requireAuth, requireRoles('hod'), async (req: AuthenticatedRequest, res) => {
+  try {
+    const targetUserId = Number(req.body?.targetUserId);
+    if (!Number.isInteger(targetUserId) || targetUserId <= 0) {
+      res.status(400).json({ error: 'Valid targetUserId is required.' });
+      return;
+    }
+    const locked = Boolean(req.body?.locked === true);
+    const remarks = String(req.body?.remarks ?? '').trim();
+    const updatedUser = await setUserBiometricLockInDb({
+      targetUserId,
+      locked,
+      hodName: req.user!.fullName,
+      remarks,
+    });
+    wsHub.broadcastAll({
+      type: 'biometric:unlock_changed',
+      userId: targetUserId,
+      locked,
+    });
+    res.json({ user: updatedUser });
+  } catch (error) {
+    const status = (error as Error & { statusCode?: number }).statusCode || 500;
+    res.status(status).json({
+      error: error instanceof Error ? error.message : 'Unable to update biometric lock permission.',
+    });
+  }
+});
+
+app.patch('/api/hod/biometric-unlock/requests/:id', requireAuth, requireRoles('hod'), async (req: AuthenticatedRequest, res) => {
+  try {
+    const requestId = String(req.params.id || '').trim();
+    const decision = req.body?.decision === 'reject' ? 'reject' : 'approve';
+    const remarks = String(req.body?.remarks ?? '').trim();
+    const result = await decideBiometricUnlockRequestInDb({
+      requestId,
+      decision,
+      hodName: req.user!.fullName,
+      remarks,
+    });
+    wsHub.broadcastAll({
+      type: 'biometric:unlock_changed',
+      userId: result.request.userId,
+      locked: decision === 'approve' ? false : true,
+    });
+    res.json(result);
+  } catch (error) {
+    const status = (error as Error & { statusCode?: number }).statusCode || 500;
+    res.status(status).json({
+      error: error instanceof Error ? error.message : 'Unable to decide biometric unlock request.',
+    });
+  }
+});
+
+app.post('/api/profile/page-call', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const targetName = String(req.body?.targetName ?? '').trim();
+    const targetPhone = String(req.body?.targetPhone ?? '').trim();
+    const targetRole = String(req.body?.targetRole ?? '').trim();
+    const targetEmail = String(req.body?.targetEmail ?? '').trim().toLowerCase();
+    const targetIdRaw = req.body?.targetUserId;
+    const message = String(req.body?.message ?? '').trim().slice(0, 240);
+
+    if (!targetName) {
+      res.status(400).json({ error: 'Recipient name is required to dispatch a Wake-Up Page-Call.' });
+      return;
+    }
+
+    let resolvedUserId: number | null =
+      typeof targetIdRaw === 'number' && Number.isFinite(targetIdRaw) ? targetIdRaw : null;
+    if (!resolvedUserId && targetEmail) {
+      const matched = await findUserByEmail(targetEmail);
+      if (matched) resolvedUserId = matched.id;
+    }
+
+    const tz = await getSetting('academic_timezone', 'Asia/Kolkata');
+    const dept = await getSetting('department_name', req.user!.department);
+    const serverTime = computeServerTimeStatus(tz, dept);
+
+    const payload = {
+      callerUserId: req.user!.id,
+      callerName: req.user!.fullName,
+      callerRole: req.user!.role,
+      callerPhone: req.user!.phone || '',
+      targetUserId: resolvedUserId,
+      targetName,
+      targetEmail,
+      targetPhone,
+      targetRole,
+      reason:
+        message ||
+        `Urgent Wake-Up Page-Call from ${req.user!.fullName} — please respond immediately.`,
+      message:
+        message ||
+        `Urgent Wake-Up Page-Call from ${req.user!.fullName} — please respond immediately.`,
+      sentAt: `${serverTime.formattedDate} · ${serverTime.formattedTime}`,
+      triggeredAt: `${serverTime.formattedDate} · ${serverTime.formattedTime}`,
+    };
+
+    wsHub.emitWakeUpPageCall(payload);
+    res.status(201).json({ ok: true, pageCall: payload });
+  } catch (error) {
+    res.status(500).json({
+      error: error instanceof Error ? error.message : 'Unable to dispatch Wake-Up Page-Call.',
+    });
+  }
+});
+
+app.get('/api/records/hod', requireAuth, async (_req, res) => {
+  try {
+    const [hodRecords, activeDelegation] = await Promise.all([
+      listHodDirectoryRecords(),
+      getActiveHodDelegation(),
+    ]);
+    res.json({ hodRecords, activeDelegation });
+  } catch (error) {
+    res.status(500).json({
+      error: error instanceof Error ? error.message : 'Unable to load HOD records.',
+    });
+  }
+});
+
+app.get('/api/hod/delegation', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const activeDelegation = await getActiveHodDelegation();
+    const candidates =
+      req.user!.role === 'hod'
+        ? await listApprovedStaffForDelegation(req.user!.id)
+        : [];
+    res.json({ activeDelegation, candidates });
+  } catch (error) {
+    res.status(500).json({
+      error: error instanceof Error ? error.message : 'Unable to load HOD delegation details.',
+    });
+  }
+});
+
+app.post(
+  '/api/hod/delegate',
+  requireAuth,
+  requireRoles('hod'),
+  async (req: AuthenticatedRequest, res) => {
+    try {
+      const delegateUserId = Number(req.body?.delegateUserId);
+      const reason = String(req.body?.reason ?? '').trim();
+      if (!Number.isInteger(delegateUserId) || delegateUserId <= 0) {
+        res.status(400).json({ error: 'Select an approved faculty member or Class Advisor.' });
+        return;
+      }
+
+      const result = await delegateHodRoleInDb({
+        hodUser: req.user!,
+        delegateUserId,
+        reason,
+      });
+
+      wsHub.emitHodDelegationChanged(result.delegation);
+
+      res.status(201).json({
+        delegation: result.delegation,
+        user: result.updatedActor,
+      });
+    } catch (error) {
+      res.status(400).json({
+        error: error instanceof Error ? error.message : 'Unable to delegate HOD control.',
+      });
+    }
+  }
+);
+
+app.post('/api/hod/restore', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const result = await restoreHodRoleInDb(req.user!);
+    wsHub.emitHodDelegationChanged(result.delegation);
+    res.json({
+      delegation: result.delegation,
+      user: result.updatedActor,
+    });
+  } catch (error) {
+    res.status(403).json({
+      error: error instanceof Error ? error.message : 'Unable to restore HOD control.',
+    });
+  }
+});
+
+app.get('/api/faculty-alterations', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const [alterations, candidates] = await Promise.all([
+      listFacultyAlterationsForUser(req.user!),
+      listSubstituteCandidates(),
+    ]);
+    res.json({ alterations, candidates });
+  } catch (error) {
+    res.status(500).json({
+      error: error instanceof Error ? error.message : 'Unable to load faculty alterations.',
+    });
+  }
+});
+
+app.post(
+  '/api/faculty-alterations',
+  requireAuth,
+  requireRoles('hod', 'class_advisor', 'dept_staff', 'other_dept_staff'),
+  async (req: AuthenticatedRequest, res) => {
+    try {
+      const tz = await getSetting('academic_timezone', 'Asia/Kolkata');
+      const dept = await getSetting(
+        'department_name',
+        req.user!.department || 'Computer Science & Engineering'
+      );
+      const serverTime = computeServerTimeStatus(tz, dept);
+
+      const timetableSlotId =
+        typeof req.body?.timetableSlotId === 'number' && Number.isFinite(req.body.timetableSlotId)
+          ? req.body.timetableSlotId
+          : null;
+      const substituteUserId =
+        typeof req.body?.substituteUserId === 'number' && Number.isFinite(req.body.substituteUserId)
+          ? req.body.substituteUserId
+          : null;
+      const substituteFacultyName = String(req.body?.substituteFacultyName ?? '').trim();
+      const rawCat = String(req.body?.reasonCategory ?? 'busy').trim().toLowerCase();
+      const reasonCategory: 'busy' | 'od' | 'absent' =
+        rawCat === 'od' ? 'od' : rawCat === 'absent' ? 'absent' : 'busy';
+      const reasonNote = String(req.body?.reasonNote ?? '').trim();
+      const alterationDate = String(req.body?.alterationDate ?? serverTime.isoDate).trim();
+
+      if (!substituteFacultyName) {
+        res.status(400).json({ error: 'Select or enter the substitute faculty member.' });
+        return;
+      }
+
+      const created = await createFacultyAlterationRequest({
+        timetableSlotId,
+        alterationDate,
+        substituteFacultyName,
+        substituteUserId,
+        substituteEmail: String(req.body?.substituteEmail ?? ''),
+        substitutePhone: String(req.body?.substitutePhone ?? ''),
+        reasonCategory,
+        reasonNote,
+        user: req.user!,
+        departmentFallback: dept,
+        dayFallback: String(req.body?.dayOfWeek ?? serverTime.weekday),
+        periodFallback: Number(req.body?.periodNumber ?? serverTime.activePeriod?.periodNumber ?? 1),
+        subjectCodeFallback: String(req.body?.subjectCode ?? 'CLASS'),
+        subjectNameFallback: String(req.body?.subjectName ?? 'Scheduled Class'),
+        yearFallback: String(req.body?.yearOfStudy ?? req.user!.yearOfStudy ?? 'III Year'),
+        sectionFallback: String(req.body?.section ?? req.user!.section ?? 'A'),
+        roomFallback: String(req.body?.roomNo ?? ''),
+      });
+
+      wsHub.emitFacultyAlterationChanged(created);
+      res.status(201).json({ alteration: created });
+    } catch (error) {
+      res.status(500).json({
+        error:
+          error instanceof Error ? error.message : 'Unable to submit faculty alteration request.',
+      });
+    }
+  }
+);
+
+app.patch(
+  '/api/faculty-alterations/:id/decision',
+  requireAuth,
+  requireRoles('hod'),
+  async (req: AuthenticatedRequest, res) => {
+    try {
+      const id = Number.parseInt(String(req.params.id), 10);
+      if (!Number.isInteger(id) || id <= 0) {
+        res.status(400).json({ error: 'Invalid faculty alteration ID.' });
+        return;
+      }
+      const decision: 'approve' | 'reject' =
+        req.body?.decision === 'reject' ? 'reject' : 'approve';
+      const remarks = String(req.body?.remarks ?? '').trim();
+
+      const updated = await decideFacultyAlteration({
+        id,
+        reviewer: req.user!,
+        decision,
+        remarks,
+      });
+
+      if (!updated) {
+        res.status(404).json({ error: 'Faculty alteration request not found.' });
+        return;
+      }
+
+      wsHub.emitFacultyAlterationChanged(updated);
+      res.json({ alteration: updated });
+    } catch (error) {
+      res.status(500).json({
+        error:
+          error instanceof Error ? error.message : 'Unable to process faculty alteration decision.',
+      });
+    }
+  }
+);
+
 app.get('/api/analytics/student-achievements', requireAuth, async (req, res) => {
   try {
     const tz = await getSetting('academic_timezone', 'Asia/Kolkata');
@@ -2740,7 +3314,7 @@ app.get('/api/academic-calendar', requireAuth, async (_req, res) => {
 app.post(
   '/api/academic-calendar',
   requireAuth,
-  requireRoles('hod', 'class_advisor', 'dept_staff'),
+  requireRoles('hod', 'class_advisor', 'dept_staff', 'student', 'class_rep'),
   async (req: AuthenticatedRequest, res) => {
     try {
       const title = String(req.body?.title ?? '').trim();
@@ -2871,6 +3445,10 @@ app.post('/api/hod/archival', requireAuth, requireRoles('hod'), async (_req, res
 // ============================================================
 app.get('/api/faculty-delays', requireAuth, async (req: AuthenticatedRequest, res) => {
   try {
+    const newlyCreated = await runAutoFacultyDelayScan();
+    for (const alert of newlyCreated) {
+      wsHub.emitFacultyDelayCreated(alert);
+    }
     const alerts = await listFacultyDelayAlertsForUser(req.user!);
     res.json({ alerts });
   } catch (error) {
@@ -2881,7 +3459,7 @@ app.get('/api/faculty-delays', requireAuth, async (req: AuthenticatedRequest, re
 app.post(
   '/api/faculty-delays',
   requireAuth,
-  requireRoles('class_rep', 'class_advisor', 'hod'),
+  requireRoles('student', 'class_rep', 'class_advisor', 'hod'),
   async (req: AuthenticatedRequest, res) => {
     try {
       const tz = await getSetting('academic_timezone', 'Asia/Kolkata');
@@ -3120,6 +3698,13 @@ app.post(
         verificationSummary: `${verification.summary}${summarySuffix}`.slice(0, 260),
         serverTimestamp: `${serverTime.formattedDate} · ${serverTime.formattedTime} (${serverTime.academicTimezone})`,
       });
+
+      if (verification.approvedForAttendance) {
+        await registerAndLockUserFace({
+          personIdentifier,
+          faceImageData,
+        }).catch(() => null);
+      }
 
       let sessionAlert: {
         subjectCode: string;
@@ -3616,6 +4201,16 @@ async function startServer() {
   httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`ChromaGrade PostgreSQL & WebSocket server running on http://0.0.0.0:${PORT}`);
     startDailyArchivalScheduler();
+    setTimeout(() => {
+      runAutoFacultyDelayScan()
+        .then((created) => created.forEach((a) => wsHub.emitFacultyDelayCreated(a)))
+        .catch(() => null);
+    }, 5000);
+    setInterval(() => {
+      runAutoFacultyDelayScan()
+        .then((created) => created.forEach((a) => wsHub.emitFacultyDelayCreated(a)))
+        .catch(() => null);
+    }, 60_000);
   });
 }
 

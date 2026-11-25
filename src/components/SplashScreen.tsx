@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 
 interface SplashScreenProps {
   onComplete: () => void;
@@ -28,6 +28,11 @@ interface SmokePuff {
 const TOTAL_DURATION_MS = 3550;
 
 export function SplashScreen({ onComplete }: SplashScreenProps) {
+  const uid = useId().replace(/[^a-zA-Z0-9_-]/g, '');
+  const splashGoldId = `splashGold-${uid}`;
+  const splashGoldHighlightId = `splashGoldHighlight-${uid}`;
+  const splashNavyId = `splashNavy-${uid}`;
+  const splashBookRimId = `splashBookRim-${uid}`;
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [phase, setPhase] = useState<'ribbons' | 'emerge' | 'aura' | 'zoomOut'>('ribbons');
   const [exiting, setExiting] = useState(false);
@@ -392,23 +397,23 @@ export function SplashScreen({ onComplete }: SplashScreenProps) {
             aria-label="Academia-ESEC emblem"
           >
             <defs>
-              <linearGradient id="splashGold" x1="60" y1="15" x2="320" y2="230" gradientUnits="userSpaceOnUse">
+              <linearGradient id={splashGoldId} x1="60" y1="15" x2="320" y2="230" gradientUnits="userSpaceOnUse">
                 <stop offset="0%" stopColor="#FFF3B0" />
                 <stop offset="28%" stopColor="#F5C84C" />
                 <stop offset="62%" stopColor="#C98E12" />
                 <stop offset="100%" stopColor="#8F5E04" />
               </linearGradient>
-              <linearGradient id="splashGoldHighlight" x1="120" y1="20" x2="260" y2="210" gradientUnits="userSpaceOnUse">
+              <linearGradient id={splashGoldHighlightId} x1="120" y1="20" x2="260" y2="210" gradientUnits="userSpaceOnUse">
                 <stop offset="0%" stopColor="#FFFFFF" stopOpacity="0.7" />
                 <stop offset="50%" stopColor="#FDE68A" stopOpacity="0.15" />
                 <stop offset="100%" stopColor="#C98E12" stopOpacity="0" />
               </linearGradient>
-              <linearGradient id="splashNavy" x1="55" y1="160" x2="335" y2="285" gradientUnits="userSpaceOnUse">
+              <linearGradient id={splashNavyId} x1="55" y1="160" x2="335" y2="285" gradientUnits="userSpaceOnUse">
                 <stop offset="0%" stopColor="#262A72" />
                 <stop offset="48%" stopColor="#16144A" />
                 <stop offset="100%" stopColor="#0D0A2E" />
               </linearGradient>
-              <linearGradient id="splashBookRim" x1="65" y1="170" x2="330" y2="265" gradientUnits="userSpaceOnUse">
+              <linearGradient id={splashBookRimId} x1="65" y1="170" x2="330" y2="265" gradientUnits="userSpaceOnUse">
                 <stop offset="0%" stopColor="#93A8F8" />
                 <stop offset="50%" stopColor="#FDE68A" />
                 <stop offset="100%" stopColor="#6378D4" />
@@ -416,7 +421,7 @@ export function SplashScreen({ onComplete }: SplashScreenProps) {
             </defs>
 
             {/* Three soaring metallic golden figures */}
-            <g fill="url(#splashGold)">
+            <g fill={`url(#${splashGoldId})`}>
               {/* Left figure */}
               <circle cx="106" cy="112" r="14.5" />
               <path d="M50 142 C91 127 127 132 157 161 C169 173 179 194 184 216 C174 186 157 166 132 151 C107 138 79 140 50 142 Z" />
@@ -432,14 +437,14 @@ export function SplashScreen({ onComplete }: SplashScreenProps) {
             {/* Specular highlight overlay on crest */}
             <path
               d="M179 49 C194 65 208 82 224 104 C211 132 201 166 196 206 C191 164 179 126 164 94 Z"
-              fill="url(#splashGoldHighlight)"
+              fill={`url(#${splashGoldHighlightId})`}
             />
 
             {/* Open Royal-Navy Book with metallic bevel stroke */}
             <path
               d="M64 268 C100 234 126 198 154 196 C169 195 180 207 186 220 C176 211 163 203 150 207 C126 215 103 241 86 256 C118 251 150 256 171 270 L188 224 L184 275 C188 281 192 285 196 286 C212 266 263 245 336 253 L310 164 C278 160 231 177 206 202 C233 185 274 173 298 177 L319 241 C265 236 218 253 192 273 L192 222 L175 262 C147 247 107 249 64 268 Z"
-              fill="url(#splashNavy)"
-              stroke="url(#splashBookRim)"
+              fill={`url(#${splashNavyId})`}
+              stroke={`url(#${splashBookRimId})`}
               strokeWidth="2.2"
               strokeLinejoin="round"
             />
@@ -453,7 +458,7 @@ export function SplashScreen({ onComplete }: SplashScreenProps) {
           }`}
         >
           <h1
-            className="text-2xl sm:text-4xl font-extrabold tracking-[0.22em] text-transparent bg-clip-text bg-gradient-to-b from-[#FFF4B8] via-[#EAB72E] to-[#9E6B06] drop-shadow-[0_2px_18px_rgba(234,179,8,0.45)]"
+            className="text-2xl sm:text-4xl font-extrabold tracking-[0.22em] text-amber-300 drop-shadow-[0_2px_18px_rgba(234,179,8,0.55)]"
             style={{ fontFamily: 'var(--font-display)' }}
           >
             ACADEMIA-ESEC

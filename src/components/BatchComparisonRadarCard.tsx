@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
   AlertTriangle,
+  ArrowLeftRight,
   Download,
   GitCompareArrows,
   TrendingUp,
@@ -26,6 +27,12 @@ import type { BatchComparisonPayload } from '../types';
 interface BatchComparisonRadarCardProps {
   token: string;
   refreshKey?: number;
+}
+
+function formatSignedDelta(valueA: number, valueB: number, suffix = ''): string {
+  const diff = Math.round((valueA - valueB) * 10) / 10;
+  if (diff === 0) return `0${suffix}`;
+  return `${diff > 0 ? '+' : ''}${diff}${suffix}`;
 }
 
 export function BatchComparisonRadarCard({
@@ -80,6 +87,14 @@ export function BatchComparisonRadarCard({
     }
   };
 
+  const handleSwapBatches = () => {
+    const currentA = batchA || data?.batchA.batchKey || '';
+    const currentB = batchB || data?.batchB.batchKey || '';
+    if (!currentA || !currentB || currentA === currentB) return;
+    setBatchA(currentB);
+    setBatchB(currentA);
+  };
+
   const riskA = data?.predictiveRisk.batchA;
   const riskB = data?.predictiveRisk.batchB;
   const anyRiskDetected = Boolean(riskA?.atPredictiveRisk || riskB?.atPredictiveRisk);
@@ -89,8 +104,80 @@ export function BatchComparisonRadarCard({
     riskThreshold: 75,
   }));
 
+  const badgeDensityA =
+    radarData.find((m) => m.metric === 'Badge Density')?.batchAValue ?? 0;
+  const badgeDensityB =
+    radarData.find((m) => m.metric === 'Badge Density')?.batchBValue ?? 0;
+
+  const comparisonRows = data
+    ? [
+        {
+          label: 'Average Attendance',
+          aDisplay: `${data.batchA.averageAttendanceRate.toFixed(1)}%`,
+          bDisplay: `${data.batchB.averageAttendanceRate.toFixed(1)}%`,
+          delta: formatSignedDelta(
+            data.batchA.averageAttendanceRate,
+            data.batchB.averageAttendanceRate,
+            '%'
+          ),
+          positiveBetter: true,
+          diff: data.batchA.averageAttendanceRate - data.batchB.averageAttendanceRate,
+        },
+        {
+          label: 'Achievement Badges',
+          aDisplay: `${data.batchA.badgesCount} badges`,
+          bDisplay: `${data.batchB.badgesCount} badges`,
+          delta: formatSignedDelta(data.batchA.badgesCount, data.batchB.badgesCount),
+          positiveBetter: true,
+          diff: data.batchA.badgesCount - data.batchB.badgesCount,
+        },
+        {
+          label: 'Badge Density Index',
+          aDisplay: `${badgeDensityA}%`,
+          bDisplay: `${badgeDensityB}%`,
+          delta: formatSignedDelta(badgeDensityA, badgeDensityB, '%'),
+          positiveBetter: true,
+          diff: badgeDensityA - badgeDensityB,
+        },
+        {
+          label: 'Avg Streak Length',
+          aDisplay: `${data.batchA.streakAvg.toFixed(1)}d`,
+          bDisplay: `${data.batchB.streakAvg.toFixed(1)}d`,
+          delta: formatSignedDelta(data.batchA.streakAvg, data.batchB.streakAvg, 'd'),
+          positiveBetter: true,
+          diff: data.batchA.streakAvg - data.batchB.streakAvg,
+        },
+        {
+          label: 'Academic Engagement',
+          aDisplay: `${data.batchA.academicEngagementScore.toFixed(1)}`,
+          bDisplay: `${data.batchB.academicEngagementScore.toFixed(1)}`,
+          delta: formatSignedDelta(
+            data.batchA.academicEngagementScore,
+            data.batchB.academicEngagementScore
+          ),
+          positiveBetter: true,
+          diff: data.batchA.academicEngagementScore - data.batchB.academicEngagementScore,
+        },
+        {
+          label: 'Average CGPA',
+          aDisplay: data.batchA.averageCgpa !== null ? data.batchA.averageCgpa.toFixed(2) : '—',
+          bDisplay: data.batchB.averageCgpa !== null ? data.batchB.averageCgpa.toFixed(2) : '—',
+          delta:
+            data.batchA.averageCgpa !== null && data.batchB.averageCgpa !== null
+              ? formatSignedDelta(data.batchA.averageCgpa, data.batchB.averageCgpa)
+              : '—',
+          positiveBetter: true,
+          diff:
+            data.batchA.averageCgpa !== null && data.batchB.averageCgpa !== null
+              ? data.batchA.averageCgpa - data.batchB.averageCgpa
+              : 0,
+        },
+      ]
+    : [];
+
   return (
     <section className="bg-white border border-slate-200 rounded-lg overflow-hidden">
+      {/* Card Header */}
       <div className="px-6 py-4 border-b border-slate-200 flex flex-col xl:flex-row xl:items-center xl:justify-between gap-4">
         <div className="flex items-start gap-3">
           <div className="w-9 h-9 rounded-lg bg-indigo-50 text-indigo-700 flex items-center justify-center shrink-0">
@@ -98,10 +185,10 @@ export function BatchComparisonRadarCard({
           </div>
           <div>
             <h3 className="text-sm font-semibold text-slate-900">
-              Batch Comparison &amp; Predictive Risk Radar
+              Side-by-Side Batch Comparison &amp; Radar Analytics
             </h3>
             <p className="text-xs text-slate-500 mt-0.5">
-              Compare attendance, engagement, and digital badge metrics side by side with 2-week OLS linear regression forecast
+              Select two batches to compare average attendance, achievement badge metrics, predictive risk, and 2-week projections
             </p>
           </div>
         </div>
@@ -145,18 +232,21 @@ export function BatchComparisonRadarCard({
         </div>
       </div>
 
-      {/* Batch Selectors + Summary Bar */}
+      {/* Dual Batch Selector Toolbar */}
       {data && (
-        <div className="px-6 py-3.5 bg-slate-50 border-b border-slate-200 grid grid-cols-1 md:grid-cols-2 gap-4">
-          <div className="flex items-center justify-between gap-3">
-            <label htmlFor="compare-batch-a" className="text-xs font-medium text-indigo-800 whitespace-nowrap">
+        <div className="px-6 py-4 bg-slate-50 border-b border-slate-200 flex flex-col lg:flex-row lg:items-center gap-3">
+          <div className="flex-1 flex items-center gap-3 min-w-0">
+            <label
+              htmlFor="compare-batch-a"
+              className="text-xs font-semibold text-indigo-800 whitespace-nowrap shrink-0"
+            >
               Batch A
             </label>
             <select
               id="compare-batch-a"
               value={batchA || data.batchA.batchKey}
               onChange={(e) => setBatchA(e.target.value)}
-              className="flex-1 px-3 py-1.5 text-xs border border-slate-300 rounded-lg bg-white text-slate-900 focus:outline-none focus:border-indigo-700"
+              className="flex-1 min-w-0 px-3 py-2 text-xs font-medium border border-slate-300 rounded-lg bg-white text-slate-900 focus:outline-none focus:border-indigo-700"
             >
               {data.availableBatches.map((b) => (
                 <option key={`a-${b.batchKey}`} value={b.batchKey}>
@@ -164,20 +254,31 @@ export function BatchComparisonRadarCard({
                 </option>
               ))}
             </select>
-            <span className="font-mono text-xs tabular-nums text-slate-700 whitespace-nowrap">
-              {data.batchA.averageAttendanceRate.toFixed(1)}% Att · {data.batchA.badgesCount} Badges
-            </span>
           </div>
 
-          <div className="flex items-center justify-between gap-3">
-            <label htmlFor="compare-batch-b" className="text-xs font-medium text-emerald-800 whitespace-nowrap">
+          <button
+            type="button"
+            onClick={handleSwapBatches}
+            disabled={data.availableBatches.length < 2}
+            title="Swap selected batches"
+            aria-label="Swap Batch A and Batch B"
+            className="self-center px-2.5 py-2 text-xs text-slate-600 hover:text-slate-900 bg-white border border-slate-300 hover:bg-slate-100 rounded-lg transition-colors whitespace-nowrap shrink-0 disabled:opacity-40"
+          >
+            <ArrowLeftRight className="w-3.5 h-3.5" />
+          </button>
+
+          <div className="flex-1 flex items-center gap-3 min-w-0">
+            <label
+              htmlFor="compare-batch-b"
+              className="text-xs font-semibold text-emerald-800 whitespace-nowrap shrink-0"
+            >
               Batch B
             </label>
             <select
               id="compare-batch-b"
               value={batchB || data.batchB.batchKey}
               onChange={(e) => setBatchB(e.target.value)}
-              className="flex-1 px-3 py-1.5 text-xs border border-slate-300 rounded-lg bg-white text-slate-900 focus:outline-none focus:border-indigo-700"
+              className="flex-1 min-w-0 px-3 py-2 text-xs font-medium border border-slate-300 rounded-lg bg-white text-slate-900 focus:outline-none focus:border-emerald-700"
             >
               {data.availableBatches.map((b) => (
                 <option key={`b-${b.batchKey}`} value={b.batchKey}>
@@ -185,9 +286,6 @@ export function BatchComparisonRadarCard({
                 </option>
               ))}
             </select>
-            <span className="font-mono text-xs tabular-nums text-slate-700 whitespace-nowrap">
-              {data.batchB.averageAttendanceRate.toFixed(1)}% Att · {data.batchB.badgesCount} Badges
-            </span>
           </div>
         </div>
       )}
@@ -196,17 +294,17 @@ export function BatchComparisonRadarCard({
 
       {loading && !data ? (
         <div className="px-6 py-12 text-center text-xs text-slate-500">
-          Computing batch radar metrics and 4-week regression slopes...
+          Computing side-by-side batch radar metrics and achievement totals...
         </div>
       ) : data ? (
         <div className="p-6 space-y-6">
-          {/* Predictive Risk Overlay Summary */}
+          {/* Predictive Risk Overlay Banner */}
           {showPredictiveRisk && (
             <div
               className={`border rounded-lg p-4 grid grid-cols-1 md:grid-cols-2 gap-4 ${
                 anyRiskDetected
-                  ? 'border-rose-200 bg-rose-50/60'
-                  : 'border-emerald-200 bg-emerald-50/50'
+                  ? 'border-rose-200 bg-rose-50/50'
+                  : 'border-emerald-200 bg-emerald-50/40'
               }`}
             >
               {[riskA, riskB].map(
@@ -222,7 +320,7 @@ export function BatchComparisonRadarCard({
                             risk.atPredictiveRisk ? 'text-rose-700' : 'text-emerald-700'
                           }`}
                         >
-                          {risk.atPredictiveRisk ? 'PREDICTIVE RISK FLAG' : 'STABLE TRAJECTORY'}
+                          {risk.atPredictiveRisk ? 'Predictive Risk Flag' : 'Stable Trajectory'}
                         </span>
                       </div>
                       <p className="text-xs text-slate-600">{risk.reason}</p>
@@ -238,17 +336,99 @@ export function BatchComparisonRadarCard({
             </div>
           )}
 
-          {/* Side-by-Side Radar & Optional 2-Week Linear Regression Trends */}
-          <div
-            className={`grid grid-cols-1 ${
-              showTrendsProjection ? 'xl:grid-cols-2' : ''
-            } gap-6 items-start`}
-          >
-            <div className="border border-slate-200 rounded-lg p-4">
-              <div className="text-xs font-semibold text-slate-900 mb-2">
-                Multi-Axis Batch Radar ({data.batchA.batchLabel} vs {data.batchB.batchLabel})
+          {/* Side-by-Side Comparison Matrix + Radar Chart */}
+          <div className="grid grid-cols-1 xl:grid-cols-12 gap-6 items-start">
+            {/* Left: Side-by-Side Batch A vs Batch B Summary & Metric Table */}
+            <div className="xl:col-span-5 space-y-4">
+              <div className="grid grid-cols-2 divide-x divide-slate-200 border border-slate-200 rounded-lg overflow-hidden">
+                <div className="p-4 bg-indigo-50/30">
+                  <div className="text-[11px] font-medium text-indigo-700">Batch A</div>
+                  <div className="text-sm font-semibold text-slate-900 mt-0.5 truncate">
+                    {data.batchA.batchLabel}
+                  </div>
+                  <div className="mt-2 font-mono text-xl font-semibold tabular-nums text-indigo-800">
+                    {data.batchA.averageAttendanceRate.toFixed(1)}%
+                  </div>
+                  <div className="text-[11px] text-slate-600 mt-0.5 font-mono tabular-nums">
+                    {data.batchA.badgesCount} badges · {data.batchA.studentCount} students
+                  </div>
+                </div>
+
+                <div className="p-4 bg-emerald-50/30">
+                  <div className="text-[11px] font-medium text-emerald-700">Batch B</div>
+                  <div className="text-sm font-semibold text-slate-900 mt-0.5 truncate">
+                    {data.batchB.batchLabel}
+                  </div>
+                  <div className="mt-2 font-mono text-xl font-semibold tabular-nums text-emerald-800">
+                    {data.batchB.averageAttendanceRate.toFixed(1)}%
+                  </div>
+                  <div className="text-[11px] text-slate-600 mt-0.5 font-mono tabular-nums">
+                    {data.batchB.badgesCount} badges · {data.batchB.studentCount} students
+                  </div>
+                </div>
               </div>
-              <div className="h-[320px] w-full">
+
+              <div className="border border-slate-200 rounded-lg overflow-hidden">
+                <table className="w-full text-left text-xs">
+                  <thead className="bg-slate-50 border-b border-slate-200 text-slate-600">
+                    <tr>
+                      <th className="px-3.5 py-2.5 font-medium">Metric</th>
+                      <th className="px-3 py-2.5 font-medium text-right text-indigo-800">
+                        {data.batchA.batchLabel}
+                      </th>
+                      <th className="px-3 py-2.5 font-medium text-right text-emerald-800">
+                        {data.batchB.batchLabel}
+                      </th>
+                      <th className="px-3.5 py-2.5 font-medium text-right">Diff (A−B)</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-200 tabular-nums">
+                    {comparisonRows.map((row) => (
+                      <tr key={row.label} className="hover:bg-slate-50/70">
+                        <td className="px-3.5 py-2.5 font-medium text-slate-800">
+                          {row.label}
+                        </td>
+                        <td className="px-3 py-2.5 font-mono text-right text-slate-900">
+                          {row.aDisplay}
+                        </td>
+                        <td className="px-3 py-2.5 font-mono text-right text-slate-900">
+                          {row.bDisplay}
+                        </td>
+                        <td
+                          className={`px-3.5 py-2.5 font-mono text-right font-medium ${
+                            row.diff > 0
+                              ? 'text-indigo-700'
+                              : row.diff < 0
+                              ? 'text-emerald-700'
+                              : 'text-slate-500'
+                          }`}
+                        >
+                          {row.delta}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* Right: Multi-Axis Batch Radar Chart */}
+            <div className="xl:col-span-7 border border-slate-200 rounded-lg p-5">
+              <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+                <div>
+                  <div className="text-xs font-semibold text-slate-900">
+                    Multi-Axis Performance &amp; Achievement Radar
+                  </div>
+                  <div className="text-[11px] text-slate-500 mt-0.5">
+                    Normalized 0–100 scale comparing {data.batchA.batchLabel} vs {data.batchB.batchLabel}
+                  </div>
+                </div>
+                <div className="text-[11px] font-mono tabular-nums text-slate-500">
+                  Attendance · Engagement · CGPA · Portal · Badges
+                </div>
+              </div>
+
+              <div className="h-[340px] w-full">
                 <ResponsiveContainer width="100%" height="100%">
                   <RadarChart cx="50%" cy="50%" outerRadius="74%" data={radarData}>
                     <PolarGrid stroke="#e2e8f0" />
@@ -279,7 +459,7 @@ export function BatchComparisonRadarCard({
                       <Radar
                         name="75% Risk Baseline"
                         dataKey="riskThreshold"
-                        stroke="#f59e0b"
+                        stroke="#d97706"
                         strokeDasharray="4 4"
                         fill="none"
                       />
@@ -290,70 +470,71 @@ export function BatchComparisonRadarCard({
                 </ResponsiveContainer>
               </div>
             </div>
-
-            {showTrendsProjection && (
-              <div className="border border-slate-200 rounded-lg p-4">
-                <div className="flex items-center justify-between gap-2 mb-2">
-                  <span className="text-xs font-semibold text-slate-900">
-                    4-Week History + 2-Week Linear Regression Projection
-                  </span>
-                  <span className="font-mono text-[11px] text-slate-500">Dashed = Forecast</span>
-                </div>
-                <div className="h-[320px] w-full">
-                  <ResponsiveContainer width="100%" height="100%">
-                    <ComposedChart
-                      data={data.weeklySeries}
-                      margin={{ top: 10, right: 12, left: -12, bottom: 0 }}
-                    >
-                      <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
-                      <XAxis dataKey="weekLabel" tick={{ fontSize: 11, fill: '#475569' }} />
-                      <YAxis domain={[0, 100]} tick={{ fontSize: 11, fill: '#475569' }} />
-                      <Tooltip />
-                      <Legend wrapperStyle={{ fontSize: 11 }} />
-                      <Line
-                        type="monotone"
-                        dataKey="batchAAttendance"
-                        name={`${data.batchA.batchLabel} (Actual)`}
-                        stroke="#4338ca"
-                        strokeWidth={2}
-                        dot={{ r: 3 }}
-                        connectNulls
-                      />
-                      <Line
-                        type="monotone"
-                        dataKey="batchAProjected"
-                        name={`${data.batchA.batchLabel} (2-Wk Proj)`}
-                        stroke="#4338ca"
-                        strokeDasharray="5 5"
-                        strokeWidth={2}
-                        dot={{ r: 3 }}
-                        connectNulls
-                      />
-                      <Line
-                        type="monotone"
-                        dataKey="batchBAttendance"
-                        name={`${data.batchB.batchLabel} (Actual)`}
-                        stroke="#047857"
-                        strokeWidth={2}
-                        dot={{ r: 3 }}
-                        connectNulls
-                      />
-                      <Line
-                        type="monotone"
-                        dataKey="batchBProjected"
-                        name={`${data.batchB.batchLabel} (2-Wk Proj)`}
-                        stroke="#047857"
-                        strokeDasharray="5 5"
-                        strokeWidth={2}
-                        dot={{ r: 3 }}
-                        connectNulls
-                      />
-                    </ComposedChart>
-                  </ResponsiveContainer>
-                </div>
-              </div>
-            )}
           </div>
+
+          {/* 4-Week History + 2-Week Linear Regression Trends Projection */}
+          {showTrendsProjection && (
+            <div className="pt-6 border-t border-slate-200">
+              <div className="flex items-center justify-between gap-2 mb-3">
+                <span className="text-xs font-semibold text-slate-900">
+                  4-Week History + 2-Week Linear Regression Projection
+                </span>
+                <span className="font-mono text-[11px] text-slate-500">Dashed = 2-Week Forecast</span>
+              </div>
+              <div className="h-[280px] w-full">
+                <ResponsiveContainer width="100%" height="100%">
+                  <ComposedChart
+                    data={data.weeklySeries}
+                    margin={{ top: 10, right: 12, left: -12, bottom: 0 }}
+                  >
+                    <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                    <XAxis dataKey="weekLabel" tick={{ fontSize: 11, fill: '#475569' }} />
+                    <YAxis domain={[0, 100]} tick={{ fontSize: 11, fill: '#475569' }} />
+                    <Tooltip />
+                    <Legend wrapperStyle={{ fontSize: 11 }} />
+                    <Line
+                      type="monotone"
+                      dataKey="batchAAttendance"
+                      name={`${data.batchA.batchLabel} (Actual)`}
+                      stroke="#4338ca"
+                      strokeWidth={2}
+                      dot={{ r: 3 }}
+                      connectNulls
+                    />
+                    <Line
+                      type="monotone"
+                      dataKey="batchAProjected"
+                      name={`${data.batchA.batchLabel} (2-Wk Proj)`}
+                      stroke="#4338ca"
+                      strokeDasharray="5 5"
+                      strokeWidth={2}
+                      dot={{ r: 3 }}
+                      connectNulls
+                    />
+                    <Line
+                      type="monotone"
+                      dataKey="batchBAttendance"
+                      name={`${data.batchB.batchLabel} (Actual)`}
+                      stroke="#047857"
+                      strokeWidth={2}
+                      dot={{ r: 3 }}
+                      connectNulls
+                    />
+                    <Line
+                      type="monotone"
+                      dataKey="batchBProjected"
+                      name={`${data.batchB.batchLabel} (2-Wk Proj)`}
+                      stroke="#047857"
+                      strokeDasharray="5 5"
+                      strokeWidth={2}
+                      dot={{ r: 3 }}
+                      connectNulls
+                    />
+                  </ComposedChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+          )}
         </div>
       ) : null}
     </section>

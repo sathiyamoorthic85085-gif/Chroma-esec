@@ -1,6 +1,14 @@
 import { type FormEvent, useEffect, useMemo, useState } from 'react';
-import { AlertTriangle, CheckCircle2, Clock, Send, X } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, Clock, Music, Play, Send, Sparkles, Upload, X } from 'lucide-react';
 import { api } from '../lib/api';
+import {
+  getFacultyAudioSettings,
+  playFacultyAlertAudio,
+  saveFacultyAudioSettings,
+  validateCustomAudioFile,
+  type FacultyAudioPreset,
+  type FacultyAudioSettings,
+} from '../lib/facultyAudio';
 import type { ServerTimePayload, TimetableSlot, UserProfile } from '../types';
 
 interface FacultyDelayButtonProps {
@@ -34,6 +42,10 @@ export function FacultyDelayButton({
   const [submitting, setSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [sentToast, setSentToast] = useState<string | null>(null);
+  const [audioSettings, setAudioSettings] = useState<FacultyAudioSettings>(() =>
+    getFacultyAudioSettings()
+  );
+  const [audioErr, setAudioErr] = useState<string | null>(null);
 
   const relevantSlots = useMemo(() => {
     const activeDay = serverTime?.weekday ?? '';
@@ -97,6 +109,7 @@ export function FacultyDelayButton({
 
       setOpen(false);
       setNote('');
+      playFacultyAlertAudio('faculty_delay', { overrideSettings: audioSettings });
       setSentToast(
         `Faculty delay alert dispatched to ${res.alert.facultyName}, HOD, and Class Advisor.`
       );
@@ -161,7 +174,14 @@ export function FacultyDelayButton({
               </button>
             </div>
 
-            <form onSubmit={handleSubmit} className="p-5 space-y-4">
+            <form onSubmit={handleSubmit} className="p-5 space-y-4 max-h-[82vh] overflow-y-auto">
+              <div className="p-3 rounded-lg bg-indigo-50 border border-indigo-200 flex items-start gap-2 text-[11px] text-indigo-950">
+                <Sparkles className="w-4 h-4 text-indigo-700 shrink-0 mt-0.5" />
+                <div>
+                  <span className="font-semibold">Auto Time-Analysis Always Active:</span> The server automatically checks the live timetable every minute and alerts the scheduled faculty&apos;s mobile if attendance hasn&apos;t started. Use this form anytime for immediate manual escalation.
+                </div>
+              </div>
+
               {errorMsg && (
                 <div className="p-3 rounded-lg bg-rose-50 border border-rose-200 text-xs text-rose-800">
                   {errorMsg}
@@ -281,6 +301,96 @@ export function FacultyDelayButton({
                   className="w-full px-3 py-2 min-h-[40px] text-xs border border-slate-300 rounded-lg"
                 />
               </label>
+
+              {/* Custom Audio Notification Picker for Faculty Alert */}
+              <div className="p-3 rounded-lg bg-slate-50 border border-slate-200 space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[11px] font-semibold text-slate-800 inline-flex items-center gap-1.5">
+                    <Music className="w-3.5 h-3.5 text-indigo-700" />
+                    Custom Audio Notification Tone
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      playFacultyAlertAudio('faculty_delay', { overrideSettings: audioSettings })
+                    }
+                    className="inline-flex items-center gap-1 px-2 py-1 text-[10px] font-semibold text-indigo-800 bg-indigo-100 hover:bg-indigo-200 rounded"
+                  >
+                    <Play className="w-2.5 h-2.5" />
+                    Preview
+                  </button>
+                </div>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {(
+                    [
+                      { id: 'siren_pulse', label: 'Siren Pulse' },
+                      { id: 'campus_bell', label: 'Campus Bell' },
+                      { id: 'urgent_chime', label: 'Urgent Chime' },
+                    ] as { id: FacultyAudioPreset; label: string }[]
+                  ).map((p) => (
+                    <button
+                      key={p.id}
+                      type="button"
+                      onClick={() => {
+                        const updated = saveFacultyAudioSettings({ preset: p.id });
+                        setAudioSettings(updated);
+                        playFacultyAlertAudio('faculty_delay', { overrideSettings: updated });
+                      }}
+                      className={`px-2 py-1 text-[10px] font-medium rounded border ${
+                        audioSettings.preset === p.id
+                          ? 'bg-indigo-700 text-white border-indigo-700'
+                          : 'bg-white text-slate-700 border-slate-300'
+                      }`}
+                    >
+                      {p.label}
+                    </button>
+                  ))}
+                  <label className="inline-flex items-center gap-1 px-2 py-1 text-[10px] font-semibold text-indigo-800 bg-white border border-indigo-300 hover:bg-indigo-50 rounded cursor-pointer">
+                    <Upload className="w-3 h-3" />
+                    {audioSettings.customAudioName ? 'Change Custom Audio' : 'Upload Custom Audio'}
+                    <input
+                      type="file"
+                      accept="audio/*"
+                      onChange={(ev) => {
+                        const f = ev.target.files?.[0];
+                        ev.target.value = '';
+                        if (!f) return;
+                        const err = validateCustomAudioFile(f);
+                        if (err) {
+                          setAudioErr(err);
+                          return;
+                        }
+                        setAudioErr(null);
+                        const reader = new FileReader();
+                        reader.onload = () => {
+                          if (typeof reader.result !== 'string') return;
+                          try {
+                            const updated = saveFacultyAudioSettings({
+                              preset: 'custom',
+                              customAudioName: f.name,
+                              customAudioDataUrl: reader.result,
+                            });
+                            setAudioSettings(updated);
+                            playFacultyAlertAudio('faculty_delay', { overrideSettings: updated });
+                          } catch (saveErr) {
+                            setAudioErr(
+                              saveErr instanceof Error ? saveErr.message : 'Unable to save audio.'
+                            );
+                          }
+                        };
+                        reader.readAsDataURL(f);
+                      }}
+                      className="hidden"
+                    />
+                  </label>
+                </div>
+                {audioSettings.preset === 'custom' && audioSettings.customAudioName && (
+                  <div className="text-[10px] text-emerald-700">
+                    Active custom audio: {audioSettings.customAudioName}
+                  </div>
+                )}
+                {audioErr && <div className="text-[10px] text-rose-700">{audioErr}</div>}
+              </div>
 
               <div className="flex items-center gap-2 text-[11px] text-slate-600 bg-rose-50/70 border border-rose-100 rounded-lg px-3 py-2">
                 <Clock className="w-3.5 h-3.5 text-rose-700 shrink-0" />

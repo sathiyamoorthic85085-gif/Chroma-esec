@@ -1,9 +1,11 @@
 import { type FormEvent, useEffect, useMemo, useState } from 'react';
 import {
   AlertTriangle,
+  ArrowLeftRight,
   Calendar,
   CalendarPlus,
   Check,
+  CheckCircle2,
   ChevronLeft,
   ChevronRight,
   Clock,
@@ -18,11 +20,13 @@ import {
   Trash2,
   Users,
   X,
+  XCircle,
 } from 'lucide-react';
 import { api } from '../lib/api';
 import { notifyExportSaved } from '../lib/exportNotify';
 import type {
   DepartmentStaff,
+  FacultyAlterationItem,
   OtherDepartmentStaff,
   ServerTimePayload,
   SessionOverlapWarning,
@@ -103,6 +107,10 @@ const PERIOD_WINDOWS: PeriodWindow[] = [
   },
   { num: 7, start: '15:05', end: '15:55', time: '15:05–15:55', startMinutes: 905, endMinutes: 955 },
   { num: 8, start: '15:55', end: '16:45', time: '15:55–16:45', startMinutes: 955, endMinutes: 1005 },
+  { num: 9, start: '16:45', end: '17:35', time: '16:45–17:35', startMinutes: 1005, endMinutes: 1055 },
+  { num: 10, start: '17:35', end: '18:25', time: '17:35–18:25', startMinutes: 1055, endMinutes: 1105 },
+  { num: 11, start: '18:25', end: '19:15', time: '18:25–19:15', startMinutes: 1105, endMinutes: 1155 },
+  { num: 12, start: '19:15', end: '20:05', time: '19:15–20:05', startMinutes: 1155, endMinutes: 1205 },
 ];
 
 function parseHHMM(value: string): number | null {
@@ -307,6 +315,44 @@ export function TimetableView({
   const [modalError, setModalError] = useState<string | null>(null);
   const [copiedSlotId, setCopiedSlotId] = useState<number | null>(null);
 
+  // Faculty Alteration workflow (Busy / OD / Absent -> HOD Permission)
+  const canRequestAlteration =
+    user.role === 'hod' ||
+    user.role === 'class_advisor' ||
+    user.role === 'dept_staff' ||
+    user.role === 'other_dept_staff';
+  const [alterations, setAlterations] = useState<FacultyAlterationItem[]>([]);
+  const [substituteCandidates, setSubstituteCandidates] = useState<
+    {
+      userId: number | null;
+      fullName: string;
+      email: string;
+      phone: string;
+      designation: string;
+      role: string;
+    }[]
+  >([]);
+  const [alterMode, setAlterMode] = useState(false);
+  const [alterReasonCategory, setAlterReasonCategory] = useState<'busy' | 'od' | 'absent'>('busy');
+  const [alterSubName, setAlterSubName] = useState('');
+  const [alterNote, setAlterNote] = useState('');
+  const [alterSubmitting, setAlterSubmitting] = useState(false);
+  const [alterDecidingId, setAlterDecidingId] = useState<number | null>(null);
+
+  const loadAlterations = async () => {
+    try {
+      const res = await api.getFacultyAlterations(token);
+      setAlterations(res.alterations || []);
+      setSubstituteCandidates(res.candidates || []);
+    } catch {
+      // Non-blocking
+    }
+  };
+
+  useEffect(() => {
+    void loadAlterations();
+  }, [token]);
+
   const [selectedYear, selectedSection] = selectedClass.split('::');
 
   const classSlots = useMemo(
@@ -316,6 +362,25 @@ export function TimetableView({
       ),
     [slots, selectedYear, selectedSection]
   );
+
+  const visiblePeriodWindows = useMemo(() => {
+    const maxSlotPeriod = classSlots.reduce((m, s) => Math.max(m, s.periodNumber || 0), 8);
+    const limit = Math.min(12, Math.max(8, maxSlotPeriod));
+    return PERIOD_WINDOWS.filter((pw) => pw.num <= limit);
+  }, [classSlots]);
+
+  const alterationBySlotId = useMemo(() => {
+    const map = new Map<number, FacultyAlterationItem>();
+    alterations.forEach((a) => {
+      if (a.timetableSlotId && (a.status === 'approved' || a.status === 'pending_hod')) {
+        const existing = map.get(a.timetableSlotId);
+        if (!existing || a.status === 'approved') {
+          map.set(a.timetableSlotId, a);
+        }
+      }
+    });
+    return map;
+  }, [alterations]);
 
   const matchesFilters = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
@@ -578,6 +643,10 @@ export function TimetableView({
       roomNo: slot.roomNo,
     });
     setIsEditingModal(false);
+    setAlterMode(false);
+    setAlterSubName('');
+    setAlterNote('');
+    setAlterReasonCategory('busy');
     setModalError(null);
   };
 
@@ -600,6 +669,7 @@ export function TimetableView({
       roomNo: '',
     });
     setIsEditingModal(true);
+    setAlterMode(false);
     setModalError(null);
   };
 
@@ -607,7 +677,79 @@ export function TimetableView({
     setModalSlot(null);
     setEditorDraft(null);
     setIsEditingModal(false);
+    setAlterMode(false);
     setModalError(null);
+  };
+
+  const handleSubmitSlotAlteration = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!modalSlot) return;
+    const chosenSub = alterSubName.trim();
+    if (!chosenSub) {
+      setModalError('Select or enter a substitute faculty name.');
+      return;
+    }
+    const candidate = substituteCandidates.find(
+      (c) => c.fullName.toLowerCase() === chosenSub.toLowerCase()
+    );
+    setAlterSubmitting(true);
+    setModalError(null);
+    try {
+      await api.createFacultyAlteration(token, {
+        timetableSlotId: modalSlot.id,
+        alterationDate: serverTime?.isoDate,
+        substituteFacultyName: chosenSub,
+        substituteUserId: candidate?.userId ?? null,
+        substituteEmail: candidate?.email ?? '',
+        substitutePhone: candidate?.phone ?? '',
+        reasonCategory: alterReasonCategory,
+        reasonNote: alterNote.trim(),
+        dayOfWeek: modalSlot.dayOfWeek,
+        periodNumber: modalSlot.periodNumber,
+        subjectCode: modalSlot.subjectCode,
+        subjectName: modalSlot.subjectName,
+        yearOfStudy: modalSlot.yearOfStudy,
+        section: modalSlot.section,
+        roomNo: modalSlot.roomNo,
+      });
+      await loadAlterations();
+      if (onRecordAdded) await onRecordAdded();
+      setAlterMode(false);
+      setAlterSubName('');
+      setAlterNote('');
+      setFeedbackMsg({
+        type: 'ok',
+        text:
+          user.role === 'hod'
+            ? `Faculty alteration approved & active: ${chosenSub} covering ${modalSlot.subjectCode} (P${modalSlot.periodNumber}).`
+            : `Alteration request sent to HOD for permission (${chosenSub} to cover ${modalSlot.subjectCode}, P${modalSlot.periodNumber}).`,
+      });
+    } catch (err) {
+      setModalError(err instanceof Error ? err.message : 'Unable to submit faculty alteration.');
+    } finally {
+      setAlterSubmitting(false);
+    }
+  };
+
+  const handleDecideSlotAlteration = async (id: number, decision: 'approve' | 'reject') => {
+    setAlterDecidingId(id);
+    setModalError(null);
+    try {
+      await api.decideFacultyAlteration(token, id, decision);
+      await loadAlterations();
+      if (onRecordAdded) await onRecordAdded();
+      setFeedbackMsg({
+        type: 'ok',
+        text:
+          decision === 'approve'
+            ? 'Faculty alteration approved and applied to schedule.'
+            : 'Faculty alteration request rejected.',
+      });
+    } catch (err) {
+      setModalError(err instanceof Error ? err.message : 'Failed to update alteration status.');
+    } finally {
+      setAlterDecidingId(null);
+    }
   };
 
   const handleSaveDraft = async (e: FormEvent) => {
@@ -711,6 +853,7 @@ export function TimetableView({
     const header = [
       'Day',
       'Period',
+      'Time Period (Per Hour)',
       'Start Time',
       'End Time',
       'Subject Code',
@@ -731,6 +874,7 @@ export function TimetableView({
         [
           s.dayOfWeek,
           `P${s.periodNumber}`,
+          s.timePeriodPerHour || `${s.startTime}–${s.endTime} (Hr ${s.periodNumber})`,
           s.startTime,
           s.endTime,
           s.subjectCode,
@@ -810,18 +954,18 @@ export function TimetableView({
   const isSelectedDayToday = activeWeekday === selectedDay;
   const dailyPeriods = useMemo(() => {
     const hasFilter = searchQuery.trim().length > 0 || facultyFilter !== 'all';
-    return PERIOD_WINDOWS.map((pw) => {
+    return visiblePeriodWindows.map((pw) => {
       const slot = slotLookup.get(`${selectedDay}::${pw.num}`) ?? null;
       const matches = slot ? matchesFilters(slot) : !hasFilter;
       return { pw, slot, visible: slot ? matches : showFreePeriods && !hasFilter };
     });
-  }, [selectedDay, slotLookup, matchesFilters, showFreePeriods, searchQuery, facultyFilter]);
+  }, [visiblePeriodWindows, selectedDay, slotLookup, matchesFilters, showFreePeriods, searchQuery, facultyFilter]);
 
   const dailySummary = useMemo(() => {
     let scheduled = 0;
     let homeDept = 0;
     let otherDept = 0;
-    PERIOD_WINDOWS.forEach((pw) => {
+    visiblePeriodWindows.forEach((pw) => {
       const s = slotLookup.get(`${selectedDay}::${pw.num}`);
       if (s) {
         scheduled += 1;
@@ -831,11 +975,11 @@ export function TimetableView({
     });
     return {
       scheduled,
-      free: PERIOD_WINDOWS.length - scheduled,
+      free: visiblePeriodWindows.length - scheduled,
       homeDept,
       otherDept,
     };
-  }, [selectedDay, slotLookup]);
+  }, [visiblePeriodWindows, selectedDay, slotLookup]);
 
   const isFilteringSchedule = searchQuery.trim().length > 0 || facultyFilter !== 'all';
 
@@ -1344,15 +1488,18 @@ export function TimetableView({
                           : 'bg-slate-50/35'
                       }`}
                     >
-                      {/* Time & Period Column */}
-                      <div className="sm:w-36 shrink-0 flex sm:flex-col items-baseline sm:items-start justify-between gap-2">
+                      {/* Time Period (Per Hour) Column */}
+                      <div className="sm:w-44 shrink-0 flex sm:flex-col items-baseline sm:items-start justify-between gap-1.5">
+                        <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">
+                          Time Period (Per Hour)
+                        </div>
                         <div className="flex items-baseline gap-2">
                           <span
                             className={`font-mono text-sm font-semibold tabular-nums ${
                               isLive ? 'text-indigo-800' : 'text-slate-900'
                             }`}
                           >
-                            P{pw.num}
+                            Hr {pw.num}
                           </span>
                           <span className="font-mono text-xs tabular-nums text-slate-600">
                             {slot ? `${slot.startTime}–${slot.endTime}` : pw.time}
@@ -1380,13 +1527,31 @@ export function TimetableView({
                           onClick={() => openSlotDetail(slot)}
                           className="flex-1 min-w-0 text-left space-y-1 focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-600 rounded-md"
                         >
-                          <div className="flex flex-wrap items-baseline gap-x-2.5 gap-y-0.5">
+                          <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1">
                             <span className="font-mono text-xs font-semibold text-indigo-800">
                               {slot.subjectCode}
                             </span>
                             <span className="text-sm font-semibold text-slate-900">
                               {slot.subjectName}
                             </span>
+                            {(() => {
+                              const alt = slot.activeAlteration || alterationBySlotId.get(slot.id);
+                              if (!alt) return null;
+                              return (
+                                <span
+                                  className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-semibold border ${
+                                    alt.status === 'approved'
+                                      ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                                      : 'bg-amber-50 border-amber-200 text-amber-800'
+                                  }`}
+                                >
+                                  <ArrowLeftRight className="w-3 h-3" />
+                                  {alt.status === 'approved'
+                                    ? `Altered → ${alt.substituteFacultyName}`
+                                    : `Alter Pending HOD (${alt.substituteFacultyName})`}
+                                </span>
+                              );
+                            })()}
                           </div>
                           <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-slate-600">
                             <span className="font-medium text-slate-700">{slot.facultyName}</span>
@@ -1504,10 +1669,11 @@ export function TimetableView({
               <table className="w-full border-collapse text-left min-w-[1000px]">
                 <thead>
                   <tr className="border-b border-slate-200 bg-slate-50">
-                    <th className="sticky left-0 z-10 bg-slate-50 py-3 px-4 text-xs font-semibold text-slate-700 w-32 border-r border-slate-200">
-                      Day
+                    <th className="sticky left-0 z-10 bg-slate-50 py-3 px-4 text-xs font-semibold text-slate-700 w-36 border-r border-slate-200">
+                      <div>Day</div>
+                      <div className="text-[10px] font-normal text-slate-500">Time Period (Per Hr)</div>
                     </th>
-                    {PERIOD_WINDOWS.map((pw) => {
+                    {visiblePeriodWindows.map((pw) => {
                       const isCurrentCol = activePeriodNum === pw.num;
                       return (
                         <th
@@ -1517,7 +1683,7 @@ export function TimetableView({
                           }`}
                         >
                           <div className="flex items-center justify-between gap-1">
-                            <span className="font-mono tabular-nums">P{pw.num}</span>
+                            <span className="font-mono tabular-nums">Hr {pw.num}</span>
                             {isCurrentCol && (
                               <span className="text-[11px] font-medium text-indigo-700">
                                 Now
@@ -1563,10 +1729,11 @@ export function TimetableView({
                             </div>
                           </button>
                         </td>
-                        {PERIOD_WINDOWS.map((pw) => {
+                        {visiblePeriodWindows.map((pw) => {
                           const slot = slotLookup.get(`${day}::${pw.num}`);
                           const isLiveSlot = isToday && activePeriodNum === pw.num;
                           const dimmed = Boolean(slot && isFilteringSchedule && !matchesFilters(slot));
+                          const alt = slot ? slot.activeAlteration || alterationBySlotId.get(slot.id) : null;
                           return (
                             <td
                               key={pw.num}
@@ -1599,6 +1766,17 @@ export function TimetableView({
                                     <div className="text-[11px] text-slate-600 leading-snug truncate">
                                       {slot.facultyName}
                                     </div>
+                                    {alt && (
+                                      <div
+                                        className={`text-[10px] font-semibold truncate ${
+                                          alt.status === 'approved' ? 'text-emerald-700' : 'text-amber-700'
+                                        }`}
+                                      >
+                                        {alt.status === 'approved'
+                                          ? `Alt: ${alt.substituteFacultyName}`
+                                          : `Alt Req: ${alt.substituteFacultyName}`}
+                                      </div>
+                                    )}
                                     <div className="text-[11px] text-slate-500">
                                       {slot.facultyType === 'other_department'
                                         ? 'Other Dept'
@@ -1801,7 +1979,13 @@ export function TimetableView({
             </div>
 
             {!isEditingModal && modalSlot ? (
-              <div className="p-5 space-y-4">
+              <div className="p-5 space-y-4 max-h-[80vh] overflow-y-auto">
+                {modalError && (
+                  <div className="p-3 rounded-lg bg-rose-50 border border-rose-200 text-xs text-rose-800">
+                    {modalError}
+                  </div>
+                )}
+
                 <dl className="grid grid-cols-2 gap-x-4 gap-y-3 text-xs">
                   <div>
                     <dt className="text-slate-500">Subject Code</dt>
@@ -1813,6 +1997,13 @@ export function TimetableView({
                     <dt className="text-slate-500">Room / Lab</dt>
                     <dd className="font-mono font-semibold text-slate-900 mt-0.5">
                       {modalSlot.roomNo || 'TBA'}
+                    </dd>
+                  </div>
+                  <div className="col-span-2">
+                    <dt className="text-slate-500">Time Period (Per Hour)</dt>
+                    <dd className="font-mono font-semibold text-indigo-800 mt-0.5">
+                      {modalSlot.timePeriodPerHour ||
+                        `${modalSlot.startTime}–${modalSlot.endTime} (Hr ${modalSlot.periodNumber})`}
                     </dd>
                   </div>
                   <div className="col-span-2">
@@ -1833,8 +2024,148 @@ export function TimetableView({
                   </div>
                 </dl>
 
+                {/* Active / Pending Faculty Alteration Banner */}
+                {(() => {
+                  const alt = modalSlot.activeAlteration || alterationBySlotId.get(modalSlot.id);
+                  if (!alt) return null;
+                  return (
+                    <div
+                      className={`rounded-lg border p-3 text-xs space-y-2 ${
+                        alt.status === 'approved'
+                          ? 'bg-emerald-50 border-emerald-200 text-emerald-950'
+                          : 'bg-amber-50 border-amber-200 text-amber-950'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="font-semibold flex items-center gap-1.5">
+                          <ArrowLeftRight className="w-3.5 h-3.5" />
+                          {alt.status === 'approved'
+                            ? 'Approved Faculty Alteration'
+                            : 'Faculty Alteration Pending HOD Permission'}
+                        </span>
+                        <span className="uppercase font-mono text-[10px] font-semibold">
+                          {alt.reasonCategory}
+                        </span>
+                      </div>
+                      <p>
+                        Substitute: <strong>{alt.substituteFacultyName}</strong>
+                        {alt.reasonNote ? ` · ${alt.reasonNote}` : ''}
+                      </p>
+                      {user.role === 'hod' && alt.status === 'pending_hod' && (
+                        <div className="flex items-center gap-2 pt-1">
+                          <button
+                            type="button"
+                            disabled={alterDecidingId === alt.id}
+                            onClick={() => handleDecideSlotAlteration(alt.id, 'approve')}
+                            className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-md bg-emerald-700 hover:bg-emerald-800 text-white text-[11px] font-semibold disabled:opacity-60"
+                          >
+                            <CheckCircle2 className="w-3.5 h-3.5" />
+                            Approve Alteration
+                          </button>
+                          <button
+                            type="button"
+                            disabled={alterDecidingId === alt.id}
+                            onClick={() => handleDecideSlotAlteration(alt.id, 'reject')}
+                            className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-md bg-rose-600 hover:bg-rose-700 text-white text-[11px] font-semibold disabled:opacity-60"
+                          >
+                            <XCircle className="w-3.5 h-3.5" />
+                            Reject
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
+
+                {/* Inline Alter Faculty Request Form */}
+                {alterMode && canRequestAlteration && (
+                  <form
+                    onSubmit={handleSubmitSlotAlteration}
+                    className="rounded-lg border border-indigo-200 bg-indigo-50/50 p-3.5 space-y-3 text-xs"
+                  >
+                    <div className="flex items-center justify-between">
+                      <span className="font-semibold text-indigo-950 flex items-center gap-1.5">
+                        <ArrowLeftRight className="w-3.5 h-3.5 text-indigo-700" />
+                        Alter Faculty (Requires HOD Permission)
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => setAlterMode(false)}
+                        className="text-slate-500 hover:text-slate-800"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                      <label className="space-y-1">
+                        <span className="block font-medium text-slate-700">Reason</span>
+                        <select
+                          value={alterReasonCategory}
+                          onChange={(e) =>
+                            setAlterReasonCategory(e.target.value as 'busy' | 'od' | 'absent')
+                          }
+                          className="w-full px-2.5 py-2 border border-slate-300 rounded-lg bg-white text-slate-900"
+                        >
+                          <option value="busy">Busy / Official Duty</option>
+                          <option value="od">On Duty (OD)</option>
+                          <option value="absent">Absent / Leave</option>
+                        </select>
+                      </label>
+                      <label className="space-y-1">
+                        <span className="block font-medium text-slate-700">Substitute Faculty</span>
+                        <input
+                          type="text"
+                          required
+                          list="alter-faculty-candidates"
+                          value={alterSubName}
+                          onChange={(e) => setAlterSubName(e.target.value)}
+                          placeholder="Choose or type faculty name..."
+                          className="w-full px-2.5 py-2 border border-slate-300 rounded-lg bg-white text-slate-900"
+                        />
+                        <datalist id="alter-faculty-candidates">
+                          {substituteCandidates.map((c, idx) => (
+                            <option key={idx} value={c.fullName}>
+                              {c.designation || c.role}
+                            </option>
+                          ))}
+                        </datalist>
+                      </label>
+                    </div>
+                    <label className="block space-y-1">
+                      <span className="block font-medium text-slate-700">Notes for HOD (optional)</span>
+                      <input
+                        type="text"
+                        value={alterNote}
+                        onChange={(e) => setAlterNote(e.target.value)}
+                        placeholder="e.g. Attending lab audit / external viva; substitute confirmed"
+                        className="w-full px-2.5 py-2 border border-slate-300 rounded-lg bg-white text-slate-900"
+                      />
+                    </label>
+                    <div className="flex justify-end gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setAlterMode(false)}
+                        className="px-3 py-1.5 border border-slate-300 rounded-lg text-slate-700 bg-white"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        type="submit"
+                        disabled={alterSubmitting}
+                        className="px-3.5 py-1.5 rounded-lg bg-indigo-700 hover:bg-indigo-800 text-white font-semibold disabled:opacity-60"
+                      >
+                        {alterSubmitting
+                          ? 'Submitting...'
+                          : user.role === 'hod'
+                          ? 'Approve & Apply Alteration'
+                          : 'Send to HOD for Permission'}
+                      </button>
+                    </div>
+                  </form>
+                )}
+
                 <div className="pt-3 border-t border-slate-200 flex flex-wrap items-center justify-between gap-2">
-                  <div className="flex items-center gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
                     <button
                       type="button"
                       onClick={() => handleCopySlot(modalSlot)}
@@ -1864,16 +2195,28 @@ export function TimetableView({
                     </button>
                   </div>
 
-                  {canManageSchedule && (
-                    <button
-                      type="button"
-                      onClick={() => setIsEditingModal(true)}
-                      className="inline-flex items-center gap-1.5 px-4 py-2 min-h-[40px] text-xs font-medium text-white bg-indigo-700 hover:bg-indigo-800 rounded-lg transition-colors whitespace-nowrap"
-                    >
-                      <PenLine className="w-3.5 h-3.5" />
-                      Edit Period
-                    </button>
-                  )}
+                  <div className="flex flex-wrap items-center gap-2">
+                    {canRequestAlteration && !alterMode && (
+                      <button
+                        type="button"
+                        onClick={() => setAlterMode(true)}
+                        className="inline-flex items-center gap-1.5 px-3.5 py-2 min-h-[40px] text-xs font-semibold text-amber-900 bg-amber-100 hover:bg-amber-200 border border-amber-300 rounded-lg transition-colors whitespace-nowrap"
+                      >
+                        <ArrowLeftRight className="w-3.5 h-3.5" />
+                        Alter Faculty
+                      </button>
+                    )}
+                    {canManageSchedule && (
+                      <button
+                        type="button"
+                        onClick={() => setIsEditingModal(true)}
+                        className="inline-flex items-center gap-1.5 px-4 py-2 min-h-[40px] text-xs font-medium text-white bg-indigo-700 hover:bg-indigo-800 rounded-lg transition-colors whitespace-nowrap"
+                      >
+                        <PenLine className="w-3.5 h-3.5" />
+                        Edit Period
+                      </button>
+                    )}
+                  </div>
                 </div>
               </div>
             ) : (
@@ -1905,7 +2248,7 @@ export function TimetableView({
                   </label>
 
                   <label className="block space-y-1">
-                    <span className="text-xs font-medium text-slate-700">Period</span>
+                    <span className="text-xs font-medium text-slate-700">Period (1–12)</span>
                     <select
                       value={editorDraft.periodNumber}
                       onChange={(e) => {
@@ -1926,11 +2269,47 @@ export function TimetableView({
                     >
                       {PERIOD_WINDOWS.map((pw) => (
                         <option key={pw.num} value={pw.num}>
-                          P{pw.num} ({pw.time})
+                          Hr {pw.num} ({pw.time})
                         </option>
                       ))}
                     </select>
                   </label>
+
+                  <label className="block space-y-1">
+                    <span className="text-xs font-medium text-slate-700">Start Time</span>
+                    <input
+                      type="time"
+                      required
+                      value={editorDraft.startTime}
+                      onChange={(e) =>
+                        setEditorDraft((prev) =>
+                          prev ? { ...prev, startTime: e.target.value } : prev
+                        )
+                      }
+                      className="w-full px-3 py-2 min-h-[40px] text-xs font-mono border border-slate-300 rounded-lg bg-white text-slate-900"
+                    />
+                  </label>
+
+                  <label className="block space-y-1">
+                    <span className="text-xs font-medium text-slate-700">End Time</span>
+                    <input
+                      type="time"
+                      required
+                      value={editorDraft.endTime}
+                      onChange={(e) =>
+                        setEditorDraft((prev) =>
+                          prev ? { ...prev, endTime: e.target.value } : prev
+                        )
+                      }
+                      className="w-full px-3 py-2 min-h-[40px] text-xs font-mono border border-slate-300 rounded-lg bg-white text-slate-900"
+                    />
+                  </label>
+
+                  <div className="col-span-2 text-[11px] text-indigo-800 bg-indigo-50 border border-indigo-200 rounded-lg px-3 py-2">
+                    <strong>Time Period (Per Hour):</strong> {editorDraft.startTime}–{editorDraft.endTime} (Hr{' '}
+                    {editorDraft.periodNumber}) · Saving automatically re-sequences periods chronologically for{' '}
+                    {editorDraft.dayOfWeek}.
+                  </div>
 
                   <label className="block space-y-1">
                     <span className="text-xs font-medium text-slate-700">Subject Code</span>

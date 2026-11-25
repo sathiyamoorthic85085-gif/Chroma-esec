@@ -4,15 +4,31 @@ import {
   Bell,
   BellOff,
   CheckCircle2,
+  Crown,
   MessageSquare,
+  Music,
+  PhoneCall,
+  Play,
   ShieldAlert,
+  Sparkles,
   Target,
+  Trash2,
+  Upload,
   Volume2,
   VolumeX,
   X,
   Zap,
 } from 'lucide-react';
 import { api } from '../lib/api';
+import {
+  getFacultyAudioSettings,
+  playFacultyAlertAudio,
+  saveFacultyAudioSettings,
+  stopActiveFacultyAudio,
+  validateCustomAudioFile,
+  type FacultyAudioPreset,
+  type FacultyAudioSettings,
+} from '../lib/facultyAudio';
 import {
   ROLE_LABELS,
   type ChatMessageItem,
@@ -43,6 +59,16 @@ export interface LiveNotificationEntry {
   targetSection?: 'attendance' | 'overview';
 }
 
+interface IncomingPageCall {
+  id: string;
+  callerName: string;
+  callerRole: string;
+  targetName: string;
+  targetPhone: string;
+  message: string;
+  createdAt: string;
+}
+
 interface WorkspaceNotificationCenterProps {
   token: string;
   user: UserProfile;
@@ -53,53 +79,8 @@ interface WorkspaceNotificationCenterProps {
   onOpenAttendance?: () => void;
   onOpenOverview?: () => void;
   onFacultyDelayCountChange?: (count: number) => void;
+  onDelegationChanged?: () => void;
   refreshSignal?: number;
-}
-
-function playChannelChime(channel: NotificationChannel) {
-  try {
-    const AudioCtx =
-      window.AudioContext ||
-      (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-    if (!AudioCtx) return;
-    const ctx = new AudioCtx();
-    const now = ctx.currentTime;
-
-    // Distinct acoustic profiles per notification channel
-    const pattern =
-      channel === 'chat'
-        ? [{ freq: 659.25, delay: 0, dur: 0.14, gain: 0.08 }] // Soft single E5 ping for regular chat
-        : channel === 'power_boost'
-        ? [
-            { freq: 880, delay: 0, dur: 0.18, gain: 0.14 },
-            { freq: 1174.66, delay: 0.15, dur: 0.24, gain: 0.14 },
-          ] // Urgent rising A5 -> D6 chime for Power Boost
-        : [
-            { freq: 740, delay: 0, dur: 0.14, gain: 0.15 },
-            { freq: 987.77, delay: 0.14, dur: 0.14, gain: 0.15 },
-            { freq: 740, delay: 0.28, dur: 0.2, gain: 0.15 },
-          ]; // Triple-pulse F#5 -> B5 -> F#5 alert for Faculty Delay
-
-    pattern.forEach((step) => {
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.type = channel === 'faculty_delay' ? 'triangle' : 'sine';
-      osc.frequency.setValueAtTime(step.freq, now + step.delay);
-      gain.gain.setValueAtTime(0.0001, now + step.delay);
-      gain.gain.exponentialRampToValueAtTime(step.gain, now + step.delay + 0.02);
-      gain.gain.exponentialRampToValueAtTime(0.0001, now + step.delay + step.dur);
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-      osc.start(now + step.delay);
-      osc.stop(now + step.delay + step.dur + 0.02);
-    });
-
-    window.setTimeout(() => {
-      ctx.close().catch(() => {});
-    }, 900);
-  } catch {
-    // Ignore browser autoplay restrictions
-  }
 }
 
 function sendWebNotification(params: {
@@ -166,9 +147,16 @@ export function WorkspaceNotificationCenter({
   onOpenAttendance,
   onOpenOverview,
   onFacultyDelayCountChange,
+  onDelegationChanged,
   refreshSignal = 0,
 }: WorkspaceNotificationCenterProps) {
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [audioConfigOpen, setAudioConfigOpen] = useState(false);
+  const [audioSettings, setAudioSettings] = useState<FacultyAudioSettings>(() =>
+    getFacultyAudioSettings()
+  );
+  const [audioUploadError, setAudioUploadError] = useState<string | null>(null);
+  const [incomingPageCall, setIncomingPageCall] = useState<IncomingPageCall | null>(null);
   const [filterTab, setFilterTab] = useState<'all' | NotificationChannel>('all');
   const [notifications, setNotifications] = useState<LiveNotificationEntry[]>([]);
   const [toasts, setToasts] = useState<LiveNotificationEntry[]>([]);
@@ -201,6 +189,58 @@ export function WorkspaceNotificationCenter({
 
   const seenNotifIds = useRef<Set<string>>(new Set());
 
+  const handleAudioPresetChange = (preset: FacultyAudioPreset) => {
+    setAudioUploadError(null);
+    const updated = saveFacultyAudioSettings({ preset });
+    setAudioSettings(updated);
+    if (soundRef.current) {
+      playFacultyAlertAudio('faculty_delay', { overrideSettings: updated });
+    }
+  };
+
+  const handleUploadCustomAudio = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    const err = validateCustomAudioFile(file);
+    if (err) {
+      setAudioUploadError(err);
+      return;
+    }
+    setAudioUploadError(null);
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result !== 'string') return;
+      try {
+        const updated = saveFacultyAudioSettings({
+          preset: 'custom',
+          customAudioName: file.name,
+          customAudioDataUrl: reader.result,
+        });
+        setAudioSettings(updated);
+        playFacultyAlertAudio('faculty_delay', { overrideSettings: updated });
+      } catch (storageErr) {
+        setAudioUploadError(
+          storageErr instanceof Error
+            ? storageErr.message
+            : 'Unable to save custom audio file.'
+        );
+      }
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const handleRemoveCustomAudio = () => {
+    stopActiveFacultyAudio();
+    const updated = saveFacultyAudioSettings({
+      preset: 'siren_pulse',
+      customAudioName: '',
+      customAudioDataUrl: '',
+    });
+    setAudioSettings(updated);
+    setAudioUploadError(null);
+  };
+
   const pushLiveNotification = useCallback(
     (entry: LiveNotificationEntry, triggerBrowser: boolean) => {
       if (seenNotifIds.current.has(entry.id)) return;
@@ -210,7 +250,7 @@ export function WorkspaceNotificationCenter({
       setToasts((prev) => [entry, ...prev].slice(0, 3));
 
       if (soundRef.current) {
-        playChannelChime(entry.channel);
+        playFacultyAlertAudio(entry.channel);
       }
 
       if (triggerBrowser) {
@@ -255,6 +295,8 @@ export function WorkspaceNotificationCenter({
 
   useEffect(() => {
     loadFacultyDelays();
+    const timer = window.setInterval(loadFacultyDelays, 60000);
+    return () => window.clearInterval(timer);
   }, [loadFacultyDelays, refreshSignal]);
 
   // Daily push notification nudge if a student has not checked in to Academic Goal Tracker today
@@ -530,6 +572,98 @@ export function WorkspaceNotificationCenter({
                 true
               );
             }
+          } else if (data.type === 'profile:page_call' && data.pageCall) {
+            const pc = data.pageCall as {
+              callerUserId?: number;
+              callerName?: string;
+              callerRole?: string;
+              targetName?: string;
+              targetEmail?: string;
+              targetPhone?: string;
+              message?: string;
+              createdAt?: string;
+            };
+            if (pc.callerUserId === user.id) return;
+            const normMe = user.fullName.toLowerCase().replace(/[^a-z0-9]/g, '');
+            const normTarget = String(pc.targetName ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
+            const isTarget =
+              (pc.targetEmail && pc.targetEmail.toLowerCase() === user.email.toLowerCase()) ||
+              (normMe && normTarget && (normMe.includes(normTarget) || normTarget.includes(normMe)));
+            if (isTarget || user.role === 'hod') {
+              const callObj: IncomingPageCall = {
+                id: `page-call-${Date.now()}`,
+                callerName: pc.callerName || 'Department Member',
+                callerRole: pc.callerRole || 'staff',
+                targetName: pc.targetName || user.fullName,
+                targetPhone: pc.targetPhone || '',
+                message: pc.message || 'Urgent Wake-Up Page-Call from Academia-ESEC.',
+                createdAt: pc.createdAt || new Date().toISOString(),
+              };
+              setIncomingPageCall(callObj);
+              if (soundRef.current) {
+                playFacultyAlertAudio('page_call');
+              }
+              pushLiveNotification(
+                {
+                  id: `notif-pagecall-${pc.createdAt || Date.now()}`,
+                  channel: 'faculty_delay',
+                  title: `Wake-Up Page-Call · ${callObj.callerName}`,
+                  subtitle: `To ${callObj.targetName}`,
+                  body: callObj.message,
+                  createdAt: callObj.createdAt,
+                  read: false,
+                },
+                true
+              );
+            }
+          } else if (data.type === 'faculty_alteration:changed' && data.alteration) {
+            const alt = data.alteration as {
+              id: number;
+              originalFacultyName: string;
+              substituteFacultyName: string;
+              subjectCode: string;
+              periodNumber: number;
+              status: string;
+              reasonCategory: string;
+              createdAt: string;
+            };
+            const isRelevant =
+              user.role === 'hod' ||
+              user.role === 'class_advisor' ||
+              user.fullName.toLowerCase().includes(alt.substituteFacultyName.toLowerCase()) ||
+              user.fullName.toLowerCase().includes(alt.originalFacultyName.toLowerCase());
+            if (isRelevant) {
+              pushLiveNotification(
+                {
+                  id: `alt-${alt.id}-${alt.status}`,
+                  channel: 'faculty_delay',
+                  title: `Faculty Alteration (${alt.status.toUpperCase()}) · P${alt.periodNumber} ${alt.subjectCode}`,
+                  subtitle: `${alt.originalFacultyName} → ${alt.substituteFacultyName} (${alt.reasonCategory.toUpperCase()})`,
+                  body:
+                    alt.status === 'pending'
+                      ? 'Pending HOD permission for faculty period alteration.'
+                      : `Faculty alteration ${alt.status} by HOD.`,
+                  createdAt: alt.createdAt,
+                  read: false,
+                },
+                true
+              );
+            }
+          } else if (data.type === 'hod_delegation:changed') {
+            onDelegationChanged?.();
+            pushLiveNotification(
+              {
+                id: `hod-deleg-${Date.now()}`,
+                channel: 'power_boost',
+                title: 'HOD Control Delegation Updated',
+                subtitle: String(data.summary || 'Department leadership role updated'),
+                body: 'HOD governance permissions have been updated live. Workspace controls refreshed.',
+                createdAt: new Date().toISOString(),
+                read: false,
+                targetSection: 'overview',
+              },
+              true
+            );
           } else if (data.type === 'goal:daily_nudge') {
             pushLiveNotification(
               {
@@ -566,7 +700,7 @@ export function WorkspaceNotificationCenter({
       if (reconnectTimer) window.clearTimeout(reconnectTimer);
       ws?.close();
     };
-  }, [token, user, pushLiveNotification]);
+  }, [token, user, pushLiveNotification, onDelegationChanged]);
 
   const handleEnableWebNotifications = async () => {
     if (typeof window === 'undefined' || !('Notification' in window)) return;
@@ -657,6 +791,19 @@ export function WorkspaceNotificationCenter({
                 <div className="flex items-center gap-1">
                   <button
                     type="button"
+                    onClick={() => setAudioConfigOpen((v) => !v)}
+                    title="Configure Custom Audio Notification for Faculty Alerts"
+                    aria-label="Configure custom audio alert tone"
+                    className={`min-h-[34px] min-w-[34px] inline-flex items-center justify-center rounded-md ${
+                      audioConfigOpen
+                        ? 'bg-indigo-100 text-indigo-800'
+                        : 'text-slate-600 hover:bg-slate-100'
+                    }`}
+                  >
+                    <Music className="w-4 h-4" />
+                  </button>
+                  <button
+                    type="button"
                     onClick={() => setSoundEnabled((prev) => !prev)}
                     aria-label={soundEnabled ? 'Mute notification chimes' : 'Unmute notification chimes'}
                     className="min-h-[34px] min-w-[34px] inline-flex items-center justify-center text-slate-600 hover:bg-slate-100 rounded-md"
@@ -677,6 +824,127 @@ export function WorkspaceNotificationCenter({
                   </button>
                 </div>
               </div>
+
+              {/* Custom Audio Notification Configurator for Faculty Alerts */}
+              {audioConfigOpen && (
+                <div className="px-4 py-3 bg-slate-50 border-b border-slate-200 space-y-2.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[11px] font-bold text-slate-800 inline-flex items-center gap-1.5">
+                      <Music className="w-3.5 h-3.5 text-indigo-700" />
+                      Faculty Alert Custom Audio
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        playFacultyAlertAudio('faculty_delay', {
+                          overrideSettings: audioSettings,
+                        })
+                      }
+                      className="inline-flex items-center gap-1 px-2 py-1 text-[10px] font-semibold bg-indigo-700 hover:bg-indigo-800 text-white rounded"
+                    >
+                      <Play className="w-2.5 h-2.5" />
+                      Test Sound
+                    </button>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-1.5">
+                    {(
+                      [
+                        { id: 'siren_pulse', label: 'Siren Pulse' },
+                        { id: 'campus_bell', label: 'Campus Bell' },
+                        { id: 'urgent_chime', label: 'Urgent Chime' },
+                        {
+                          id: 'custom',
+                          label: audioSettings.customAudioName ? 'Custom File ✓' : 'Custom Audio',
+                        },
+                      ] as const
+                    ).map((opt) => (
+                      <button
+                        key={opt.id}
+                        type="button"
+                        disabled={opt.id === 'custom' && !audioSettings.customAudioDataUrl}
+                        onClick={() => handleAudioPresetChange(opt.id)}
+                        className={`px-2 py-1.5 text-[11px] font-medium rounded-md border text-left truncate disabled:opacity-45 ${
+                          audioSettings.preset === opt.id
+                            ? 'bg-indigo-600 text-white border-indigo-600'
+                            : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-100'
+                        }`}
+                      >
+                        {opt.label}
+                      </button>
+                    ))}
+                  </div>
+
+                  <div className="flex items-center justify-between gap-2">
+                    <label className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-[11px] font-semibold text-indigo-800 bg-white border border-indigo-300 hover:bg-indigo-50 rounded-md cursor-pointer">
+                      <Upload className="w-3 h-3" />
+                      Upload Custom Tone (MP3/WAV)
+                      <input
+                        type="file"
+                        accept="audio/*"
+                        onChange={handleUploadCustomAudio}
+                        className="hidden"
+                      />
+                    </label>
+                    {audioSettings.customAudioDataUrl && (
+                      <button
+                        type="button"
+                        onClick={handleRemoveCustomAudio}
+                        title="Remove custom audio"
+                        className="inline-flex items-center gap-1 px-2 py-1 text-[10px] text-rose-700 hover:bg-rose-50 rounded"
+                      >
+                        <Trash2 className="w-3 h-3" />
+                        Clear
+                      </button>
+                    )}
+                  </div>
+
+                  {audioSettings.customAudioName && (
+                    <div className="text-[10px] text-emerald-700 truncate">
+                      Loaded: {audioSettings.customAudioName}
+                    </div>
+                  )}
+                  {audioUploadError && (
+                    <div className="text-[10px] text-rose-700">{audioUploadError}</div>
+                  )}
+
+                  <div className="flex items-center justify-between gap-3 pt-1">
+                    <label className="flex items-center gap-2 text-[10px] text-slate-600 flex-1">
+                      <span>Vol</span>
+                      <input
+                        type="range"
+                        min={0.1}
+                        max={1}
+                        step={0.05}
+                        value={audioSettings.volume}
+                        onChange={(e) => {
+                          const updated = saveFacultyAudioSettings({
+                            volume: Number(e.target.value),
+                          });
+                          setAudioSettings(updated);
+                        }}
+                        className="flex-1 accent-indigo-700"
+                      />
+                      <span className="font-mono w-7 text-right">
+                        {Math.round(audioSettings.volume * 100)}%
+                      </span>
+                    </label>
+                    <label className="inline-flex items-center gap-1 text-[10px] text-slate-700">
+                      <input
+                        type="checkbox"
+                        checked={audioSettings.vibrateEnabled}
+                        onChange={(e) => {
+                          const updated = saveFacultyAudioSettings({
+                            vibrateEnabled: e.target.checked,
+                          });
+                          setAudioSettings(updated);
+                        }}
+                      />
+                      Vibrate
+                    </label>
+                  </div>
+                </div>
+              )}
 
               {/* Browser Push Permission Prompt Banner inside Web App */}
               {webPermission !== 'granted' && webPermission !== 'unsupported' && (
@@ -749,11 +1017,17 @@ export function WorkspaceNotificationCenter({
                       }`}
                     >
                       <div className="flex items-start justify-between gap-2">
-                        <div className="flex items-center gap-1.5 text-xs font-semibold text-rose-900">
+                        <div className="flex items-center gap-1.5 text-xs font-semibold text-rose-900 flex-wrap">
                           <AlertTriangle className="w-3.5 h-3.5 text-rose-600 shrink-0" />
                           <span>
                             Faculty Delay · P{alert.periodNumber} {alert.subjectCode}
                           </span>
+                          {alert.isAutoDetected && (
+                            <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-800 text-[9px] font-bold uppercase">
+                              <Sparkles className="w-2.5 h-2.5" />
+                              Auto
+                            </span>
+                          )}
                         </div>
                         <span
                           className={`text-[10px] font-medium ${
@@ -778,32 +1052,45 @@ export function WorkspaceNotificationCenter({
                       {alert.note && (
                         <p className="text-[11px] text-slate-600">{alert.note}</p>
                       )}
-                      <div className="flex items-center justify-between gap-2 pt-1">
+                      <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
                         <span className="text-[10px] text-slate-500">
-                          Reported by {alert.reportedByName}
+                          {alert.isAutoDetected
+                            ? 'Auto Time-Analysis'
+                            : `Reported by ${alert.reportedByName}`}
                         </span>
-                        {canActionDelay && alert.status !== 'resolved' && (
-                          <div className="flex items-center gap-1.5">
-                            {alert.status === 'active' && (
+                        <div className="flex items-center gap-1.5">
+                          {alert.facultyPhone && (
+                            <a
+                              href={`tel:${alert.facultyPhone.replace(/[^+\d]/g, '')}`}
+                              className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium text-indigo-900 bg-indigo-100 hover:bg-indigo-200 rounded"
+                            >
+                              <PhoneCall className="w-3 h-3" />
+                              Call
+                            </a>
+                          )}
+                          {canActionDelay && alert.status !== 'resolved' && (
+                            <>
+                              {alert.status === 'active' && (
+                                <button
+                                  type="button"
+                                  disabled={updatingDelayId === alert.id}
+                                  onClick={() => handleUpdateDelay(alert.id, 'acknowledged')}
+                                  className="px-2 py-1 text-[11px] font-medium text-amber-900 bg-amber-100 hover:bg-amber-200 rounded"
+                                >
+                                  On My Way
+                                </button>
+                              )}
                               <button
                                 type="button"
                                 disabled={updatingDelayId === alert.id}
-                                onClick={() => handleUpdateDelay(alert.id, 'acknowledged')}
-                                className="px-2 py-1 text-[11px] font-medium text-amber-900 bg-amber-100 hover:bg-amber-200 rounded"
+                                onClick={() => handleUpdateDelay(alert.id, 'resolved')}
+                                className="px-2 py-1 text-[11px] font-medium text-emerald-900 bg-emerald-100 hover:bg-emerald-200 rounded"
                               >
-                                On My Way
+                                Resolve
                               </button>
-                            )}
-                            <button
-                              type="button"
-                              disabled={updatingDelayId === alert.id}
-                              onClick={() => handleUpdateDelay(alert.id, 'resolved')}
-                              className="px-2 py-1 text-[11px] font-medium text-emerald-900 bg-emerald-100 hover:bg-emerald-200 rounded"
-                            >
-                              Resolve
-                            </button>
-                          </div>
-                        )}
+                            </>
+                          )}
+                        </div>
                       </div>
                     </div>
                   ))}
@@ -1000,20 +1287,45 @@ export function WorkspaceNotificationCenter({
               <AlertTriangle className="w-4 h-4 text-rose-300 shrink-0" />
               Active Faculty Delay Alert ({activeFacultyDelays.length})
             </span>
+            <button
+              type="button"
+              onClick={() => playFacultyAlertAudio('faculty_delay')}
+              title="Replay custom alert audio"
+              className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-semibold bg-rose-800 hover:bg-rose-700 text-rose-100 rounded"
+            >
+              <Volume2 className="w-3 h-3" />
+              Sound
+            </button>
           </div>
           {activeFacultyDelays.slice(0, 2).map((alert) => (
             <div
               key={alert.id}
               className="pt-2 border-t border-rose-800/80 space-y-1.5 text-xs"
             >
-              <div className="font-medium text-white">
-                P{alert.periodNumber} {alert.subjectCode} · {alert.facultyName} ({alert.delayMinutes}+ min delay)
+              <div className="font-medium text-white flex items-center gap-1.5 flex-wrap">
+                <span>
+                  P{alert.periodNumber} {alert.subjectCode} · {alert.facultyName} ({alert.delayMinutes}+ min delay)
+                </span>
+                {alert.isAutoDetected && (
+                  <span className="px-1.5 py-0.5 rounded bg-amber-400/20 text-amber-200 text-[9px] font-bold uppercase">
+                    AUTO
+                  </span>
+                )}
               </div>
               <div className="text-[11px] text-rose-200">
-                {alert.yearOfStudy} Sec {alert.section} · Room {alert.roomNo || 'TBA'} · Reported by{' '}
-                {alert.reportedByName}
+                {alert.yearOfStudy} Sec {alert.section} · Room {alert.roomNo || 'TBA'} ·{' '}
+                {alert.isAutoDetected ? 'Auto Time-Analysis' : `Reported by ${alert.reportedByName}`}
               </div>
-              <div className="flex items-center gap-2 pt-1">
+              <div className="flex flex-wrap items-center gap-2 pt-1">
+                {alert.facultyPhone && (
+                  <a
+                    href={`tel:${alert.facultyPhone.replace(/[^+\d]/g, '')}`}
+                    className="inline-flex items-center gap-1 px-2.5 py-1.5 text-[11px] font-semibold bg-amber-400 text-slate-950 hover:bg-amber-300 rounded-md"
+                  >
+                    <PhoneCall className="w-3.5 h-3.5" />
+                    Call Mobile
+                  </a>
+                )}
                 <button
                   type="button"
                   disabled={updatingDelayId === alert.id}
@@ -1034,6 +1346,73 @@ export function WorkspaceNotificationCenter({
               </div>
             </div>
           ))}
+        </div>
+      )}
+
+      {/* Urgent Incoming Wake-Up Page-Call Modal */}
+      {incomingPageCall && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/70 p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Incoming Wake-Up Page-Call"
+        >
+          <div className="w-full max-w-md bg-white rounded-2xl border-2 border-rose-500 shadow-2xl overflow-hidden">
+            <div className="px-5 py-4 bg-rose-700 text-white flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <Crown className="w-5 h-5 text-amber-300" />
+                <div>
+                  <div className="text-sm font-bold">Urgent Wake-Up Page-Call</div>
+                  <div className="text-[11px] text-rose-100">
+                    From {incomingPageCall.callerName} ({incomingPageCall.callerRole})
+                  </div>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  stopActiveFacultyAudio();
+                  setIncomingPageCall(null);
+                }}
+                aria-label="Dismiss wake-up call"
+                className="p-1.5 text-rose-100 hover:text-white rounded-lg"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="p-5 space-y-4">
+              <p className="text-sm text-slate-800 leading-relaxed">{incomingPageCall.message}</p>
+              <div className="flex flex-wrap items-center justify-end gap-2">
+                {incomingPageCall.targetPhone && (
+                  <a
+                    href={`tel:${incomingPageCall.targetPhone.replace(/[^+\d]/g, '')}`}
+                    className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg"
+                  >
+                    <PhoneCall className="w-3.5 h-3.5" />
+                    Call Mobile
+                  </a>
+                )}
+                <button
+                  type="button"
+                  onClick={() => playFacultyAlertAudio('page_call')}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-indigo-800 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 rounded-lg"
+                >
+                  <Volume2 className="w-3.5 h-3.5" />
+                  Replay Tone
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    stopActiveFacultyAudio();
+                    setIncomingPageCall(null);
+                  }}
+                  className="px-4 py-2 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 rounded-lg"
+                >
+                  Acknowledge
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
       )}
     </>

@@ -159,8 +159,23 @@ export function ApprovalsView({
                 {activeRows.map((reg) => (
                   <tr key={reg.id} className="hover:bg-slate-50/70">
                     <td className="py-3.5 px-4">
-                      <div className="font-medium text-slate-900">{reg.fullName}</div>
-                      <div className="text-xs text-slate-500">{reg.email}</div>
+                      <div className="flex items-center gap-2.5">
+                        {reg.profileImageData ? (
+                          <img
+                            src={reg.profileImageData}
+                            alt={reg.fullName}
+                            className="w-9 h-9 rounded-xl object-cover border border-indigo-200 shrink-0"
+                          />
+                        ) : (
+                          <div className="w-9 h-9 rounded-xl bg-slate-100 text-slate-700 font-bold text-xs flex items-center justify-center shrink-0">
+                            {reg.fullName.slice(0, 2).toUpperCase()}
+                          </div>
+                        )}
+                        <div>
+                          <div className="font-medium text-slate-900">{reg.fullName}</div>
+                          <div className="text-xs text-slate-500">{reg.email}</div>
+                        </div>
+                      </div>
                     </td>
                     <td className="py-3.5 px-4 text-xs text-slate-800">
                       {ROLE_LABELS[reg.role]}

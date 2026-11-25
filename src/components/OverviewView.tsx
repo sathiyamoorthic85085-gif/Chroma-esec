@@ -17,6 +17,7 @@ import {
 import { AcademicCalendarCard } from './AcademicCalendarCard';
 import { AcademicGoalTrackerCard } from './AcademicGoalTrackerCard';
 import { BatchComparisonRadarCard } from './BatchComparisonRadarCard';
+import { ChromaGradeMark } from './ChromaGradeMark';
 import { DailyArchivalCard } from './DailyArchivalCard';
 import { DepartmentalPerformanceChart } from './DepartmentalPerformanceChart';
 import { MonthlyAttendanceChart } from './MonthlyAttendanceChart';
@@ -34,7 +35,8 @@ export type NavSection =
   | 'timetable'
   | 'attendance'
   | 'communities'
-  | 'uploads';
+  | 'uploads'
+  | 'profile';
 
 interface OverviewViewProps {
   token: string;
@@ -106,14 +108,17 @@ export function OverviewView({
       {/* Header summary strip */}
       <section className="bg-white border border-slate-200 rounded-lg p-6">
         <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
-          <div>
-            <div className="text-xs text-slate-500">
-              {ROLE_LABELS[user.role]} · {user.department}
-              {user.yearOfStudy ? ` · ${user.yearOfStudy} Sec ${user.section}` : ''}
+          <div className="flex items-center gap-3.5">
+            <ChromaGradeMark size="md" showWordmark={false} />
+            <div>
+              <div className="text-xs text-slate-500">
+                {ROLE_LABELS[user.role]} · {user.department}
+                {user.yearOfStudy ? ` · ${user.yearOfStudy} Sec ${user.section}` : ''}
+              </div>
+              <h2 className="text-xl font-semibold text-slate-900 mt-0.5">
+                Welcome, {user.fullName}
+              </h2>
             </div>
-            <h2 className="text-xl font-semibold text-slate-900 mt-1">
-              Welcome, {user.fullName}
-            </h2>
           </div>
 
           <div className="flex flex-wrap items-center gap-6 lg:text-right">
@@ -138,6 +143,20 @@ export function OverviewView({
             </div>
           </div>
         </div>
+        {user.delegationInfo && user.delegationInfo.status === 'active' && (
+          <div className="mt-4 pt-3 border-t border-amber-200 flex flex-wrap items-center justify-between gap-2 text-xs text-amber-900 bg-amber-50/70 px-3 py-2 rounded-lg">
+            <span>
+              <strong>HOD Leave Delegation Active:</strong> {user.delegationInfo.delegateName} is currently serving as Acting HOD (on behalf of {user.delegationInfo.originalHodName}).
+            </span>
+            <button
+              type="button"
+              onClick={() => onNavigate('profile')}
+              className="font-semibold text-amber-800 underline hover:text-amber-950"
+            >
+              Manage in Profile
+            </button>
+          </div>
+        )}
       </section>
 
       {/* Primary Live Workspace Modules Strip: Dual-Camera Attendance & Communities */}

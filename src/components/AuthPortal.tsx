@@ -1,10 +1,12 @@
 import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { signInWithPopup } from 'firebase/auth';
+import { onAuthStateChanged, signInWithPopup } from 'firebase/auth';
 import {
   Building,
   Camera,
   CheckCircle2,
   Clock,
+  Eye,
+  EyeOff,
   Mail,
   MapPin,
   Navigation,
@@ -24,6 +26,7 @@ import {
   type UserRole,
 } from '../types';
 import { ChromaGradeMark } from './ChromaGradeMark';
+import { ClassroomMapPicker } from './ClassroomMapPicker';
 import { OfflineIndicator } from './OfflineIndicator';
 import { PWAInstallButton } from './PWAInstallButton';
 
@@ -108,6 +111,11 @@ export function AuthPortal({
   const [submitting, setSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
+  const [pendingStatusHint, setPendingStatusHint] = useState(false);
+  const [showLoginPassword, setShowLoginPassword] = useState(false);
+  const [showRegPassword, setShowRegPassword] = useState(false);
+  const [showHodPassword, setShowHodPassword] = useState(false);
+  const autoSyncAttemptedRef = useRef(false);
 
   const stopRegCamera = useCallback(() => {
     if (regStreamRef.current) {
@@ -151,7 +159,35 @@ export function AuthPortal({
       .catch(() => {
         // Handled cleanly
       });
-  }, []);
+
+    const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+      if (!firebaseUser || autoSyncAttemptedRef.current) return;
+      try {
+        if (sessionStorage.getItem('chromagrade_signed_out') === '1') return;
+      } catch {
+        // Ignore storage restrictions
+      }
+      autoSyncAttemptedRef.current = true;
+      setSubmitting(true);
+      setErrorMsg(null);
+      setPendingStatusHint(false);
+      try {
+        const idToken = await firebaseUser.getIdToken(true);
+        const res = await api.syncFirebaseLogin(idToken);
+        onAuthenticated(res.token, res.user);
+      } catch (err) {
+        if (err instanceof ApiError && err.accountStatus === 'pending') {
+          if (firebaseUser.email) setStatusEmail(firebaseUser.email);
+          setPendingStatusHint(true);
+          setErrorMsg(err.message);
+        }
+      } finally {
+        setSubmitting(false);
+      }
+    });
+
+    return () => unsubscribe();
+  }, [onAuthenticated]);
 
   const isStudentRegistration = regRole === 'student' || regRole === 'class_rep';
   const needsClassFields = isStudentRegistration || regRole === 'class_advisor';
@@ -267,20 +303,52 @@ export function AuthPortal({
     setRegCameraError(null);
   };
 
+  const formatFirebaseAuthError = (err: unknown): string => {
+    const code = (err as { code?: string })?.code ?? '';
+    if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') {
+      return 'Google Sign-In window was closed before completing. Try again or sign in with your institutional email / Roll ID and password below.';
+    }
+    if (code === 'auth/popup-blocked') {
+      return 'Your browser blocked the Google Sign-In popup. Allow popups for this site and click again, or sign in with your institutional email and password below.';
+    }
+    if (code === 'auth/unauthorized-domain') {
+      return `Google Sign-In is not authorized for ${window.location.hostname}. Please sign in using your institutional email / Roll ID and password below, or register a new account.`;
+    }
+    if (code === 'auth/network-request-failed') {
+      return 'Network error while contacting Google authentication. Check your connection and try again.';
+    }
+    if (err instanceof Error && err.message) {
+      return err.message;
+    }
+    return 'Google Sign-In failed. Please try again or use your institutional email and password.';
+  };
+
   const handleGoogleSignIn = async () => {
     setErrorMsg(null);
     setSuccessMsg(null);
+    setPendingStatusHint(false);
     setSubmitting(true);
     try {
       const cred = await signInWithPopup(auth, googleAuthProvider);
-      const idToken = await cred.user.getIdToken();
+      try {
+        sessionStorage.removeItem('chromagrade_signed_out');
+      } catch {
+        // Ignore storage restrictions
+      }
+      const idToken = await cred.user.getIdToken(true);
       const res = await api.syncFirebaseLogin(idToken);
       onAuthenticated(res.token, res.user);
     } catch (err) {
       if (err instanceof ApiError) {
+        if (err.accountStatus === 'pending') {
+          if (auth.currentUser?.email) {
+            setStatusEmail(auth.currentUser.email);
+          }
+          setPendingStatusHint(true);
+        }
         setErrorMsg(err.message);
-      } else if (err instanceof Error && !err.message.includes('popup-closed-by-user')) {
-        setErrorMsg(err.message);
+      } else {
+        setErrorMsg(formatFirebaseAuthError(err));
       }
     } finally {
       setSubmitting(false);
@@ -289,17 +357,34 @@ export function AuthPortal({
 
   const handleLogin = async (e: FormEvent) => {
     e.preventDefault();
+    const cleanedIdentifier = loginEmail.trim();
+    if (!cleanedIdentifier || !loginPassword) {
+      setErrorMsg('Enter both your institutional email (or Roll / Employee ID) and password.');
+      return;
+    }
     setErrorMsg(null);
     setSuccessMsg(null);
+    setPendingStatusHint(false);
     setSubmitting(true);
     try {
-      const res = await api.login(loginEmail, loginPassword);
+      try {
+        sessionStorage.removeItem('chromagrade_signed_out');
+      } catch {
+        // Ignore storage restrictions
+      }
+      const res = await api.login(cleanedIdentifier, loginPassword);
       onAuthenticated(res.token, res.user);
     } catch (err) {
       if (err instanceof ApiError) {
+        if (err.accountStatus === 'pending') {
+          if (cleanedIdentifier.includes('@')) {
+            setStatusEmail(cleanedIdentifier.toLowerCase());
+          }
+          setPendingStatusHint(true);
+        }
         setErrorMsg(err.message);
       } else {
-        setErrorMsg('Unable to sign in right now.');
+        setErrorMsg('Unable to sign in right now. Please check your connection and try again.');
       }
     } finally {
       setSubmitting(false);
@@ -470,6 +555,9 @@ export function AuthPortal({
       <main className="lg:col-span-7 flex flex-col justify-center px-5 py-8 sm:px-12 lg:px-16 bg-white pb-safe">
         <OfflineIndicator />
         <div className="w-full max-w-xl mx-auto">
+          <div className="lg:hidden mb-4 flex items-center justify-between">
+            <ChromaGradeMark size="sm" showSubline />
+          </div>
           <div className="flex flex-wrap items-center justify-between gap-4 pb-6 border-b border-slate-200">
             <div>
               <h2 className="text-2xl font-semibold tracking-tight text-slate-900">
@@ -482,7 +570,7 @@ export function AuthPortal({
                 {mode === 'setup_hod' &&
                   'Create the Head of Department account or sign in with Google to initialize the department.'}
                 {mode === 'login' &&
-                  'Sign in with Google or your approved institutional email and password.'}
+                  'Sign in with Google or your approved institutional email / Roll ID and password.'}
                 {mode === 'register' &&
                   'Submit your details for HOD approval. An email intimation confirms when you can sign in.'}
                 {mode === 'check_status' &&
@@ -600,9 +688,22 @@ export function AuthPortal({
           {errorMsg && (
             <div
               role="alert"
-              className="mt-4 p-4 rounded-lg border border-red-200 bg-red-50 text-sm text-red-800"
+              className="mt-4 p-4 rounded-lg border border-red-200 bg-red-50 text-sm text-red-800 space-y-2"
             >
-              {errorMsg}
+              <div>{errorMsg}</div>
+              {pendingStatusHint && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMode('check_status');
+                    setErrorMsg(null);
+                    setPendingStatusHint(false);
+                  }}
+                  className="inline-flex items-center gap-1 text-xs font-semibold text-red-900 underline underline-offset-2 hover:text-red-700"
+                >
+                  Check Approval Status & Email Intimation →
+                </button>
+              )}
             </div>
           )}
 
@@ -677,15 +778,25 @@ export function AuthPortal({
                 <label className="block text-xs font-medium text-slate-700 mb-1.5">
                   Choose HOD Password
                 </label>
-                <input
-                  type="password"
-                  required
-                  minLength={6}
-                  value={hodPassword}
-                  onChange={(e) => setHodPassword(e.target.value)}
-                  placeholder="Minimum 6 characters"
-                  className="w-full px-3.5 py-2.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-600/20 focus:border-indigo-600"
-                />
+                <div className="relative">
+                  <input
+                    type={showHodPassword ? 'text' : 'password'}
+                    required
+                    minLength={6}
+                    value={hodPassword}
+                    onChange={(e) => setHodPassword(e.target.value)}
+                    placeholder="Minimum 6 characters"
+                    className="w-full px-3.5 py-2.5 pr-10 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-600/20 focus:border-indigo-600"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowHodPassword((v) => !v)}
+                    aria-label={showHodPassword ? 'Hide password' : 'Show password'}
+                    className="absolute inset-y-0 right-0 px-3 flex items-center text-slate-400 hover:text-slate-700"
+                  >
+                    {showHodPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </div>
               </div>
 
               <div className="pt-2 flex flex-wrap items-center justify-between gap-3">
@@ -713,14 +824,15 @@ export function AuthPortal({
             <form onSubmit={handleLogin} className="space-y-4">
               <div>
                 <label className="block text-xs font-medium text-slate-700 mb-1.5">
-                  Institutional Email
+                  Institutional Email or Roll / Employee ID
                 </label>
                 <input
-                  type="email"
+                  type="text"
+                  autoComplete="username"
                   required
                   value={loginEmail}
                   onChange={(e) => setLoginEmail(e.target.value)}
-                  placeholder="name@chromagrade.edu"
+                  placeholder="name@esec.ac.in or 22CSE001 / HOD-001"
                   className="w-full px-3.5 py-2.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-600/20 focus:border-indigo-600"
                 />
               </div>
@@ -729,14 +841,25 @@ export function AuthPortal({
                 <label className="block text-xs font-medium text-slate-700 mb-1.5">
                   Password
                 </label>
-                <input
-                  type="password"
-                  required
-                  value={loginPassword}
-                  onChange={(e) => setLoginPassword(e.target.value)}
-                  placeholder="Enter your password"
-                  className="w-full px-3.5 py-2.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-600/20 focus:border-indigo-600"
-                />
+                <div className="relative">
+                  <input
+                    type={showLoginPassword ? 'text' : 'password'}
+                    autoComplete="current-password"
+                    required
+                    value={loginPassword}
+                    onChange={(e) => setLoginPassword(e.target.value)}
+                    placeholder="Enter your password"
+                    className="w-full px-3.5 py-2.5 pr-10 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-600/20 focus:border-indigo-600"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowLoginPassword((v) => !v)}
+                    aria-label={showLoginPassword ? 'Hide password' : 'Show password'}
+                    className="absolute inset-y-0 right-0 px-3 flex items-center text-slate-400 hover:text-slate-700"
+                  >
+                    {showLoginPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </div>
               </div>
 
               <div className="pt-2 flex flex-wrap items-center justify-between gap-3">
@@ -898,15 +1021,25 @@ export function AuthPortal({
                 <label className="block text-xs font-medium text-slate-700 mb-1.5">
                   Create Password
                 </label>
-                <input
-                  type="password"
-                  required
-                  minLength={6}
-                  value={regPassword}
-                  onChange={(e) => setRegPassword(e.target.value)}
-                  placeholder="Minimum 6 characters (used after HOD approval)"
-                  className="w-full px-3.5 py-2.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-600/20 focus:border-indigo-600"
-                />
+                <div className="relative">
+                  <input
+                    type={showRegPassword ? 'text' : 'password'}
+                    required
+                    minLength={6}
+                    value={regPassword}
+                    onChange={(e) => setRegPassword(e.target.value)}
+                    placeholder="Minimum 6 characters (used after HOD approval)"
+                    className="w-full px-3.5 py-2.5 pr-10 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-600/20 focus:border-indigo-600"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowRegPassword((v) => !v)}
+                    aria-label={showRegPassword ? 'Hide password' : 'Show password'}
+                    className="absolute inset-y-0 right-0 px-3 flex items-center text-slate-400 hover:text-slate-700"
+                  >
+                    {showRegPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </div>
               </div>
 
               {/* Mandatory Student Face & HOD-Pinned Classroom Environment Registration */}
@@ -960,6 +1093,21 @@ export function AuthPortal({
                             ? `Verified inside HOD-pinned classroom (${regDistanceMeters}m away · limit ${pinnedLocation.radiusMeters}m)`
                             : `Outside HOD-pinned classroom (${regDistanceMeters}m away · move within ${pinnedLocation.radiusMeters}m to capture environment photo)`
                           : `GPS locked (${regCoords.lat}, ${regCoords.lng} · ±${regCoords.accuracy}m)`}
+                      </div>
+                    )}
+
+                    {(pinnedLocation?.configured || regCoords) && (
+                      <div className="pt-1">
+                        <ClassroomMapPicker
+                          readOnly
+                          latitude={pinnedLocation?.latitude ?? regCoords?.lat ?? null}
+                          longitude={pinnedLocation?.longitude ?? regCoords?.lng ?? null}
+                          radiusMeters={pinnedLocation?.radiusMeters ?? 150}
+                          label={pinnedLocation?.label || 'Pinned Classroom Zone'}
+                          currentLatitude={regCoords?.lat ?? null}
+                          currentLongitude={regCoords?.lng ?? null}
+                          height="180px"
+                        />
                       </div>
                     )}
                   </div>

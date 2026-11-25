@@ -25,6 +25,10 @@ const PERIOD_DEFAULTS: Record<number, { start: string; end: string }> = {
   6: { start: '14:05', end: '14:55' },
   7: { start: '15:05', end: '15:55' },
   8: { start: '15:55', end: '16:45' },
+  9: { start: '16:45', end: '17:35' },
+  10: { start: '17:35', end: '18:25' },
+  11: { start: '18:25', end: '19:15' },
+  12: { start: '19:15', end: '20:05' },
 };
 
 export function ManualRecordForm({
@@ -702,13 +706,13 @@ export function ManualRecordForm({
             </label>
 
             <label className="space-y-1">
-              <span className="block text-xs font-medium text-slate-700">Period (1–8)</span>
+              <span className="block text-xs font-medium text-slate-700">Period (1–12)</span>
               <select
                 value={periodNumber}
                 onChange={(e) => handlePeriodChange(Number(e.target.value))}
                 className={inputClass}
               >
-                {[1, 2, 3, 4, 5, 6, 7, 8].map((n) => (
+                {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].map((n) => (
                   <option key={n} value={n}>
                     Period {n} ({PERIOD_DEFAULTS[n].start}–{PERIOD_DEFAULTS[n].end})
                   </option>
@@ -719,10 +723,9 @@ export function ManualRecordForm({
             <label className="space-y-1">
               <span className="block text-xs font-medium text-slate-700">Start Time</span>
               <input
-                type="text"
+                type="time"
                 value={startTime}
                 onChange={(e) => setStartTime(e.target.value)}
-                placeholder="08:45"
                 className={inputClass}
               />
             </label>
@@ -730,13 +733,19 @@ export function ManualRecordForm({
             <label className="space-y-1">
               <span className="block text-xs font-medium text-slate-700">End Time</span>
               <input
-                type="text"
+                type="time"
                 value={endTime}
                 onChange={(e) => setEndTime(e.target.value)}
-                placeholder="09:35"
                 className={inputClass}
               />
             </label>
+
+            <div className="space-y-1">
+              <span className="block text-xs font-medium text-slate-700">Time Period (Per Hour)</span>
+              <div className="px-3 py-2 text-xs font-mono bg-indigo-50 text-indigo-900 border border-indigo-200 rounded-lg">
+                {startTime || '--:--'}–{endTime || '--:--'} · Hr {periodNumber}
+              </div>
+            </div>
 
             <label className="space-y-1">
               <span className="block text-xs font-medium text-slate-700">Subject Code</span>

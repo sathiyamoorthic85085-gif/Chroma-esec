@@ -1,17 +1,134 @@
-import { useMemo, useState } from 'react';
-import { PenLine, RotateCcw, Upload } from 'lucide-react';
+import { useEffect, useMemo, useState } from 'react';
+import { BellRing, Crown, Lock, PenLine, RotateCcw, Upload } from 'lucide-react';
+import { api } from '../lib/api';
 import type {
   DepartmentStaff,
   DepartmentStudent,
+  HodDelegationInfo,
+  HodDirectoryRecord,
   OtherDepartmentStaff,
   UploadModule,
 } from '../types';
 import { ManualRecordForm } from './ManualRecordForm';
+import { RecordProfileModal, type RecordShowcasePerson } from './RecordProfileModal';
 import {
   DirectorySearchBar,
   matchesDirectorySearch,
   type DirectorySearchField,
 } from './DirectorySearchBar';
+
+function AvatarBadge({ name, photoData }: { name: string; photoData?: string }) {
+  if (photoData) {
+    return (
+      <img
+        src={photoData}
+        alt={name}
+        className="w-9 h-9 rounded-xl object-cover border border-slate-200 shrink-0"
+      />
+    );
+  }
+  const initials = name
+    .split(' ')
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((p) => p[0]?.toUpperCase() || '')
+    .join('');
+  return (
+    <div className="w-9 h-9 rounded-xl bg-indigo-100 text-indigo-800 font-bold text-xs flex items-center justify-center border border-indigo-200 shrink-0">
+      {initials || 'AE'}
+    </div>
+  );
+}
+
+function HodDirectoryShowcaseBanner({
+  token,
+  onSelectPerson,
+}: {
+  token: string;
+  onSelectPerson: (person: RecordShowcasePerson) => void;
+}) {
+  const [hodRecords, setHodRecords] = useState<HodDirectoryRecord[]>([]);
+  const [delegation, setDelegation] = useState<HodDelegationInfo | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    api
+      .getHodRecords(token)
+      .then((res) => {
+        if (!active) return;
+        setHodRecords(res.hodRecords);
+        setDelegation(res.activeDelegation);
+      })
+      .catch(() => null);
+    return () => {
+      active = false;
+    };
+  }, [token]);
+
+  if (hodRecords.length === 0) return null;
+
+  return (
+    <section className="bg-gradient-to-r from-slate-900 to-indigo-950 text-white rounded-xl border border-indigo-800/40 p-4 space-y-3">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-center gap-2">
+          <Crown className="w-4 h-4 text-amber-300" />
+          <h3 className="text-xs font-bold uppercase tracking-wider text-amber-200">
+            Department Leadership / HOD Directory (Profile & Wake-Up Page-Call Only)
+          </h3>
+        </div>
+        {delegation && delegation.status === 'active' && (
+          <span className="text-[11px] px-2.5 py-0.5 rounded-md bg-amber-400/20 text-amber-200 border border-amber-300/30">
+            Acting HOD: {delegation.delegateName}
+          </span>
+        )}
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+        {hodRecords.map((hod) => (
+          <button
+            key={hod.id}
+            type="button"
+            onClick={() =>
+              onSelectPerson({
+                userId: hod.id,
+                fullName: hod.fullName,
+                roleLabel: hod.isActingHod
+                  ? 'Acting Head of Department (HOD)'
+                  : 'Head of Department (HOD)',
+                identifier: hod.staffOrRollId,
+                email: hod.email,
+                phone: hod.phone,
+                department: hod.department,
+                yearSectionOrSpec: hod.specialization,
+                designationOrSubLabel: hod.designation,
+                photoData: hod.photoData,
+                faceRegisteredLocked: hod.faceRegisteredLocked,
+                bio: hod.bio,
+              })
+            }
+            className="flex items-center gap-3 bg-white/10 hover:bg-white/15 border border-white/15 rounded-xl p-3 text-left transition-colors"
+          >
+            <AvatarBadge name={hod.fullName} photoData={hod.photoData} />
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-1.5">
+                <span className="text-sm font-semibold text-white truncate">{hod.fullName}</span>
+                {hod.faceRegisteredLocked && <Lock className="w-3 h-3 text-emerald-300 shrink-0" />}
+              </div>
+              <div className="text-[11px] text-amber-200 truncate">{hod.designation}</div>
+              <div className="text-[11px] text-slate-300 truncate">
+                {hod.email} {hod.phone ? `· ${hod.phone}` : ''}
+              </div>
+            </div>
+            <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-rose-600/90 text-white text-[10px] font-semibold shrink-0">
+              <BellRing className="w-3 h-3" />
+              Page-Call
+            </span>
+          </button>
+        ))}
+      </div>
+    </section>
+  );
+}
 
 interface DirectoryCommonProps {
   token: string;
@@ -36,6 +153,7 @@ export function DepartmentStudentsView({
   const [sectionFilter, setSectionFilter] = useState('ALL');
   const [crOnly, setCrOnly] = useState(false);
   const [showManualAdd, setShowManualAdd] = useState(false);
+  const [selectedProfile, setSelectedProfile] = useState<RecordShowcasePerson | null>(null);
 
   const departments = useMemo(() => {
     const set = new Set(students.map((st) => st.department.trim()).filter(Boolean));
@@ -88,6 +206,7 @@ export function DepartmentStudentsView({
 
   return (
     <div className="space-y-5">
+      <HodDirectoryShowcaseBanner token={token} onSelectPerson={setSelectedProfile} />
       <DirectorySearchBar
         query={query}
         onQueryChange={setQuery}
@@ -199,12 +318,12 @@ export function DepartmentStudentsView({
             <thead>
               <tr className="border-b border-slate-200 bg-slate-50 text-xs font-semibold text-slate-600">
                 <th className="py-3 px-4">Roll No</th>
-                <th className="py-3 px-4">Student Name</th>
+                <th className="py-3 px-4">Student Profile</th>
                 <th className="py-3 px-4">Class &amp; Department</th>
                 <th className="py-3 px-4">Designation</th>
                 <th className="py-3 px-4">Class Advisor</th>
                 <th className="py-3 px-4 text-right">CGPA</th>
-                <th className="py-3 px-4">Source Document</th>
+                <th className="py-3 px-4 text-right">Profile &amp; Page-Call</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-200 text-sm">
@@ -214,9 +333,21 @@ export function DepartmentStudentsView({
                     {st.rollNo}
                   </td>
                   <td className="py-3 px-4">
-                    <div className="font-medium text-slate-900">{st.fullName}</div>
-                    <div className="text-xs text-slate-500">
-                      {st.email} {st.phone ? `· ${st.phone}` : ''}
+                    <div className="flex items-center gap-2.5">
+                      <AvatarBadge name={st.fullName} photoData={st.photoData} />
+                      <div className="min-w-0">
+                        <div className="font-medium text-slate-900 flex items-center gap-1.5">
+                          <span>{st.fullName}</span>
+                          {st.faceRegisteredLocked && (
+                            <span title="Face Registered" className="inline-flex shrink-0">
+                              <Lock className="w-3 h-3 text-emerald-600" />
+                            </span>
+                          )}
+                        </div>
+                        <div className="text-xs text-slate-500">
+                          {st.email} {st.phone ? `· ${st.phone}` : ''}
+                        </div>
+                      </div>
                     </div>
                   </td>
                   <td className="py-3 px-4 text-xs text-slate-700">
@@ -247,8 +378,28 @@ export function DepartmentStudentsView({
                   <td className="py-3 px-4 text-right font-mono text-xs tabular-nums text-slate-800">
                     {st.cgpa || '—'}
                   </td>
-                  <td className="py-3 px-4 text-xs text-slate-500 max-w-[200px] truncate">
-                    {st.sourceFilename || '—'}
+                  <td className="py-3 px-4 text-right">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setSelectedProfile({
+                          fullName: st.fullName,
+                          roleLabel: st.isClassRep ? 'Class Representative' : 'Student',
+                          identifier: st.rollNo,
+                          email: st.email,
+                          phone: st.phone,
+                          department: st.department,
+                          yearSectionOrSpec: `${st.yearOfStudy} · Sec ${st.section}`,
+                          designationOrSubLabel: st.crResponsibility || st.advisorName,
+                          photoData: st.photoData,
+                          faceRegisteredLocked: st.faceRegisteredLocked,
+                        })
+                      }
+                      className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 text-xs font-semibold whitespace-nowrap"
+                    >
+                      <BellRing className="w-3 h-3" />
+                      Profile / Call
+                    </button>
                   </td>
                 </tr>
               ))}
@@ -277,6 +428,12 @@ export function DepartmentStudentsView({
           </table>
         </div>
       </div>
+      <RecordProfileModal
+        open={Boolean(selectedProfile)}
+        onClose={() => setSelectedProfile(null)}
+        token={token}
+        person={selectedProfile}
+      />
     </div>
   );
 }
@@ -295,6 +452,7 @@ export function DepartmentStaffView({
   const [designationFilter, setDesignationFilter] = useState('ALL');
   const [advisorsOnly, setAdvisorsOnly] = useState(false);
   const [showManualAdd, setShowManualAdd] = useState(false);
+  const [selectedProfile, setSelectedProfile] = useState<RecordShowcasePerson | null>(null);
 
   const departments = useMemo(() => {
     const set = new Set(staff.map((f) => f.department.trim()).filter(Boolean));
@@ -339,6 +497,7 @@ export function DepartmentStaffView({
 
   return (
     <div className="space-y-5">
+      <HodDirectoryShowcaseBanner token={token} onSelectPerson={setSelectedProfile} />
       <DirectorySearchBar
         query={query}
         onQueryChange={setQuery}
@@ -431,11 +590,11 @@ export function DepartmentStaffView({
             <thead>
               <tr className="border-b border-slate-200 bg-slate-50 text-xs font-semibold text-slate-600">
                 <th className="py-3 px-4">Employee ID</th>
-                <th className="py-3 px-4">Faculty Member</th>
+                <th className="py-3 px-4">Faculty Profile</th>
                 <th className="py-3 px-4">Department &amp; Designation</th>
                 <th className="py-3 px-4">Specialization</th>
                 <th className="py-3 px-4">Class Advisor Role</th>
-                <th className="py-3 px-4">Source Document</th>
+                <th className="py-3 px-4 text-right">Profile &amp; Page-Call</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-200 text-sm">
@@ -445,9 +604,19 @@ export function DepartmentStaffView({
                     {f.employeeId}
                   </td>
                   <td className="py-3 px-4">
-                    <div className="font-medium text-slate-900">{f.fullName}</div>
-                    <div className="text-xs text-slate-500">
-                      {f.email} {f.phone ? `· ${f.phone}` : ''}
+                    <div className="flex items-center gap-2.5">
+                      <AvatarBadge name={f.fullName} photoData={f.photoData} />
+                      <div className="min-w-0">
+                        <div className="font-medium text-slate-900 flex items-center gap-1.5">
+                          <span>{f.fullName}</span>
+                          {f.faceRegisteredLocked && (
+                            <Lock className="w-3 h-3 text-emerald-600 shrink-0" />
+                          )}
+                        </div>
+                        <div className="text-xs text-slate-500">
+                          {f.email} {f.phone ? `· ${f.phone}` : ''}
+                        </div>
+                      </div>
                     </div>
                   </td>
                   <td className="py-3 px-4 text-xs">
@@ -468,8 +637,28 @@ export function DepartmentStaffView({
                       <span className="text-slate-500">Teaching Faculty</span>
                     )}
                   </td>
-                  <td className="py-3 px-4 text-xs text-slate-500 max-w-[200px] truncate">
-                    {f.sourceFilename || '—'}
+                  <td className="py-3 px-4 text-right">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setSelectedProfile({
+                          fullName: f.fullName,
+                          roleLabel: f.isClassAdvisor ? 'Class Advisor' : 'Department Faculty',
+                          identifier: f.employeeId,
+                          email: f.email,
+                          phone: f.phone,
+                          department: f.department,
+                          yearSectionOrSpec: f.specialization,
+                          designationOrSubLabel: f.designation,
+                          photoData: f.photoData,
+                          faceRegisteredLocked: f.faceRegisteredLocked,
+                        })
+                      }
+                      className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 text-xs font-semibold whitespace-nowrap"
+                    >
+                      <BellRing className="w-3 h-3" />
+                      Profile / Call
+                    </button>
                   </td>
                 </tr>
               ))}
@@ -498,6 +687,12 @@ export function DepartmentStaffView({
           </table>
         </div>
       </div>
+      <RecordProfileModal
+        open={Boolean(selectedProfile)}
+        onClose={() => setSelectedProfile(null)}
+        token={token}
+        person={selectedProfile}
+      />
     </div>
   );
 }
@@ -515,6 +710,7 @@ export function OtherDepartmentStaffView({
   const [deptFilter, setDeptFilter] = useState('ALL');
   const [designationFilter, setDesignationFilter] = useState('ALL');
   const [showManualAdd, setShowManualAdd] = useState(false);
+  const [selectedProfile, setSelectedProfile] = useState<RecordShowcasePerson | null>(null);
 
   const homeDepts = useMemo(() => {
     const set = new Set(staff.map((f) => f.homeDepartment.trim()).filter(Boolean));
@@ -633,11 +829,11 @@ export function OtherDepartmentStaffView({
             <thead>
               <tr className="border-b border-slate-200 bg-slate-50 text-xs font-semibold text-slate-600">
                 <th className="py-3 px-4">Employee ID</th>
-                <th className="py-3 px-4">Faculty Member</th>
+                <th className="py-3 px-4">Faculty Profile</th>
                 <th className="py-3 px-4">Home Department</th>
                 <th className="py-3 px-4">Handling Subject</th>
                 <th className="py-3 px-4">Visiting Days</th>
-                <th className="py-3 px-4">Source Document</th>
+                <th className="py-3 px-4 text-right">Profile &amp; Page-Call</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-200 text-sm">
@@ -647,9 +843,19 @@ export function OtherDepartmentStaffView({
                     {f.employeeId}
                   </td>
                   <td className="py-3 px-4">
-                    <div className="font-medium text-slate-900">{f.fullName}</div>
-                    <div className="text-xs text-slate-500">
-                      {f.designation} · {f.email}
+                    <div className="flex items-center gap-2.5">
+                      <AvatarBadge name={f.fullName} photoData={f.photoData} />
+                      <div className="min-w-0">
+                        <div className="font-medium text-slate-900 flex items-center gap-1.5">
+                          <span>{f.fullName}</span>
+                          {f.faceRegisteredLocked && (
+                            <Lock className="w-3 h-3 text-emerald-600 shrink-0" />
+                          )}
+                        </div>
+                        <div className="text-xs text-slate-500">
+                          {f.designation} · {f.email}
+                        </div>
+                      </div>
                     </div>
                   </td>
                   <td className="py-3 px-4 text-xs font-medium text-slate-800">
@@ -661,8 +867,28 @@ export function OtherDepartmentStaffView({
                   <td className="py-3 px-4 text-xs text-slate-600 whitespace-nowrap">
                     {f.visitingDays || '—'}
                   </td>
-                  <td className="py-3 px-4 text-xs text-slate-500 max-w-[200px] truncate">
-                    {f.sourceFilename || '—'}
+                  <td className="py-3 px-4 text-right">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setSelectedProfile({
+                          fullName: f.fullName,
+                          roleLabel: 'Other-Department Faculty',
+                          identifier: f.employeeId,
+                          email: f.email,
+                          phone: f.phone,
+                          department: f.homeDepartment,
+                          yearSectionOrSpec: f.handlingSubject,
+                          designationOrSubLabel: f.designation,
+                          photoData: f.photoData,
+                          faceRegisteredLocked: f.faceRegisteredLocked,
+                        })
+                      }
+                      className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 text-xs font-semibold whitespace-nowrap"
+                    >
+                      <BellRing className="w-3 h-3" />
+                      Profile / Call
+                    </button>
                   </td>
                 </tr>
               ))}
@@ -691,6 +917,12 @@ export function OtherDepartmentStaffView({
           </table>
         </div>
       </div>
+      <RecordProfileModal
+        open={Boolean(selectedProfile)}
+        onClose={() => setSelectedProfile(null)}
+        token={token}
+        person={selectedProfile}
+      />
     </div>
   );
 }

@@ -8,6 +8,8 @@ import type {
   AttendanceRecordItem,
   AttendanceRiskAlertItem,
   BatchComparisonPayload,
+  BiometricLockUserSummary,
+  BiometricUnlockRequestItem,
   BootstrapStatus,
   CallParticipantInfo,
   ChatAttachmentPayload,
@@ -20,7 +22,10 @@ import type {
   DepartmentStaff,
   DepartmentStudent,
   EmailIntimation,
+  FacultyAlterationItem,
   FacultyDelayAlertItem,
+  HodDelegationInfo,
+  HodDirectoryRecord,
   LeaderboardAndBuddiesPayload,
   MonthlyAttendanceTrendsPayload,
   OdLeaveFormConfig,
@@ -1007,4 +1012,183 @@ export const api = {
 
   triggerManualArchival: (token: string) =>
     requestJson<{ record: ArchivalRecordSummary }>('/api/hod/archival', { method: 'POST' }, token),
+
+  // Public Runtime Config & Health
+  getHealth: () =>
+    requestJson<{ ok: boolean; service: string; status: string }>('/api/health', {}),
+
+  getPublicConfig: () =>
+    requestJson<{ googleMapsApiKey: string }>('/api/config/public', {}),
+
+  // Profile Management, Face Registration Photo Lock & Wake-Up Page-Call
+  getMyProfile: (token: string) =>
+    requestJson<{ user: UserProfile }>('/api/profile/me', {}, token),
+
+  updateMyProfile: (
+    token: string,
+    payload: {
+      fullName?: string;
+      phone?: string;
+      designation?: string;
+      specialization?: string;
+      bio?: string;
+      transitBufferMinutes?: number;
+      profileImageData?: string;
+    }
+  ) =>
+    requestJson<{ user: UserProfile }>(
+      '/api/profile/me',
+      { method: 'PATCH', body: JSON.stringify(payload) },
+      token
+    ),
+
+  registerAndLockFace: (token: string, faceImageData: string) =>
+    requestJson<{ user: UserProfile }>(
+      '/api/profile/register-face',
+      { method: 'POST', body: JSON.stringify({ faceImageData }) },
+      token
+    ),
+
+  getBiometricUnlockState: (token: string) =>
+    requestJson<{
+      requests: BiometricUnlockRequestItem[];
+      users: BiometricLockUserSummary[];
+    }>('/api/profile/biometric-unlock', {}, token),
+
+  requestBiometricUnlock: (token: string, reason: string) =>
+    requestJson<{ request: BiometricUnlockRequestItem }>(
+      '/api/profile/biometric-unlock/request',
+      { method: 'POST', body: JSON.stringify({ reason }) },
+      token
+    ),
+
+  setHodBiometricLock: (
+    token: string,
+    payload: { targetUserId: number; locked: boolean; remarks?: string }
+  ) =>
+    requestJson<{ user: UserProfile }>(
+      '/api/hod/biometric-unlock',
+      { method: 'POST', body: JSON.stringify(payload) },
+      token
+    ),
+
+  decideBiometricUnlockRequest: (
+    token: string,
+    requestId: string,
+    decision: 'approve' | 'reject',
+    remarks?: string
+  ) =>
+    requestJson<{ request: BiometricUnlockRequestItem; user: UserProfile | null }>(
+      `/api/hod/biometric-unlock/requests/${encodeURIComponent(requestId)}`,
+      { method: 'PATCH', body: JSON.stringify({ decision, remarks }) },
+      token
+    ),
+
+  triggerWakeUpPageCall: (
+    token: string,
+    payload: {
+      targetUserId?: number | null;
+      targetName: string;
+      targetPhone?: string;
+      targetRole?: string;
+      targetEmail?: string;
+      message?: string;
+    }
+  ) =>
+    requestJson<{ ok: boolean }>(
+      '/api/profile/page-call',
+      { method: 'POST', body: JSON.stringify(payload) },
+      token
+    ),
+
+  updateMyPassword: (
+    token: string,
+    payload: { currentPassword?: string; newPassword: string }
+  ) =>
+    requestJson<{ ok: boolean; message: string }>(
+      '/api/profile/password',
+      { method: 'POST', body: JSON.stringify(payload) },
+      token
+    ),
+
+  // HOD Directory Records Showcase & HOD Leave Control Delegation
+  getHodRecords: (token: string) =>
+    requestJson<{ hodRecords: HodDirectoryRecord[]; activeDelegation: HodDelegationInfo | null }>(
+      '/api/records/hod',
+      {},
+      token
+    ),
+
+  getHodDelegation: (token: string) =>
+    requestJson<{ activeDelegation: HodDelegationInfo | null; candidates: UserProfile[] }>(
+      '/api/hod/delegation',
+      {},
+      token
+    ),
+
+  delegateHodControl: (token: string, payload: { delegateUserId: number; reason: string }) =>
+    requestJson<{ delegation: HodDelegationInfo; user: UserProfile }>(
+      '/api/hod/delegate',
+      { method: 'POST', body: JSON.stringify(payload) },
+      token
+    ),
+
+  restoreHodControl: (token: string) =>
+    requestJson<{ delegation: HodDelegationInfo; user: UserProfile }>(
+      '/api/hod/restore',
+      { method: 'POST' },
+      token
+    ),
+
+  // Faculty Alterations (Busy / OD / Absent -> HOD Approval)
+  getFacultyAlterations: (token: string) =>
+    requestJson<{
+      alterations: FacultyAlterationItem[];
+      candidates: {
+        userId: number | null;
+        fullName: string;
+        email: string;
+        phone: string;
+        designation: string;
+        role: string;
+      }[];
+    }>('/api/faculty-alterations', {}, token),
+
+  createFacultyAlteration: (
+    token: string,
+    payload: {
+      timetableSlotId?: number | null;
+      alterationDate?: string;
+      substituteFacultyName: string;
+      substituteUserId?: number | null;
+      substituteEmail?: string;
+      substitutePhone?: string;
+      reasonCategory: 'busy' | 'od' | 'absent';
+      reasonNote?: string;
+      dayOfWeek?: string;
+      periodNumber?: number;
+      subjectCode?: string;
+      subjectName?: string;
+      yearOfStudy?: string;
+      section?: string;
+      roomNo?: string;
+    }
+  ) =>
+    requestJson<{ alteration: FacultyAlterationItem }>(
+      '/api/faculty-alterations',
+      { method: 'POST', body: JSON.stringify(payload) },
+      token
+    ),
+
+  decideFacultyAlteration: (
+    token: string,
+    id: number,
+    decision: 'approve' | 'reject',
+    remarks?: string
+  ) =>
+    requestJson<{ alteration: FacultyAlterationItem }>(
+      `/api/faculty-alterations/${id}/decision`,
+      { method: 'PATCH', body: JSON.stringify({ decision, remarks }) },
+      token
+    ),
 };

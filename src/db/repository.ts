@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import { and, asc, desc, eq, gt, inArray, isNull, like, ne, or, sql } from 'drizzle-orm';
+import { computeServerTimeStatus } from '../../server/serverTime.ts';
 import type {
   AcademicCalendarEventItem,
   AcademicEventCategory,
@@ -25,7 +26,10 @@ import type {
   DepartmentStaff,
   DepartmentStudent,
   EmailIntimation,
+  FacultyAlterationItem,
   FacultyDelayAlertItem,
+  HodDelegationInfo,
+  HodDirectoryRecord,
   LeaderboardAndBuddiesPayload,
   OdLeaveApplicantCategory,
   OdLeaveFormConfig,
@@ -67,7 +71,9 @@ import {
   departmentStaff,
   departmentStudents,
   emailIntimations,
+  facultyAlterations,
   facultyDelayAlerts,
+  hodDelegations,
   messageAcknowledgements,
   odLeaveRequests,
   otherDepartmentStaff,
@@ -75,6 +81,7 @@ import {
   studentBiometricProfiles,
   timetableSlots,
   uploadBatches,
+  userProfileMeta,
   users,
 } from './schema.ts';
 
@@ -123,7 +130,97 @@ export function mapUser(row: typeof users.$inferSelect): UserProfile {
     approvedAt: row.approvedAt ?? null,
     createdAt: formatTs(row.createdAt),
     transitBufferMinutes: row.transitBufferMinutes ?? 15,
+    profileImageData: '',
+    faceRegisteredLocked: false,
+    faceRegisteredAt: null,
+    designation: '',
+    specialization: '',
+    bio: '',
+    delegationInfo: null,
   };
+}
+
+function mapDelegationRow(row: typeof hodDelegations.$inferSelect): HodDelegationInfo {
+  return {
+    id: row.id,
+    originalHodUserId: row.originalHodUserId,
+    originalHodName: row.originalHodName,
+    originalHodEmail: row.originalHodEmail,
+    delegateUserId: row.delegateUserId,
+    delegateName: row.delegateName,
+    delegateEmail: row.delegateEmail,
+    delegatePreviousRole: row.delegatePreviousRole as UserRole,
+    reason: row.reason,
+    status: (row.status as 'active' | 'restored') || 'active',
+    delegatedAt: formatTs(row.delegatedAt),
+    restoredAt: row.restoredAt ? formatTs(row.restoredAt) : null,
+  };
+}
+
+export async function enrichUsersWithMeta(
+  rows: (typeof users.$inferSelect)[]
+): Promise<UserProfile[]> {
+  if (rows.length === 0) return [];
+  const userIds = rows.map((r) => r.id);
+  const [metaRows, bioRows, activeDelegations] = await Promise.all([
+    db.select().from(userProfileMeta).where(inArray(userProfileMeta.userId, userIds)),
+    db.select({
+      rollNo: studentBiometricProfiles.rollNo,
+      email: studentBiometricProfiles.email,
+      faceImageData: studentBiometricProfiles.faceImageData,
+      updatedAt: studentBiometricProfiles.updatedAt,
+    }).from(studentBiometricProfiles),
+    db
+      .select()
+      .from(hodDelegations)
+      .where(eq(hodDelegations.status, 'active'))
+      .orderBy(desc(hodDelegations.id))
+      .limit(5),
+  ]);
+
+  const metaByUserId = new Map(metaRows.map((m) => [m.userId, m]));
+  const bioByRoll = new Map(bioRows.map((b) => [b.rollNo.trim().toUpperCase(), b]));
+  const bioByEmail = new Map(bioRows.map((b) => [b.email.trim().toLowerCase(), b]));
+  const latestActiveDelegation = activeDelegations[0] ? mapDelegationRow(activeDelegations[0]) : null;
+
+  return rows.map((row) => {
+    const base = mapUser(row);
+    const meta = metaByUserId.get(row.id);
+    const bio =
+      (row.staffOrRollId ? bioByRoll.get(row.staffOrRollId.trim().toUpperCase()) : undefined) ??
+      (row.email ? bioByEmail.get(row.email.trim().toLowerCase()) : undefined);
+
+    const profileImageData = meta?.profileImageData || bio?.faceImageData || '';
+    const faceRegisteredLocked =
+      meta !== undefined ? Boolean(meta.faceRegisteredLocked) : Boolean(bio?.faceImageData);
+    const faceRegisteredAt =
+      meta?.faceRegisteredAt || (bio?.faceImageData ? formatTs(bio.updatedAt) : null) || null;
+
+    const delegationInfo =
+      latestActiveDelegation &&
+      (latestActiveDelegation.delegateUserId === row.id ||
+        latestActiveDelegation.originalHodUserId === row.id)
+        ? latestActiveDelegation
+        : null;
+
+    return {
+      ...base,
+      profileImageData,
+      faceRegisteredLocked,
+      faceRegisteredAt,
+      designation: meta?.designation || '',
+      specialization: meta?.specialization || '',
+      bio: meta?.bio || '',
+      delegationInfo,
+    };
+  });
+}
+
+export async function enrichUserWithMeta(
+  row: typeof users.$inferSelect
+): Promise<UserProfile> {
+  const enriched = await enrichUsersWithMeta([row]);
+  return enriched[0] ?? mapUser(row);
 }
 
 // ============================================================
@@ -171,82 +268,61 @@ export async function ensureBaselineData(): Promise<void> {
       ])
       .onConflictDoNothing();
 
-    // Idempotent schema sync for new columns & feature tables on existing Cloud SQL instances
-    await db.execute(
-      sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS transit_buffer_minutes integer NOT NULL DEFAULT 15;`
-    );
-    await db.execute(sql`
-      CREATE TABLE IF NOT EXISTS academic_goals (
-        id serial PRIMARY KEY,
-        user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        weekly_attendance_target integer NOT NULL DEFAULT 85,
-        weekly_engagement_target integer NOT NULL DEFAULT 80,
-        last_checked_in_date text NOT NULL DEFAULT '',
-        note text NOT NULL DEFAULT '',
-        updated_at timestamp NOT NULL DEFAULT now(),
-        created_at timestamp NOT NULL DEFAULT now()
-      );
-    `);
-    await db.execute(
-      sql`CREATE UNIQUE INDEX IF NOT EXISTS academic_goals_user_uidx ON academic_goals(user_id);`
-    );
-    await db.execute(sql`
-      CREATE TABLE IF NOT EXISTS academic_goal_logs (
-        id serial PRIMARY KEY,
-        user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        week_start text NOT NULL,
-        attendance_pct integer NOT NULL DEFAULT 0,
-        engagement_pct integer NOT NULL DEFAULT 0,
-        attendance_target integer NOT NULL DEFAULT 85,
-        engagement_target integer NOT NULL DEFAULT 80,
-        check_ins_count integer NOT NULL DEFAULT 0,
-        created_at timestamp NOT NULL DEFAULT now()
-      );
-    `);
-    await db.execute(
-      sql`CREATE UNIQUE INDEX IF NOT EXISTS academic_goal_logs_user_week_uidx ON academic_goal_logs(user_id, week_start);`
-    );
-    await db.execute(sql`
-      CREATE TABLE IF NOT EXISTS academic_calendar_events (
-        id serial PRIMARY KEY,
-        title text NOT NULL,
-        event_date text NOT NULL,
-        category text NOT NULL DEFAULT 'event',
-        department text NOT NULL,
-        year_of_study text NOT NULL DEFAULT 'All Years',
-        description text NOT NULL DEFAULT '',
-        created_by_name text NOT NULL,
-        created_at timestamp NOT NULL DEFAULT now()
-      );
-    `);
-    await db.execute(sql`
-      CREATE TABLE IF NOT EXISTS archival_logs (
-        id serial PRIMARY KEY,
-        archive_date text NOT NULL,
-        storage_path text NOT NULL,
-        attendance_count integer NOT NULL DEFAULT 0,
-        students_count integer NOT NULL DEFAULT 0,
-        checksum_sha256 text NOT NULL,
-        trigger_type text NOT NULL DEFAULT 'scheduled',
-        status text NOT NULL DEFAULT 'completed',
-        created_at timestamp NOT NULL DEFAULT now()
-      );
-    `);
-    await db.execute(sql`
-      CREATE TABLE IF NOT EXISTS attendance_risk_alerts (
-        id serial PRIMARY KEY,
-        roll_no text NOT NULL,
-        student_name text NOT NULL,
-        year_of_study text NOT NULL DEFAULT '',
-        section text NOT NULL DEFAULT '',
-        present_count integer NOT NULL DEFAULT 0,
-        total_sessions integer NOT NULL DEFAULT 0,
-        cumulative_rate integer NOT NULL DEFAULT 0,
-        advisor_notified boolean NOT NULL DEFAULT true,
-        notified_date text NOT NULL,
-        created_at timestamp NOT NULL DEFAULT now()
-      );
-    `);
+    // Ensure every non-announcement-only community (and default community) has an open discussion group
+    // so students and Class Reps can send messages and upload documents right away.
+    const existingComms = await db.select().from(communities);
+    const existingGroups = await db.select().from(communityGroups);
+
+    if (existingComms.length === 0) {
+      const dept = await getSetting('department_name', 'Computer Science & Engineering');
+      const [comm] = await db
+        .insert(communities)
+        .values({
+          name: `${dept} Hub`,
+          description: 'Official department announcements & student-faculty open discussion space.',
+          department: dept,
+          category: 'department',
+          announcementOnly: false,
+          createdByUserId: null,
+          createdByName: 'Department Office',
+        })
+        .returning();
+      await db.insert(communityGroups).values([
+        {
+          communityId: comm.id,
+          name: 'Announcements',
+          description: 'Official broadcasts from HOD, Class Advisors & Admins.',
+          groupType: 'announcements',
+          onlyAdminsCanPost: true,
+        },
+        {
+          communityId: comm.id,
+          name: 'General Discussion',
+          description: 'Open discussion, documents & collaboration for all students and faculty.',
+          groupType: 'group',
+          onlyAdminsCanPost: false,
+        },
+      ]);
+    } else {
+      for (const comm of existingComms) {
+        if (comm.announcementOnly) continue;
+        const commGroups = existingGroups.filter((g) => g.communityId === comm.id);
+        const hasOpenGroup = commGroups.some((g) => !g.onlyAdminsCanPost);
+        if (!hasOpenGroup) {
+          await db
+            .insert(communityGroups)
+            .values({
+              communityId: comm.id,
+              name: 'General Discussion',
+              description: `Open discussion group for ${comm.name}`,
+              groupType: 'group',
+              onlyAdminsCanPost: false,
+              createdByUserId: comm.createdByUserId ?? null,
+            })
+            .onConflictDoNothing();
+        }
+      }
+    }
 
     baselineEnsured = true;
   } catch (error) {
@@ -285,6 +361,26 @@ export async function findUserByEmail(email: string) {
   }
 }
 
+export async function findUserByEmailOrIdentifier(identifier: string) {
+  const cleaned = identifier.trim();
+  if (!cleaned) return null;
+  if (cleaned.includes('@')) {
+    return findUserByEmail(cleaned.toLowerCase());
+  }
+  try {
+    const rows = await db
+      .select()
+      .from(users)
+      .where(eq(users.staffOrRollId, cleaned.toUpperCase()))
+      .limit(2);
+    if (rows.length === 1) return rows[0];
+    return rows.find((r) => r.status === 'approved') ?? rows[0] ?? null;
+  } catch (error) {
+    console.error('Failed to find user by identifier:', error);
+    throw new Error('Database query failed.', { cause: error });
+  }
+}
+
 export async function findUserByUid(uid: string) {
   try {
     const rows = await db.select().from(users).where(eq(users.uid, uid)).limit(1);
@@ -305,10 +401,45 @@ export async function findUserById(id: number) {
   }
 }
 
+export async function findUserWithMetaById(id: number): Promise<UserProfile | null> {
+  const row = await findUserById(id);
+  return row ? enrichUserWithMeta(row) : null;
+}
+
+async function seedGooglePhotoIfUnlocked(userId: number, photoUrl?: string): Promise<void> {
+  const cleanUrl = String(photoUrl ?? '').trim();
+  if (!cleanUrl || (!cleanUrl.startsWith('http://') && !cleanUrl.startsWith('https://'))) return;
+  try {
+    const existing = await db
+      .select()
+      .from(userProfileMeta)
+      .where(eq(userProfileMeta.userId, userId))
+      .limit(1);
+    if (existing[0]?.faceRegisteredLocked || existing[0]?.profileImageData) return;
+    await db
+      .insert(userProfileMeta)
+      .values({
+        userId,
+        profileImageData: cleanUrl,
+        updatedAt: new Date(),
+      })
+      .onConflictDoUpdate({
+        target: userProfileMeta.userId,
+        set: {
+          profileImageData: cleanUrl,
+          updatedAt: new Date(),
+        },
+      });
+  } catch {
+    // Non-critical photo seed failure
+  }
+}
+
 export async function syncFirebaseUserToDb(params: {
   uid: string;
   email: string;
   displayName: string;
+  photoUrl?: string;
 }): Promise<UserProfile> {
   try {
     await ensureBaselineData();
@@ -318,14 +449,19 @@ export async function syncFirebaseUserToDb(params: {
     const byUid = await findUserByUid(params.uid);
     if (byUid) {
       if (byUid.email !== emailLower) {
-        const [updated] = await db
-          .update(users)
-          .set({ email: emailLower })
-          .where(eq(users.id, byUid.id))
-          .returning();
-        return mapUser(updated);
+        const collision = await findUserByEmail(emailLower);
+        if (!collision) {
+          const [updated] = await db
+            .update(users)
+            .set({ email: emailLower })
+            .where(eq(users.id, byUid.id))
+            .returning();
+          await seedGooglePhotoIfUnlocked(updated.id, params.photoUrl);
+          return enrichUserWithMeta(updated);
+        }
       }
-      return mapUser(byUid);
+      await seedGooglePhotoIfUnlocked(byUid.id, params.photoUrl);
+      return enrichUserWithMeta(byUid);
     }
 
     const byEmail = await findUserByEmail(emailLower);
@@ -335,12 +471,62 @@ export async function syncFirebaseUserToDb(params: {
         .set({ uid: params.uid })
         .where(eq(users.id, byEmail.id))
         .returning();
-      return mapUser(linked);
+      await seedGooglePhotoIfUnlocked(linked.id, params.photoUrl);
+      return enrichUserWithMeta(linked);
     }
 
     // If no HOD exists yet, grant HOD role to first Google Sign-In administrator
     const hodCount = await getHodCount();
     const isInitialHod = hodCount === 0;
+
+    // Match pre-uploaded academic directory records when provisioning a first-time Google user
+    let inferredRole: UserRole = isInitialHod ? 'hod' : 'student';
+    let inferredDept = deptName;
+    let inferredStaffOrRollId = isInitialHod ? 'HOD-001' : '';
+    let inferredYear = '';
+    let inferredSection = '';
+    let inferredPhone = '';
+
+    if (!isInitialHod) {
+      const [deptStaffHit, otherStaffHit, studentHit] = await Promise.all([
+        db.select().from(departmentStaff).where(eq(departmentStaff.email, emailLower)).limit(1),
+        db
+          .select()
+          .from(otherDepartmentStaff)
+          .where(eq(otherDepartmentStaff.email, emailLower))
+          .limit(1),
+        db
+          .select()
+          .from(departmentStudents)
+          .where(eq(departmentStudents.email, emailLower))
+          .limit(1),
+      ]);
+
+      if (deptStaffHit[0]) {
+        inferredRole = deptStaffHit[0].isClassAdvisor ? 'class_advisor' : 'dept_staff';
+        inferredDept = deptStaffHit[0].department || deptName;
+        inferredStaffOrRollId = deptStaffHit[0].employeeId || '';
+        const advClass = (deptStaffHit[0].advisingClass || '').trim();
+        if (advClass) {
+          const parts = advClass.split(/[-–—·]/).map((p) => p.trim()).filter(Boolean);
+          inferredYear = parts[0] || advClass;
+          inferredSection = parts[1] || '';
+        }
+        inferredPhone = deptStaffHit[0].phone || '';
+      } else if (otherStaffHit[0]) {
+        inferredRole = 'other_dept_staff';
+        inferredDept = otherStaffHit[0].homeDepartment || deptName;
+        inferredStaffOrRollId = otherStaffHit[0].employeeId || '';
+        inferredPhone = otherStaffHit[0].phone || '';
+      } else if (studentHit[0]) {
+        inferredRole = studentHit[0].isClassRep ? 'class_rep' : 'student';
+        inferredDept = studentHit[0].department || deptName;
+        inferredStaffOrRollId = studentHit[0].rollNo || '';
+        inferredYear = studentHit[0].yearOfStudy || '';
+        inferredSection = studentHit[0].section || '';
+        inferredPhone = studentHit[0].phone || '';
+      }
+    }
 
     const [created] = await db
       .insert(users)
@@ -348,9 +534,12 @@ export async function syncFirebaseUserToDb(params: {
         uid: params.uid,
         fullName: params.displayName?.trim() || emailLower.split('@')[0],
         email: emailLower,
-        role: isInitialHod ? 'hod' : 'student',
-        department: deptName,
-        staffOrRollId: isInitialHod ? 'HOD-001' : '',
+        role: inferredRole,
+        department: inferredDept,
+        staffOrRollId: inferredStaffOrRollId,
+        yearOfStudy: inferredYear,
+        section: inferredSection,
+        phone: inferredPhone,
         status: isInitialHod ? 'approved' : 'pending',
         approvedBy: isInitialHod ? 'Google Workspace Setup' : null,
         approvedAt: isInitialHod ? formatTs(new Date()) : null,
@@ -361,11 +550,42 @@ export async function syncFirebaseUserToDb(params: {
       })
       .returning();
 
-    return mapUser(created);
+    await seedGooglePhotoIfUnlocked(created.id, params.photoUrl);
+    return enrichUserWithMeta(created);
   } catch (error) {
     console.error('Failed to sync Firebase user:', error);
     throw new Error('Failed to synchronize user account.', { cause: error });
   }
+}
+
+export async function setUserPasswordInDb(params: {
+  userId: number;
+  currentPassword?: string;
+  newPassword: string;
+}): Promise<void> {
+  const existing = await findUserById(params.userId);
+  if (!existing) {
+    const err = new Error('User account not found.');
+    (err as Error & { statusCode?: number }).statusCode = 404;
+    throw err;
+  }
+  if (params.newPassword.length < 6) {
+    const err = new Error('New password must be at least 6 characters.');
+    (err as Error & { statusCode?: number }).statusCode = 400;
+    throw err;
+  }
+  if (existing.passwordHash) {
+    const current = params.currentPassword ?? '';
+    if (!current || !verifyPassword(current, existing.passwordHash)) {
+      const err = new Error('Current password is incorrect.');
+      (err as Error & { statusCode?: number }).statusCode = 401;
+      throw err;
+    }
+  }
+  await db
+    .update(users)
+    .set({ passwordHash: hashPassword(params.newPassword) })
+    .where(eq(users.id, params.userId));
 }
 
 export async function createSession(userId: number): Promise<string> {
@@ -388,7 +608,7 @@ export async function getUserBySessionToken(token: string): Promise<UserProfile 
       .innerJoin(users, eq(sessions.userId, users.id))
       .where(and(eq(sessions.token, token), gt(sessions.expiresAt, new Date())))
       .limit(1);
-    return rows[0] ? mapUser(rows[0].user) : null;
+    return rows[0] ? enrichUserWithMeta(rows[0].user) : null;
   } catch (error) {
     console.error('Session lookup failed:', error);
     throw new Error('Authentication check failed.', { cause: error });
@@ -469,40 +689,85 @@ export async function upsertStudentFromRegistration(params: {
 // ============================================================
 // Directory & Timetable Queries
 // ============================================================
+async function buildDirectoryPhotoLookups() {
+  const [userRows, metaRows, bioRows] = await Promise.all([
+    db.select().from(users).where(eq(users.status, 'approved')),
+    db.select().from(userProfileMeta),
+    db
+      .select({
+        rollNo: studentBiometricProfiles.rollNo,
+        email: studentBiometricProfiles.email,
+        faceImageData: studentBiometricProfiles.faceImageData,
+      })
+      .from(studentBiometricProfiles),
+  ]);
+
+  const metaByUserId = new Map(metaRows.map((m) => [m.userId, m]));
+  const photoByKey = new Map<string, { photoData: string; locked: boolean }>();
+
+  for (const b of bioRows) {
+    if (!b.faceImageData) continue;
+    const entry = { photoData: b.faceImageData, locked: true };
+    if (b.rollNo) photoByKey.set(`id:${b.rollNo.trim().toUpperCase()}`, entry);
+    if (b.email) photoByKey.set(`email:${b.email.trim().toLowerCase()}`, entry);
+  }
+
+  for (const u of userRows) {
+    const meta = metaByUserId.get(u.id);
+    if (!meta?.profileImageData) continue;
+    const entry = { photoData: meta.profileImageData, locked: Boolean(meta.faceRegisteredLocked) };
+    if (u.staffOrRollId) photoByKey.set(`id:${u.staffOrRollId.trim().toUpperCase()}`, entry);
+    if (u.email) photoByKey.set(`email:${u.email.trim().toLowerCase()}`, entry);
+    if (u.fullName) photoByKey.set(`name:${u.fullName.trim().toLowerCase()}`, entry);
+  }
+
+  return photoByKey;
+}
+
 export async function listDepartmentStudents(): Promise<DepartmentStudent[]> {
   try {
     await ensureBaselineData();
-    const rows = await db
-      .select({
-        student: departmentStudents,
-        sourceFilename: uploadBatches.originalFilename,
-      })
-      .from(departmentStudents)
-      .leftJoin(uploadBatches, eq(departmentStudents.sourceBatchId, uploadBatches.id))
-      .orderBy(
-        asc(departmentStudents.yearOfStudy),
-        asc(departmentStudents.section),
-        desc(departmentStudents.isClassRep),
-        asc(departmentStudents.rollNo)
-      );
+    const [rows, photoLookup] = await Promise.all([
+      db
+        .select({
+          student: departmentStudents,
+          sourceFilename: uploadBatches.originalFilename,
+        })
+        .from(departmentStudents)
+        .leftJoin(uploadBatches, eq(departmentStudents.sourceBatchId, uploadBatches.id))
+        .orderBy(
+          asc(departmentStudents.yearOfStudy),
+          asc(departmentStudents.section),
+          desc(departmentStudents.isClassRep),
+          asc(departmentStudents.rollNo)
+        ),
+      buildDirectoryPhotoLookups(),
+    ]);
 
-    return rows.map(({ student, sourceFilename }) => ({
-      id: student.id,
-      rollNo: student.rollNo,
-      fullName: student.fullName,
-      email: student.email,
-      department: student.department,
-      yearOfStudy: student.yearOfStudy,
-      section: student.section,
-      phone: student.phone,
-      isClassRep: student.isClassRep,
-      crResponsibility: student.crResponsibility,
-      advisorName: student.advisorName,
-      cgpa: student.cgpa,
-      sourceBatchId: student.sourceBatchId ?? null,
-      sourceFilename: sourceFilename ?? null,
-      createdAt: formatTs(student.createdAt),
-    }));
+    return rows.map(({ student, sourceFilename }) => {
+      const photo =
+        photoLookup.get(`id:${student.rollNo.trim().toUpperCase()}`) ??
+        (student.email ? photoLookup.get(`email:${student.email.trim().toLowerCase()}`) : undefined);
+      return {
+        id: student.id,
+        rollNo: student.rollNo,
+        fullName: student.fullName,
+        email: student.email,
+        department: student.department,
+        yearOfStudy: student.yearOfStudy,
+        section: student.section,
+        phone: student.phone,
+        isClassRep: student.isClassRep,
+        crResponsibility: student.crResponsibility,
+        advisorName: student.advisorName,
+        cgpa: student.cgpa,
+        sourceBatchId: student.sourceBatchId ?? null,
+        sourceFilename: sourceFilename ?? null,
+        createdAt: formatTs(student.createdAt),
+        photoData: photo?.photoData || '',
+        faceRegisteredLocked: photo?.locked ?? false,
+      };
+    });
   } catch (error) {
     console.error('Failed to list students:', error);
     throw new Error('Unable to load student records.', { cause: error });
@@ -512,30 +777,41 @@ export async function listDepartmentStudents(): Promise<DepartmentStudent[]> {
 export async function listDepartmentStaff(): Promise<DepartmentStaff[]> {
   try {
     await ensureBaselineData();
-    const rows = await db
-      .select({
-        staff: departmentStaff,
-        sourceFilename: uploadBatches.originalFilename,
-      })
-      .from(departmentStaff)
-      .leftJoin(uploadBatches, eq(departmentStaff.sourceBatchId, uploadBatches.id))
-      .orderBy(asc(departmentStaff.employeeId));
+    const [rows, photoLookup] = await Promise.all([
+      db
+        .select({
+          staff: departmentStaff,
+          sourceFilename: uploadBatches.originalFilename,
+        })
+        .from(departmentStaff)
+        .leftJoin(uploadBatches, eq(departmentStaff.sourceBatchId, uploadBatches.id))
+        .orderBy(asc(departmentStaff.employeeId)),
+      buildDirectoryPhotoLookups(),
+    ]);
 
-    return rows.map(({ staff, sourceFilename }) => ({
-      id: staff.id,
-      employeeId: staff.employeeId,
-      fullName: staff.fullName,
-      email: staff.email,
-      department: staff.department,
-      designation: staff.designation,
-      specialization: staff.specialization,
-      phone: staff.phone,
-      isClassAdvisor: staff.isClassAdvisor,
-      advisingClass: staff.advisingClass,
-      sourceBatchId: staff.sourceBatchId ?? null,
-      sourceFilename: sourceFilename ?? null,
-      createdAt: formatTs(staff.createdAt),
-    }));
+    return rows.map(({ staff, sourceFilename }) => {
+      const photo =
+        photoLookup.get(`id:${staff.employeeId.trim().toUpperCase()}`) ??
+        (staff.email ? photoLookup.get(`email:${staff.email.trim().toLowerCase()}`) : undefined) ??
+        photoLookup.get(`name:${staff.fullName.trim().toLowerCase()}`);
+      return {
+        id: staff.id,
+        employeeId: staff.employeeId,
+        fullName: staff.fullName,
+        email: staff.email,
+        department: staff.department,
+        designation: staff.designation,
+        specialization: staff.specialization,
+        phone: staff.phone,
+        isClassAdvisor: staff.isClassAdvisor,
+        advisingClass: staff.advisingClass,
+        sourceBatchId: staff.sourceBatchId ?? null,
+        sourceFilename: sourceFilename ?? null,
+        createdAt: formatTs(staff.createdAt),
+        photoData: photo?.photoData || '',
+        faceRegisteredLocked: photo?.locked ?? false,
+      };
+    });
   } catch (error) {
     console.error('Failed to list department staff:', error);
     throw new Error('Unable to load department staff.', { cause: error });
@@ -545,65 +821,161 @@ export async function listDepartmentStaff(): Promise<DepartmentStaff[]> {
 export async function listOtherDepartmentStaff(): Promise<OtherDepartmentStaff[]> {
   try {
     await ensureBaselineData();
-    const rows = await db
-      .select({
-        staff: otherDepartmentStaff,
-        sourceFilename: uploadBatches.originalFilename,
-      })
-      .from(otherDepartmentStaff)
-      .leftJoin(uploadBatches, eq(otherDepartmentStaff.sourceBatchId, uploadBatches.id))
-      .orderBy(asc(otherDepartmentStaff.homeDepartment), asc(otherDepartmentStaff.employeeId));
+    const [rows, photoLookup] = await Promise.all([
+      db
+        .select({
+          staff: otherDepartmentStaff,
+          sourceFilename: uploadBatches.originalFilename,
+        })
+        .from(otherDepartmentStaff)
+        .leftJoin(uploadBatches, eq(otherDepartmentStaff.sourceBatchId, uploadBatches.id))
+        .orderBy(asc(otherDepartmentStaff.homeDepartment), asc(otherDepartmentStaff.employeeId)),
+      buildDirectoryPhotoLookups(),
+    ]);
 
-    return rows.map(({ staff, sourceFilename }) => ({
-      id: staff.id,
-      employeeId: staff.employeeId,
-      fullName: staff.fullName,
-      email: staff.email,
-      homeDepartment: staff.homeDepartment,
-      handlingSubject: staff.handlingSubject,
-      designation: staff.designation,
-      phone: staff.phone,
-      visitingDays: staff.visitingDays,
-      sourceBatchId: staff.sourceBatchId ?? null,
-      sourceFilename: sourceFilename ?? null,
-      createdAt: formatTs(staff.createdAt),
-    }));
+    return rows.map(({ staff, sourceFilename }) => {
+      const photo =
+        photoLookup.get(`id:${staff.employeeId.trim().toUpperCase()}`) ??
+        (staff.email ? photoLookup.get(`email:${staff.email.trim().toLowerCase()}`) : undefined) ??
+        photoLookup.get(`name:${staff.fullName.trim().toLowerCase()}`);
+      return {
+        id: staff.id,
+        employeeId: staff.employeeId,
+        fullName: staff.fullName,
+        email: staff.email,
+        homeDepartment: staff.homeDepartment,
+        handlingSubject: staff.handlingSubject,
+        designation: staff.designation,
+        phone: staff.phone,
+        visitingDays: staff.visitingDays,
+        sourceBatchId: staff.sourceBatchId ?? null,
+        sourceFilename: sourceFilename ?? null,
+        createdAt: formatTs(staff.createdAt),
+        photoData: photo?.photoData || '',
+        faceRegisteredLocked: photo?.locked ?? false,
+      };
+    });
   } catch (error) {
     console.error('Failed to list other department staff:', error);
     throw new Error('Unable to load other department staff.', { cause: error });
   }
 }
 
+export function parseTimeToMinutes(hhmm: string): number {
+  const m = String(hhmm ?? '').trim().match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return 24 * 60;
+  const hh = Number(m[1]);
+  const mm = Number(m[2]);
+  if (!Number.isFinite(hh) || !Number.isFinite(mm)) return 24 * 60;
+  return Math.max(0, Math.min(24 * 60, hh * 60 + mm));
+}
+
+export function formatTimePeriodPerHour(
+  startTime: string,
+  endTime: string,
+  periodNumber: number
+): string {
+  const s = parseTimeToMinutes(startTime);
+  const e = parseTimeToMinutes(endTime);
+  const diff = e > s && s < 24 * 60 && e <= 24 * 60 ? e - s : 50;
+  return `${startTime}–${endTime} (${diff} min / Hr ${periodNumber})`;
+}
+
+export function mapFacultyAlterationRow(
+  r: typeof facultyAlterations.$inferSelect
+): FacultyAlterationItem {
+  return {
+    id: r.id,
+    department: r.department,
+    yearOfStudy: r.yearOfStudy,
+    section: r.section,
+    dayOfWeek: r.dayOfWeek,
+    periodNumber: r.periodNumber,
+    alterationDate: r.alterationDate,
+    timetableSlotId: r.timetableSlotId ?? null,
+    subjectCode: r.subjectCode,
+    subjectName: r.subjectName,
+    roomNo: r.roomNo,
+    requestingUserId: r.requestingUserId ?? null,
+    requestingFacultyName: r.requestingFacultyName,
+    substituteUserId: r.substituteUserId ?? null,
+    substituteFacultyName: r.substituteFacultyName,
+    substituteEmail: r.substituteEmail,
+    substitutePhone: r.substitutePhone,
+    reasonCategory: (r.reasonCategory as FacultyAlterationItem['reasonCategory']) || 'busy',
+    reasonNote: r.reasonNote,
+    status: (r.status as FacultyAlterationItem['status']) || 'pending_hod',
+    hodReviewedBy: r.hodReviewedBy,
+    hodRemarks: r.hodRemarks,
+    hodReviewedAt: r.hodReviewedAt ? formatTs(r.hodReviewedAt) : null,
+    createdAt: formatTs(r.createdAt),
+  };
+}
+
 export async function listTimetableSlots(): Promise<TimetableSlot[]> {
   try {
     await ensureBaselineData();
-    const rows = await db
-      .select()
-      .from(timetableSlots)
-      .orderBy(
-        asc(timetableSlots.yearOfStudy),
-        asc(timetableSlots.section),
-        asc(timetableSlots.dayOfWeek),
-        asc(timetableSlots.periodNumber)
-      );
+    const [tz, dept] = await Promise.all([
+      getSetting('academic_timezone', 'Asia/Kolkata'),
+      getSetting('department_name', 'Computer Science & Engineering'),
+    ]);
+    const todayIso = computeServerTimeStatus(tz, dept).isoDate;
 
-    return rows.map((r) => ({
-      id: r.id,
-      department: r.department,
-      yearOfStudy: r.yearOfStudy,
-      section: r.section,
-      dayOfWeek: r.dayOfWeek,
-      periodNumber: r.periodNumber,
-      startTime: r.startTime,
-      endTime: r.endTime,
-      subjectCode: r.subjectCode,
-      subjectName: r.subjectName,
-      facultyName: r.facultyName,
-      facultyType: r.facultyType as 'department' | 'other_department',
-      roomNo: r.roomNo,
-      sourceBatchId: r.sourceBatchId ?? null,
-      createdAt: formatTs(r.createdAt),
-    }));
+    const [rows, approvedAlterations] = await Promise.all([
+      db
+        .select()
+        .from(timetableSlots)
+        .orderBy(
+          asc(timetableSlots.yearOfStudy),
+          asc(timetableSlots.section),
+          asc(timetableSlots.dayOfWeek),
+          asc(timetableSlots.periodNumber)
+        ),
+      db
+        .select()
+        .from(facultyAlterations)
+        .where(
+          and(
+            eq(facultyAlterations.status, 'approved'),
+            eq(facultyAlterations.alterationDate, todayIso)
+          )
+        )
+        .orderBy(desc(facultyAlterations.id)),
+    ]);
+
+    const mappedAlts = approvedAlterations.map(mapFacultyAlterationRow);
+
+    return rows.map((r) => {
+      const activeAlteration =
+        mappedAlts.find(
+          (a) =>
+            a.timetableSlotId === r.id ||
+            (a.dayOfWeek === r.dayOfWeek &&
+              a.periodNumber === r.periodNumber &&
+              a.yearOfStudy === r.yearOfStudy &&
+              a.section.toUpperCase() === r.section.toUpperCase())
+        ) ?? null;
+
+      return {
+        id: r.id,
+        department: r.department,
+        yearOfStudy: r.yearOfStudy,
+        section: r.section,
+        dayOfWeek: r.dayOfWeek,
+        periodNumber: r.periodNumber,
+        startTime: r.startTime,
+        endTime: r.endTime,
+        timePeriodPerHour: formatTimePeriodPerHour(r.startTime, r.endTime, r.periodNumber),
+        subjectCode: r.subjectCode,
+        subjectName: r.subjectName,
+        facultyName: r.facultyName,
+        facultyType: r.facultyType as 'department' | 'other_department',
+        roomNo: r.roomNo,
+        sourceBatchId: r.sourceBatchId ?? null,
+        createdAt: formatTs(r.createdAt),
+        activeAlteration,
+      };
+    });
   } catch (error) {
     console.error('Failed to list timetable slots:', error);
     throw new Error('Unable to load timetable records.', { cause: error });
@@ -635,6 +1007,7 @@ function mapTimetableRow(r: typeof timetableSlots.$inferSelect): TimetableSlot {
     periodNumber: r.periodNumber,
     startTime: r.startTime,
     endTime: r.endTime,
+    timePeriodPerHour: formatTimePeriodPerHour(r.startTime, r.endTime, r.periodNumber),
     subjectCode: r.subjectCode,
     subjectName: r.subjectName,
     facultyName: r.facultyName,
@@ -643,6 +1016,58 @@ function mapTimetableRow(r: typeof timetableSlots.$inferSelect): TimetableSlot {
     sourceBatchId: r.sourceBatchId ?? null,
     createdAt: formatTs(r.createdAt),
   };
+}
+
+type DbTransaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+async function resequenceTimetableDaySlots(
+  tx: DbTransaction,
+  department: string,
+  yearOfStudy: string,
+  section: string,
+  dayOfWeek: string
+): Promise<void> {
+  const dayRows = await tx
+    .select()
+    .from(timetableSlots)
+    .where(
+      and(
+        eq(timetableSlots.department, department),
+        eq(timetableSlots.yearOfStudy, yearOfStudy),
+        eq(timetableSlots.section, section),
+        eq(timetableSlots.dayOfWeek, dayOfWeek)
+      )
+    );
+
+  if (dayRows.length === 0) return;
+
+  const sorted = [...dayRows].sort((a, b) => {
+    const startDiff = parseTimeToMinutes(a.startTime) - parseTimeToMinutes(b.startTime);
+    if (startDiff !== 0) return startDiff;
+    const endDiff = parseTimeToMinutes(a.endTime) - parseTimeToMinutes(b.endTime);
+    if (endDiff !== 0) return endDiff;
+    if (a.periodNumber !== b.periodNumber) return a.periodNumber - b.periodNumber;
+    return a.id - b.id;
+  });
+
+  const needsUpdate = sorted.some((row, idx) => row.periodNumber !== idx + 1);
+  if (!needsUpdate) return;
+
+  // Step 1: assign negative temporary period numbers to avoid unique index collision
+  for (let i = 0; i < sorted.length; i++) {
+    await tx
+      .update(timetableSlots)
+      .set({ periodNumber: -(i + 1000) })
+      .where(eq(timetableSlots.id, sorted[i].id));
+  }
+
+  // Step 2: assign clean chronological 1..N period numbers
+  for (let i = 0; i < sorted.length; i++) {
+    await tx
+      .update(timetableSlots)
+      .set({ periodNumber: i + 1 })
+      .where(eq(timetableSlots.id, sorted[i].id));
+  }
 }
 
 export async function saveTimetableSlot(
@@ -666,56 +1091,136 @@ export async function saveTimetableSlot(
       roomNo: input.roomNo.trim(),
     };
 
-    if (existingId && Number.isInteger(existingId) && existingId > 0) {
-      // Remove any OTHER conflicting slot at the target (dept, year, section, day, period)
-      await db
-        .delete(timetableSlots)
-        .where(
-          and(
-            ne(timetableSlots.id, existingId),
-            eq(timetableSlots.department, values.department),
-            eq(timetableSlots.yearOfStudy, values.yearOfStudy),
-            eq(timetableSlots.section, values.section),
-            eq(timetableSlots.dayOfWeek, values.dayOfWeek),
-            eq(timetableSlots.periodNumber, values.periodNumber)
-          )
-        );
+    const finalRow = await db.transaction(async (tx) => {
+      let targetId: number;
+      let oldCohort: {
+        department: string;
+        yearOfStudy: string;
+        section: string;
+        dayOfWeek: string;
+      } | null = null;
 
-      const [updated] = await db
-        .update(timetableSlots)
-        .set(values)
-        .where(eq(timetableSlots.id, existingId))
-        .returning();
+      if (existingId && Number.isInteger(existingId) && existingId > 0) {
+        const prev = await tx
+          .select()
+          .from(timetableSlots)
+          .where(eq(timetableSlots.id, existingId))
+          .limit(1);
+        if (prev[0]) {
+          oldCohort = {
+            department: prev[0].department,
+            yearOfStudy: prev[0].yearOfStudy,
+            section: prev[0].section,
+            dayOfWeek: prev[0].dayOfWeek,
+          };
+        }
 
-      if (updated) {
-        return mapTimetableRow(updated);
+        // Remove any OTHER conflicting slot at the target (dept, year, section, day, period)
+        await tx
+          .delete(timetableSlots)
+          .where(
+            and(
+              ne(timetableSlots.id, existingId),
+              eq(timetableSlots.department, values.department),
+              eq(timetableSlots.yearOfStudy, values.yearOfStudy),
+              eq(timetableSlots.section, values.section),
+              eq(timetableSlots.dayOfWeek, values.dayOfWeek),
+              eq(timetableSlots.periodNumber, values.periodNumber)
+            )
+          );
+
+        const [updated] = await tx
+          .update(timetableSlots)
+          .set(values)
+          .where(eq(timetableSlots.id, existingId))
+          .returning();
+
+        if (updated) {
+          targetId = updated.id;
+        } else {
+          const [inserted] = await tx
+            .insert(timetableSlots)
+            .values(values)
+            .onConflictDoUpdate({
+              target: [
+                timetableSlots.department,
+                timetableSlots.yearOfStudy,
+                timetableSlots.section,
+                timetableSlots.dayOfWeek,
+                timetableSlots.periodNumber,
+              ],
+              set: {
+                startTime: values.startTime,
+                endTime: values.endTime,
+                subjectCode: values.subjectCode,
+                subjectName: values.subjectName,
+                facultyName: values.facultyName,
+                facultyType: values.facultyType,
+                roomNo: values.roomNo,
+              },
+            })
+            .returning();
+          targetId = inserted.id;
+        }
+      } else {
+        const [saved] = await tx
+          .insert(timetableSlots)
+          .values(values)
+          .onConflictDoUpdate({
+            target: [
+              timetableSlots.department,
+              timetableSlots.yearOfStudy,
+              timetableSlots.section,
+              timetableSlots.dayOfWeek,
+              timetableSlots.periodNumber,
+            ],
+            set: {
+              startTime: values.startTime,
+              endTime: values.endTime,
+              subjectCode: values.subjectCode,
+              subjectName: values.subjectName,
+              facultyName: values.facultyName,
+              facultyType: values.facultyType,
+              roomNo: values.roomNo,
+            },
+          })
+          .returning();
+        targetId = saved.id;
       }
-    }
 
-    const [saved] = await db
-      .insert(timetableSlots)
-      .values(values)
-      .onConflictDoUpdate({
-        target: [
-          timetableSlots.department,
-          timetableSlots.yearOfStudy,
-          timetableSlots.section,
-          timetableSlots.dayOfWeek,
-          timetableSlots.periodNumber,
-        ],
-        set: {
-          startTime: values.startTime,
-          endTime: values.endTime,
-          subjectCode: values.subjectCode,
-          subjectName: values.subjectName,
-          facultyName: values.facultyName,
-          facultyType: values.facultyType,
-          roomNo: values.roomNo,
-        },
-      })
-      .returning();
+      if (
+        oldCohort &&
+        (oldCohort.department !== values.department ||
+          oldCohort.yearOfStudy !== values.yearOfStudy ||
+          oldCohort.section !== values.section ||
+          oldCohort.dayOfWeek !== values.dayOfWeek)
+      ) {
+        await resequenceTimetableDaySlots(
+          tx,
+          oldCohort.department,
+          oldCohort.yearOfStudy,
+          oldCohort.section,
+          oldCohort.dayOfWeek
+        );
+      }
 
-    return mapTimetableRow(saved);
+      await resequenceTimetableDaySlots(
+        tx,
+        values.department,
+        values.yearOfStudy,
+        values.section,
+        values.dayOfWeek
+      );
+
+      const refreshed = await tx
+        .select()
+        .from(timetableSlots)
+        .where(eq(timetableSlots.id, targetId))
+        .limit(1);
+      return refreshed[0];
+    });
+
+    return mapTimetableRow(finalRow);
   } catch (error) {
     console.error('Failed to save timetable slot:', error);
     throw new Error('Unable to save timetable slot.', { cause: error });
@@ -725,11 +1230,35 @@ export async function saveTimetableSlot(
 export async function deleteTimetableSlot(id: number): Promise<boolean> {
   try {
     await ensureBaselineData();
-    const deleted = await db
-      .delete(timetableSlots)
-      .where(eq(timetableSlots.id, id))
-      .returning({ id: timetableSlots.id });
-    return deleted.length > 0;
+    return await db.transaction(async (tx) => {
+      const existing = await tx
+        .select({
+          department: timetableSlots.department,
+          yearOfStudy: timetableSlots.yearOfStudy,
+          section: timetableSlots.section,
+          dayOfWeek: timetableSlots.dayOfWeek,
+        })
+        .from(timetableSlots)
+        .where(eq(timetableSlots.id, id))
+        .limit(1);
+
+      const deleted = await tx
+        .delete(timetableSlots)
+        .where(eq(timetableSlots.id, id))
+        .returning({ id: timetableSlots.id });
+
+      if (deleted.length > 0 && existing[0]) {
+        await resequenceTimetableDaySlots(
+          tx,
+          existing[0].department,
+          existing[0].yearOfStudy,
+          existing[0].section,
+          existing[0].dayOfWeek
+        );
+      }
+
+      return deleted.length > 0;
+    });
   } catch (error) {
     console.error('Failed to delete timetable slot:', error);
     throw new Error('Unable to delete timetable slot.', { cause: error });
@@ -936,17 +1465,33 @@ export async function commitDocumentRowsToDb(params: {
         }
       } else if (params.targetModule === 'timetable') {
         const seenKeys = new Set<string>();
-        for (const r of params.rows) {
+        const touchedCohorts = new Map<
+          string,
+          { department: string; yearOfStudy: string; section: string; dayOfWeek: string }
+        >();
+
+        // Sort chronologically within each (dept, year, section, day) before inserting & resequencing
+        const sortedTimetableRows = [...params.rows].sort((a, b) => {
+          const sA = parseTimeToMinutes(String(a.startTime ?? '08:45'));
+          const sB = parseTimeToMinutes(String(b.startTime ?? '08:45'));
+          if (sA !== sB) return sA - sB;
+          return Number(a.periodNumber ?? 1) - Number(b.periodNumber ?? 1);
+        });
+
+        for (const r of sortedTimetableRows) {
           const dept = String(r.department ?? params.defaultDepartment).trim();
           const yearOfStudy = String(r.yearOfStudy ?? 'III Year').trim();
           const section = String(r.section ?? 'A').trim().toUpperCase();
           const dayOfWeek = String(r.dayOfWeek ?? 'Monday').trim();
-          const periodNumber = Number(r.periodNumber ?? 1);
+          const periodNumber = Math.max(1, Math.min(12, Number(r.periodNumber ?? 1) || 1));
           const subjectName = String(r.subjectName ?? '').trim();
           const facultyName = String(r.facultyName ?? '').trim();
           const key = `${dept}|${yearOfStudy}|${section}|${dayOfWeek}|${periodNumber}`;
           if (!subjectName || !facultyName || seenKeys.has(key)) continue;
           seenKeys.add(key);
+
+          const cohortKey = `${dept}|${yearOfStudy}|${section}|${dayOfWeek}`;
+          touchedCohorts.set(cohortKey, { department: dept, yearOfStudy, section, dayOfWeek });
 
           const existing = await tx
             .select({ id: timetableSlots.id })
@@ -1002,6 +1547,16 @@ export async function commitDocumentRowsToDb(params: {
 
           if (existing.length > 0) updated++;
           else inserted++;
+        }
+
+        for (const cohort of touchedCohorts.values()) {
+          await resequenceTimetableDaySlots(
+            tx,
+            cohort.department,
+            cohort.yearOfStudy,
+            cohort.section,
+            cohort.dayOfWeek
+          );
         }
       }
 
@@ -1130,7 +1685,7 @@ export async function runDeduplicationSweep(): Promise<DeduplicateReport> {
 // WhatsApp-Style Communities, Groups & Real-Time Messages
 // ============================================================
 export function canUserCreateCommunity(role: UserRole): boolean {
-  return ['hod', 'class_advisor', 'dept_staff', 'other_dept_staff', 'class_rep'].includes(role);
+  return ['hod', 'class_advisor', 'dept_staff', 'other_dept_staff', 'class_rep', 'student'].includes(role);
 }
 
 export async function canUserManageCommunity(
@@ -1379,10 +1934,20 @@ function parseAttachmentJson(raw: string | null | undefined): ChatAttachmentPayl
   }
 }
 
+export interface SenderMetaSnapshot {
+  senderPhotoData: string;
+  senderStaffOrRollId: string;
+  senderDepartment: string;
+  senderYearSection: string;
+  senderEmail: string;
+  senderPhone: string;
+}
+
 export function mapChatMessageRow(
   m: typeof chatMessages.$inferSelect,
   acknowledgements: PowerBoostAcknowledgementItem[] = [],
-  viewerUserId?: number
+  viewerUserId?: number,
+  senderMeta?: SenderMetaSnapshot
 ): ChatMessageItem {
   return {
     id: m.id,
@@ -1407,7 +1972,54 @@ export function mapChatMessageRow(
     isPinned: m.isPinned,
     editedAt: m.editedAt ? formatTs(m.editedAt) : null,
     createdAt: formatTs(m.createdAt),
+    senderPhotoData: senderMeta?.senderPhotoData ?? '',
+    senderStaffOrRollId: senderMeta?.senderStaffOrRollId ?? '',
+    senderDepartment: senderMeta?.senderDepartment ?? '',
+    senderYearSection: senderMeta?.senderYearSection ?? '',
+    senderEmail: senderMeta?.senderEmail ?? '',
+    senderPhone: senderMeta?.senderPhone ?? '',
   };
+}
+
+export async function getSenderMetaLookup(userIds: number[]): Promise<Map<number, SenderMetaSnapshot>> {
+  const uniqueIds = Array.from(new Set(userIds.filter((id) => Number.isInteger(id) && id > 0)));
+  if (uniqueIds.length === 0) return new Map();
+
+  const [userRows, metaRows, bioRows] = await Promise.all([
+    db.select().from(users).where(inArray(users.id, uniqueIds)),
+    db.select().from(userProfileMeta).where(inArray(userProfileMeta.userId, uniqueIds)),
+    db
+      .select({
+        rollNo: studentBiometricProfiles.rollNo,
+        email: studentBiometricProfiles.email,
+        faceImageData: studentBiometricProfiles.faceImageData,
+      })
+      .from(studentBiometricProfiles),
+  ]);
+
+  const metaById = new Map(metaRows.map((m) => [m.userId, m]));
+  const bioByRoll = new Map(bioRows.map((b) => [b.rollNo.trim().toUpperCase(), b.faceImageData]));
+  const bioByEmail = new Map(bioRows.map((b) => [b.email.trim().toLowerCase(), b.faceImageData]));
+  const result = new Map<number, SenderMetaSnapshot>();
+
+  for (const u of userRows) {
+    const meta = metaById.get(u.id);
+    const bioPhoto =
+      (u.staffOrRollId ? bioByRoll.get(u.staffOrRollId.trim().toUpperCase()) : undefined) ??
+      (u.email ? bioByEmail.get(u.email.trim().toLowerCase()) : undefined) ??
+      '';
+    const yrSec = [u.yearOfStudy, u.section ? `Sec ${u.section}` : ''].filter(Boolean).join(' · ');
+    result.set(u.id, {
+      senderPhotoData: meta?.profileImageData || bioPhoto || '',
+      senderStaffOrRollId: u.staffOrRollId || '',
+      senderDepartment: u.department || '',
+      senderYearSection: yrSec,
+      senderEmail: u.email || '',
+      senderPhone: u.phone || '',
+    });
+  }
+
+  return result;
 }
 
 export async function listGroupMessages(
@@ -1423,31 +2035,47 @@ export async function listGroupMessages(
       .limit(250);
 
     const msgIds = rows.map((r) => r.id);
-    const ackMap = new Map<number, PowerBoostAcknowledgementItem[]>();
+    const senderIds = rows
+      .map((r) => r.senderUserId)
+      .filter((id): id is number => typeof id === 'number' && id > 0);
 
-    if (msgIds.length > 0) {
-      const ackRows = await db
-        .select()
-        .from(messageAcknowledgements)
-        .where(inArray(messageAcknowledgements.messageId, msgIds))
-        .orderBy(asc(messageAcknowledgements.acknowledgedAt));
+    const [ackMap, senderLookup] = await Promise.all([
+      (async () => {
+        const map = new Map<number, PowerBoostAcknowledgementItem[]>();
+        if (msgIds.length > 0) {
+          const ackRows = await db
+            .select()
+            .from(messageAcknowledgements)
+            .where(inArray(messageAcknowledgements.messageId, msgIds))
+            .orderBy(asc(messageAcknowledgements.acknowledgedAt));
 
-      for (const a of ackRows) {
-        const list = ackMap.get(a.messageId) ?? [];
-        list.push({
-          id: a.id,
-          messageId: a.messageId,
-          userId: a.userId,
-          userName: a.userName,
-          userRole: a.userRole,
-          responseNote: a.responseNote,
-          acknowledgedAt: formatTs(a.acknowledgedAt),
-        });
-        ackMap.set(a.messageId, list);
-      }
-    }
+          for (const a of ackRows) {
+            const list = map.get(a.messageId) ?? [];
+            list.push({
+              id: a.id,
+              messageId: a.messageId,
+              userId: a.userId,
+              userName: a.userName,
+              userRole: a.userRole,
+              responseNote: a.responseNote,
+              acknowledgedAt: formatTs(a.acknowledgedAt),
+            });
+            map.set(a.messageId, list);
+          }
+        }
+        return map;
+      })(),
+      getSenderMetaLookup(senderIds),
+    ]);
 
-    return rows.map((m) => mapChatMessageRow(m, ackMap.get(m.id) ?? [], viewerUserId));
+    return rows.map((m) =>
+      mapChatMessageRow(
+        m,
+        ackMap.get(m.id) ?? [],
+        viewerUserId,
+        m.senderUserId ? senderLookup.get(m.senderUserId) : undefined
+      )
+    );
   } catch (error) {
     console.error('Failed to list messages:', error);
     throw new Error('Unable to load chat messages.', { cause: error });
@@ -1492,7 +2120,18 @@ export async function createChatMessageInDb(params: {
       })
       .returning();
 
-    return mapChatMessageRow(inserted, [], params.user.id);
+    const yrSec = [params.user.yearOfStudy, params.user.section ? `Sec ${params.user.section}` : '']
+      .filter(Boolean)
+      .join(' · ');
+
+    return mapChatMessageRow(inserted, [], params.user.id, {
+      senderPhotoData: params.user.profileImageData || '',
+      senderStaffOrRollId: params.user.staffOrRollId || '',
+      senderDepartment: params.user.department || '',
+      senderYearSection: yrSec,
+      senderEmail: params.user.email || '',
+      senderPhone: params.user.phone || '',
+    });
   } catch (error) {
     console.error('Failed to insert chat message:', error);
     throw new Error('Unable to send message.', { cause: error });
@@ -1984,10 +2623,9 @@ export async function listRegistrations(): Promise<UserProfile[]> {
       .where(ne(users.role, 'hod'))
       .orderBy(desc(users.createdAt));
 
+    const enriched = await enrichUsersWithMeta(rows);
     const order: Record<string, number> = { pending: 0, approved: 1, rejected: 2 };
-    return rows
-      .map(mapUser)
-      .sort((a, b) => (order[a.status] ?? 9) - (order[b.status] ?? 9));
+    return enriched.sort((a, b) => (order[a.status] ?? 9) - (order[b.status] ?? 9));
   } catch (error) {
     console.error('Failed to list registrations:', error);
     throw new Error('Unable to load registrations.', { cause: error });
@@ -2061,12 +2699,14 @@ export async function getPinnedLocationConfig(): Promise<PinnedLocationConfig> {
       25,
       Math.min(5000, Math.round(Number(radiusStr) || 200))
     );
+    const hasValidNonZero =
+      latitude !== null && longitude !== null && !(latitude === 0 && longitude === 0);
 
     return {
-      configured: latitude !== null && longitude !== null,
+      configured: hasValidNonZero,
       label: label || 'Department Classroom Zone',
-      latitude,
-      longitude,
+      latitude: hasValidNonZero ? latitude : null,
+      longitude: hasValidNonZero ? longitude : null,
       radiusMeters,
       updatedBy,
       updatedAt,
@@ -2229,9 +2869,30 @@ export async function listStudentBiometricSummaries(): Promise<StudentBiometricP
 // ============================================================
 // Faculty Delay Alerts Queries
 // ============================================================
+function normalizeFacultyMatchKey(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+async function buildFacultyPhoneLookup(): Promise<Map<string, string>> {
+  const [deptStaffRows, otherRows, userRows] = await Promise.all([
+    db.select({ fullName: departmentStaff.fullName, phone: departmentStaff.phone }).from(departmentStaff),
+    db.select({ fullName: otherDepartmentStaff.fullName, phone: otherDepartmentStaff.phone }).from(otherDepartmentStaff),
+    db.select({ fullName: users.fullName, phone: users.phone }).from(users).where(eq(users.status, 'approved')),
+  ]);
+  const map = new Map<string, string>();
+  for (const r of [...deptStaffRows, ...otherRows, ...userRows]) {
+    if (r.phone) {
+      map.set(normalizeFacultyMatchKey(r.fullName), r.phone);
+    }
+  }
+  return map;
+}
+
 function mapFacultyDelayRow(
-  r: typeof facultyDelayAlerts.$inferSelect
+  r: typeof facultyDelayAlerts.$inferSelect,
+  phoneLookup?: Map<string, string>
 ): FacultyDelayAlertItem {
+  const facultyPhone = phoneLookup?.get(normalizeFacultyMatchKey(r.facultyName)) || '';
   return {
     id: r.id,
     department: r.department,
@@ -2253,6 +2914,8 @@ function mapFacultyDelayRow(
     acknowledgedByName: r.acknowledgedByName,
     acknowledgedAt: r.acknowledgedAt ? formatTs(r.acknowledgedAt) : null,
     createdAt: formatTs(r.createdAt),
+    isAutoDetected: r.reportedByRole === 'system_auto',
+    facultyPhone,
   };
 }
 
@@ -2267,9 +2930,14 @@ export function isUserFacultyDelayRecipient(
     return true;
   }
   if (user.role === 'dept_staff' || user.role === 'other_dept_staff') {
-    const normUser = user.fullName.toLowerCase().replace(/[^a-z0-9]/g, '');
-    const normFaculty = alert.facultyName.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const normUser = normalizeFacultyMatchKey(user.fullName);
+    const normFaculty = normalizeFacultyMatchKey(alert.facultyName);
     if (normUser && normFaculty && (normUser.includes(normFaculty) || normFaculty.includes(normUser))) {
+      return true;
+    }
+  }
+  if (user.role === 'class_rep' || user.role === 'student') {
+    if (!alert.yearOfStudy || !user.yearOfStudy || alert.yearOfStudy === user.yearOfStudy) {
       return true;
     }
   }
@@ -2313,21 +2981,175 @@ export async function createFacultyDelayAlert(params: {
     })
     .returning();
 
-  return mapFacultyDelayRow(created);
+  const phoneLookup = await buildFacultyPhoneLookup();
+  return mapFacultyDelayRow(created, phoneLookup);
+}
+
+let autoDelayScanInFlight = false;
+
+export async function runAutoFacultyDelayScan(): Promise<FacultyDelayAlertItem[]> {
+  if (autoDelayScanInFlight) return [];
+  autoDelayScanInFlight = true;
+  try {
+    await ensureBaselineData();
+    const [tz, dept] = await Promise.all([
+      getSetting('academic_timezone', 'Asia/Kolkata'),
+      getSetting('department_name', 'Computer Science & Engineering'),
+    ]);
+    const serverTime = computeServerTimeStatus(tz, dept);
+    if (!serverTime.isAcademicDay) return [];
+
+    const nowMin = serverTime.minutesSinceMidnight;
+
+    const [todaySlots, todayAttendance, activeOdLeave, approvedAlts, recentAlerts, phoneLookup] =
+      await Promise.all([
+        db
+          .select()
+          .from(timetableSlots)
+          .where(eq(timetableSlots.dayOfWeek, serverTime.weekday)),
+        db
+          .select()
+          .from(attendanceRecords)
+          .where(eq(attendanceRecords.attendanceDate, serverTime.isoDate)),
+        listActiveApprovedOdLeaveForDate(serverTime.isoDate),
+        db
+          .select()
+          .from(facultyAlterations)
+          .where(
+            and(
+              eq(facultyAlterations.status, 'approved'),
+              eq(facultyAlterations.alterationDate, serverTime.isoDate)
+            )
+          ),
+        db
+          .select()
+          .from(facultyDelayAlerts)
+          .orderBy(desc(facultyDelayAlerts.id))
+          .limit(120),
+        buildFacultyPhoneLookup(),
+      ]);
+
+    const newlyCreated: FacultyDelayAlertItem[] = [];
+
+    for (const slot of todaySlots) {
+      const startMin = parseTimeToMinutes(slot.startTime);
+      const endMin = parseTimeToMinutes(slot.endTime);
+      if (startMin >= 24 * 60 || endMin <= startMin) continue;
+
+      // Only trigger if class has started by >= 5 minutes and hasn't ended yet
+      const elapsed = nowMin - startMin;
+      if (elapsed < 5 || nowMin >= endMin) continue;
+
+      const slotFacultyNorm = normalizeFacultyMatchKey(slot.facultyName);
+      if (!slotFacultyNorm) continue;
+
+      // 1. Check if faculty already marked attendance today for this period/slot
+      const hasAttendance = todayAttendance.some((a) => {
+        if (a.personType !== 'faculty') return false;
+        if (a.status !== 'present' && a.status !== 'late' && a.status !== 'od') return false;
+        const attNameNorm = normalizeFacultyMatchKey(a.personName);
+        const matchesFaculty =
+          attNameNorm === slotFacultyNorm ||
+          attNameNorm.includes(slotFacultyNorm) ||
+          slotFacultyNorm.includes(attNameNorm);
+        return matchesFaculty && (a.timetableSlotId === slot.id || a.periodNumber === slot.periodNumber);
+      });
+      if (hasAttendance) continue;
+
+      // 2. Check if faculty has approved OD/Leave today
+      const onApprovedOdLeave = activeOdLeave.some((r) => {
+        if (r.applicantCategory !== 'faculty') return false;
+        const appNorm = normalizeFacultyMatchKey(r.applicantName);
+        return (
+          appNorm === slotFacultyNorm ||
+          appNorm.includes(slotFacultyNorm) ||
+          slotFacultyNorm.includes(appNorm)
+        );
+      });
+      if (onApprovedOdLeave) continue;
+
+      // 3. Check if HOD approved a Faculty Alteration/Substitute for this slot today
+      const hasApprovedAlteration = approvedAlts.some(
+        (alt) =>
+          alt.timetableSlotId === slot.id ||
+          (alt.dayOfWeek === slot.dayOfWeek &&
+            alt.periodNumber === slot.periodNumber &&
+            alt.yearOfStudy === slot.yearOfStudy &&
+            alt.section.toUpperCase() === slot.section.toUpperCase())
+      );
+      if (hasApprovedAlteration) continue;
+
+      // 4. Deduplicate against alerts already logged today in this academic timezone
+      const alreadyAlerted = recentAlerts.some((al) => {
+        const alDate = al.createdAt
+          ? new Intl.DateTimeFormat('en-CA', {
+              timeZone: serverTime.academicTimezone,
+              year: 'numeric',
+              month: '2-digit',
+              day: '2-digit',
+            }).format(al.createdAt)
+          : '';
+        if (alDate !== serverTime.isoDate) return false;
+        return (
+          al.timetableSlotId === slot.id ||
+          (al.periodNumber === slot.periodNumber &&
+            al.yearOfStudy === slot.yearOfStudy &&
+            al.section.toUpperCase() === slot.section.toUpperCase() &&
+            normalizeFacultyMatchKey(al.facultyName) === slotFacultyNorm)
+        );
+      });
+      if (alreadyAlerted) continue;
+
+      const [inserted] = await db
+        .insert(facultyDelayAlerts)
+        .values({
+          department: slot.department,
+          yearOfStudy: slot.yearOfStudy,
+          section: slot.section,
+          dayOfWeek: slot.dayOfWeek,
+          periodNumber: slot.periodNumber,
+          timetableSlotId: slot.id,
+          subjectCode: slot.subjectCode,
+          subjectName: slot.subjectName,
+          roomNo: slot.roomNo,
+          facultyName: slot.facultyName,
+          reportedByUserId: null,
+          reportedByName: 'Auto Schedule Analyzer',
+          reportedByRole: 'system_auto',
+          delayMinutes: Math.max(5, Math.min(120, elapsed)),
+          note: `Auto-detected ${elapsed}m delay after ${slot.startTime} (${slot.yearOfStudy} ${slot.section}) without faculty check-in or approved alteration.`,
+          status: 'active',
+        })
+        .returning();
+
+      const mapped = mapFacultyDelayRow(inserted, phoneLookup);
+      newlyCreated.push(mapped);
+    }
+
+    return newlyCreated;
+  } catch (error) {
+    console.error('Auto faculty delay scan failed:', error);
+    return [];
+  } finally {
+    autoDelayScanInFlight = false;
+  }
 }
 
 export async function listFacultyDelayAlertsForUser(
   user: UserProfile
 ): Promise<FacultyDelayAlertItem[]> {
   try {
-    const rows = await db
-      .select()
-      .from(facultyDelayAlerts)
-      .orderBy(desc(facultyDelayAlerts.id))
-      .limit(50);
+    const [rows, phoneLookup] = await Promise.all([
+      db
+        .select()
+        .from(facultyDelayAlerts)
+        .orderBy(desc(facultyDelayAlerts.id))
+        .limit(60),
+      buildFacultyPhoneLookup(),
+    ]);
 
     return rows
-      .map(mapFacultyDelayRow)
+      .map((r) => mapFacultyDelayRow(r, phoneLookup))
       .filter((alert) => isUserFacultyDelayRecipient(alert, user));
   } catch (error) {
     console.error('Failed to list faculty delay alerts:', error);
@@ -2349,7 +3171,9 @@ export async function updateFacultyDelayAlertStatus(params: {
     })
     .where(eq(facultyDelayAlerts.id, params.id))
     .returning();
-  return updated ? mapFacultyDelayRow(updated) : null;
+  if (!updated) return null;
+  const phoneLookup = await buildFacultyPhoneLookup();
+  return mapFacultyDelayRow(updated, phoneLookup);
 }
 
 // ============================================================
@@ -4466,4 +5290,798 @@ export async function getArchivalSnapshotData(todayIso: string) {
     })),
   };
 }
+
+// ============================================================
+// Profile Management, Face-Registration Photo Lock & HOD Showcase
+// ============================================================
+export async function updateUserProfileInDb(params: {
+  userId: number;
+  fullName?: string;
+  phone?: string;
+  designation?: string;
+  specialization?: string;
+  bio?: string;
+  transitBufferMinutes?: number;
+  profileImageData?: string;
+}): Promise<UserProfile> {
+  await ensureBaselineData();
+  const existingUser = await findUserWithMetaById(params.userId);
+  if (!existingUser) {
+    throw new Error('User profile not found.');
+  }
+
+  // Enforce strict biometric photo lock once face registration is completed
+  if (
+    params.profileImageData !== undefined &&
+    params.profileImageData.trim() !== '' &&
+    params.profileImageData.trim() !== (existingUser.profileImageData || '') &&
+    existingUser.faceRegisteredLocked
+  ) {
+    const err = new Error(
+      'Your profile photo is permanently locked after face registration for attendance integrity.'
+    );
+    (err as Error & { statusCode?: number }).statusCode = 403;
+    throw err;
+  }
+
+  const nextFullName =
+    params.fullName !== undefined && params.fullName.trim().length >= 2
+      ? params.fullName.trim().slice(0, 120)
+      : existingUser.fullName;
+  const nextPhone =
+    params.phone !== undefined ? params.phone.trim().slice(0, 40) : existingUser.phone;
+  const nextBuffer =
+    params.transitBufferMinutes !== undefined
+      ? Math.max(0, Math.min(60, Math.round(params.transitBufferMinutes)))
+      : existingUser.transitBufferMinutes ?? 15;
+
+  await db
+    .update(users)
+    .set({
+      fullName: nextFullName,
+      phone: nextPhone,
+      transitBufferMinutes: nextBuffer,
+    })
+    .where(eq(users.id, params.userId));
+
+  // Sync updated name & phone to matching directory tables cleanly
+  if (existingUser.staffOrRollId) {
+    const cleanId = existingUser.staffOrRollId.trim().toUpperCase();
+    if (existingUser.role === 'student' || existingUser.role === 'class_rep') {
+      await db
+        .update(departmentStudents)
+        .set({ fullName: nextFullName, phone: nextPhone })
+        .where(eq(departmentStudents.rollNo, cleanId));
+    } else if (existingUser.role === 'other_dept_staff') {
+      await db
+        .update(otherDepartmentStaff)
+        .set({ fullName: nextFullName, phone: nextPhone })
+        .where(eq(otherDepartmentStaff.employeeId, cleanId));
+    } else {
+      await db
+        .update(departmentStaff)
+        .set({ fullName: nextFullName, phone: nextPhone })
+        .where(eq(departmentStaff.employeeId, cleanId));
+    }
+  }
+
+  const metaExisting = await db
+    .select()
+    .from(userProfileMeta)
+    .where(eq(userProfileMeta.userId, params.userId))
+    .limit(1);
+
+  const curMeta = metaExisting[0];
+  const nextImage =
+    !existingUser.faceRegisteredLocked && params.profileImageData !== undefined
+      ? params.profileImageData.trim()
+      : curMeta?.profileImageData || existingUser.profileImageData || '';
+
+  await db
+    .insert(userProfileMeta)
+    .values({
+      userId: params.userId,
+      profileImageData: nextImage,
+      faceRegisteredLocked: curMeta?.faceRegisteredLocked ?? existingUser.faceRegisteredLocked ?? false,
+      faceRegisteredAt: curMeta?.faceRegisteredAt ?? existingUser.faceRegisteredAt ?? '',
+      designation:
+        params.designation !== undefined
+          ? params.designation.trim().slice(0, 100)
+          : curMeta?.designation ?? '',
+      specialization:
+        params.specialization !== undefined
+          ? params.specialization.trim().slice(0, 140)
+          : curMeta?.specialization ?? '',
+      bio: params.bio !== undefined ? params.bio.trim().slice(0, 400) : curMeta?.bio ?? '',
+      updatedAt: new Date(),
+    })
+    .onConflictDoUpdate({
+      target: userProfileMeta.userId,
+      set: {
+        profileImageData: nextImage,
+        designation:
+          params.designation !== undefined
+            ? params.designation.trim().slice(0, 100)
+            : curMeta?.designation ?? '',
+        specialization:
+          params.specialization !== undefined
+            ? params.specialization.trim().slice(0, 140)
+            : curMeta?.specialization ?? '',
+        bio: params.bio !== undefined ? params.bio.trim().slice(0, 400) : curMeta?.bio ?? '',
+        updatedAt: new Date(),
+      },
+    });
+
+  const refreshed = await findUserWithMetaById(params.userId);
+  if (!refreshed) throw new Error('Unable to reload updated profile.');
+  return refreshed;
+}
+
+export async function registerAndLockUserFace(params: {
+  userId?: number;
+  personIdentifier?: string;
+  email?: string;
+  faceImageData: string;
+}): Promise<UserProfile | null> {
+  await ensureBaselineData();
+  const photo = params.faceImageData.trim();
+  if (!photo) return null;
+
+  let targetUserId = params.userId;
+  if (!targetUserId && params.personIdentifier) {
+    const cleanId = params.personIdentifier.trim().toUpperCase();
+    const matched = await db
+      .select()
+      .from(users)
+      .where(eq(users.staffOrRollId, cleanId))
+      .limit(1);
+    if (matched[0]) targetUserId = matched[0].id;
+  }
+  if (!targetUserId && params.email) {
+    const matched = await findUserByEmail(params.email);
+    if (matched) targetUserId = matched.id;
+  }
+  if (!targetUserId) return null;
+
+  const metaRows = await db
+    .select()
+    .from(userProfileMeta)
+    .where(eq(userProfileMeta.userId, targetUserId))
+    .limit(1);
+
+  if (metaRows[0]?.faceRegisteredLocked) {
+    // Already permanently locked; preserve original registered face image
+    return findUserWithMetaById(targetUserId);
+  }
+
+  const lockedAt = formatTs(new Date());
+  await db
+    .insert(userProfileMeta)
+    .values({
+      userId: targetUserId,
+      profileImageData: photo,
+      faceRegisteredLocked: true,
+      faceRegisteredAt: lockedAt,
+      updatedAt: new Date(),
+    })
+    .onConflictDoUpdate({
+      target: userProfileMeta.userId,
+      set: {
+        profileImageData: photo,
+        faceRegisteredLocked: true,
+        faceRegisteredAt: lockedAt,
+        updatedAt: new Date(),
+      },
+    });
+
+  // Also refresh student biometric baseline if this user has a student biometric record
+  const refreshed = await findUserWithMetaById(targetUserId);
+  if (refreshed) {
+    const cleanRoll = (refreshed.staffOrRollId || '').trim().toUpperCase();
+    const cleanEmail = (refreshed.email || '').trim().toLowerCase();
+    if (cleanRoll) {
+      await db
+        .update(studentBiometricProfiles)
+        .set({ faceImageData: photo, updatedAt: new Date() })
+        .where(eq(studentBiometricProfiles.rollNo, cleanRoll));
+    }
+    if (cleanEmail) {
+      await db
+        .update(studentBiometricProfiles)
+        .set({ faceImageData: photo, updatedAt: new Date() })
+        .where(eq(studentBiometricProfiles.email, cleanEmail));
+    }
+  }
+
+  return refreshed;
+}
+
+export async function listHodDirectoryRecords(): Promise<HodDirectoryRecord[]> {
+  await ensureBaselineData();
+  const [hodRows, activeDelegations] = await Promise.all([
+    db
+      .select()
+      .from(users)
+      .where(and(eq(users.role, 'hod'), eq(users.status, 'approved')))
+      .orderBy(asc(users.id)),
+    db
+      .select()
+      .from(hodDelegations)
+      .where(eq(hodDelegations.status, 'active'))
+      .orderBy(desc(hodDelegations.id))
+      .limit(5),
+  ]);
+
+  const activeDel = activeDelegations[0];
+  const idsToFetch = new Set(hodRows.map((h) => h.id));
+  if (activeDel) {
+    idsToFetch.add(activeDel.originalHodUserId);
+  }
+
+  const allTargetRows =
+    idsToFetch.size > 0
+      ? await db.select().from(users).where(inArray(users.id, Array.from(idsToFetch)))
+      : [];
+  const enriched = await enrichUsersWithMeta(allTargetRows);
+
+  return enriched.map((u) => ({
+    id: u.id,
+    fullName: u.fullName,
+    email: u.email,
+    role: u.role,
+    department: u.department,
+    staffOrRollId: u.staffOrRollId || 'HOD-001',
+    phone: u.phone,
+    designation:
+      u.designation ||
+      (activeDel && activeDel.delegateUserId === u.id
+        ? 'Acting Head of Department (HOD)'
+        : 'Head of Department (HOD)'),
+    specialization: u.specialization || 'Academic Governance & Research',
+    bio: u.bio || '',
+    photoData: u.profileImageData || '',
+    faceRegisteredLocked: Boolean(u.faceRegisteredLocked),
+    isActingHod: Boolean(activeDel && activeDel.delegateUserId === u.id),
+    delegationReason:
+      activeDel && activeDel.delegateUserId === u.id ? activeDel.reason : undefined,
+  }));
+}
+
+// ============================================================
+// HOD Role / Full App Control Delegation While on Leave
+// ============================================================
+export async function getActiveHodDelegation(): Promise<HodDelegationInfo | null> {
+  await ensureBaselineData();
+  const rows = await db
+    .select()
+    .from(hodDelegations)
+    .where(eq(hodDelegations.status, 'active'))
+    .orderBy(desc(hodDelegations.id))
+    .limit(1);
+  return rows[0] ? mapDelegationRow(rows[0]) : null;
+}
+
+export async function listApprovedStaffForDelegation(excludeUserId?: number): Promise<UserProfile[]> {
+  await ensureBaselineData();
+  const rows = await db
+    .select()
+    .from(users)
+    .where(
+      and(
+        eq(users.status, 'approved'),
+        or(
+          eq(users.role, 'class_advisor'),
+          eq(users.role, 'dept_staff'),
+          eq(users.role, 'other_dept_staff')
+        )
+      )
+    )
+    .orderBy(asc(users.fullName));
+  const filtered = excludeUserId ? rows.filter((r) => r.id !== excludeUserId) : rows;
+  return enrichUsersWithMeta(filtered);
+}
+
+export async function delegateHodRoleInDb(params: {
+  hodUser: UserProfile;
+  delegateUserId: number;
+  reason: string;
+}): Promise<{ delegation: HodDelegationInfo; updatedActor: UserProfile }> {
+  await ensureBaselineData();
+  if (params.hodUser.role !== 'hod') {
+    throw new Error('Only the active HOD can delegate HOD control.');
+  }
+  if (params.delegateUserId === params.hodUser.id) {
+    throw new Error('Select a different faculty member to receive HOD control.');
+  }
+
+  const existingActive = await getActiveHodDelegation();
+  if (existingActive) {
+    throw new Error(
+      `HOD control is already delegated to ${existingActive.delegateName}. Restore it first before re-assigning.`
+    );
+  }
+
+  const targetRow = await findUserById(params.delegateUserId);
+  if (!targetRow || targetRow.status !== 'approved') {
+    throw new Error('Selected faculty account not found or not approved.');
+  }
+  const staffRoles: UserRole[] = ['class_advisor', 'dept_staff', 'other_dept_staff'];
+  if (!staffRoles.includes(targetRow.role as UserRole)) {
+    throw new Error('HOD control can only be delegated to approved faculty / Class Advisor accounts.');
+  }
+
+  const createdDel = await db.transaction(async (tx) => {
+    const [del] = await tx
+      .insert(hodDelegations)
+      .values({
+        originalHodUserId: params.hodUser.id,
+        originalHodName: params.hodUser.fullName,
+        originalHodEmail: params.hodUser.email,
+        delegateUserId: targetRow.id,
+        delegateName: targetRow.fullName,
+        delegateEmail: targetRow.email,
+        delegatePreviousRole: targetRow.role,
+        reason: params.reason.trim().slice(0, 300) || 'HOD on Leave — Acting HOD Delegation',
+        status: 'active',
+      })
+      .returning();
+
+    // Promote selected faculty to full 'hod' control and move leaving HOD to 'dept_staff'
+    await tx.update(users).set({ role: 'hod' }).where(eq(users.id, targetRow.id));
+    await tx.update(users).set({ role: 'dept_staff' }).where(eq(users.id, params.hodUser.id));
+
+    return del;
+  });
+
+  const updatedActor = await findUserWithMetaById(params.hodUser.id);
+  return {
+    delegation: mapDelegationRow(createdDel),
+    updatedActor: updatedActor!,
+  };
+}
+
+export async function restoreHodRoleInDb(
+  actorUser: UserProfile
+): Promise<{ delegation: HodDelegationInfo; updatedActor: UserProfile }> {
+  await ensureBaselineData();
+  const active = await getActiveHodDelegation();
+  if (!active) {
+    throw new Error('There is no active HOD leave delegation to restore.');
+  }
+  if (
+    actorUser.id !== active.originalHodUserId &&
+    actorUser.id !== active.delegateUserId &&
+    actorUser.role !== 'hod'
+  ) {
+    throw new Error('Only the original HOD or acting HOD can restore HOD control.');
+  }
+
+  const updatedDel = await db.transaction(async (tx) => {
+    await tx
+      .update(users)
+      .set({ role: 'hod' })
+      .where(eq(users.id, active.originalHodUserId));
+
+    await tx
+      .update(users)
+      .set({ role: active.delegatePreviousRole })
+      .where(eq(users.id, active.delegateUserId));
+
+    const [closed] = await tx
+      .update(hodDelegations)
+      .set({ status: 'restored', restoredAt: new Date() })
+      .where(eq(hodDelegations.id, active.id))
+      .returning();
+
+    return closed;
+  });
+
+  const updatedActor = await findUserWithMetaById(actorUser.id);
+  return {
+    delegation: mapDelegationRow(updatedDel),
+    updatedActor: updatedActor!,
+  };
+}
+
+// ============================================================
+// Faculty Alteration / Substitution Workflow (Busy / OD / Absent -> HOD)
+// ============================================================
+export async function listSubstituteCandidates(): Promise<
+  {
+    userId: number | null;
+    fullName: string;
+    email: string;
+    phone: string;
+    designation: string;
+    role: string;
+  }[]
+> {
+  await ensureBaselineData();
+  const [userRows, staffRows, otherRows] = await Promise.all([
+    db
+      .select()
+      .from(users)
+      .where(
+        and(
+          eq(users.status, 'approved'),
+          or(
+            eq(users.role, 'class_advisor'),
+            eq(users.role, 'dept_staff'),
+            eq(users.role, 'other_dept_staff'),
+            eq(users.role, 'hod')
+          )
+        )
+      ),
+    db.select().from(departmentStaff),
+    db.select().from(otherDepartmentStaff),
+  ]);
+
+  const byNormName = new Map<
+    string,
+    {
+      userId: number | null;
+      fullName: string;
+      email: string;
+      phone: string;
+      designation: string;
+      role: string;
+    }
+  >();
+
+  for (const s of staffRows) {
+    byNormName.set(normalizeFacultyMatchKey(s.fullName), {
+      userId: null,
+      fullName: s.fullName,
+      email: s.email,
+      phone: s.phone,
+      designation: s.designation,
+      role: s.isClassAdvisor ? 'class_advisor' : 'dept_staff',
+    });
+  }
+  for (const o of otherRows) {
+    const k = normalizeFacultyMatchKey(o.fullName);
+    if (!byNormName.has(k)) {
+      byNormName.set(k, {
+        userId: null,
+        fullName: o.fullName,
+        email: o.email,
+        phone: o.phone,
+        designation: o.designation,
+        role: 'other_dept_staff',
+      });
+    }
+  }
+  for (const u of userRows) {
+    const k = normalizeFacultyMatchKey(u.fullName);
+    const prev = byNormName.get(k);
+    byNormName.set(k, {
+      userId: u.id,
+      fullName: u.fullName,
+      email: u.email || prev?.email || '',
+      phone: u.phone || prev?.phone || '',
+      designation: prev?.designation || 'Faculty Member',
+      role: u.role,
+    });
+  }
+
+  return Array.from(byNormName.values()).sort((a, b) => a.fullName.localeCompare(b.fullName));
+}
+
+export async function createFacultyAlterationRequest(params: {
+  timetableSlotId: number | null;
+  alterationDate: string;
+  substituteFacultyName: string;
+  substituteUserId?: number | null;
+  substituteEmail?: string;
+  substitutePhone?: string;
+  reasonCategory: 'busy' | 'od' | 'absent';
+  reasonNote: string;
+  user: UserProfile;
+  departmentFallback: string;
+  dayFallback: string;
+  periodFallback: number;
+  subjectCodeFallback: string;
+  subjectNameFallback: string;
+  yearFallback: string;
+  sectionFallback: string;
+  roomFallback: string;
+}): Promise<FacultyAlterationItem> {
+  await ensureBaselineData();
+
+  let slot: typeof timetableSlots.$inferSelect | null = null;
+  if (params.timetableSlotId) {
+    const found = await db
+      .select()
+      .from(timetableSlots)
+      .where(eq(timetableSlots.id, params.timetableSlotId))
+      .limit(1);
+    slot = found[0] ?? null;
+  }
+
+  const candidates = await listSubstituteCandidates();
+  const subMatch =
+    candidates.find((c) => params.substituteUserId && c.userId === params.substituteUserId) ??
+    candidates.find(
+      (c) =>
+        normalizeFacultyMatchKey(c.fullName) ===
+        normalizeFacultyMatchKey(params.substituteFacultyName)
+    );
+
+  const [created] = await db
+    .insert(facultyAlterations)
+    .values({
+      department: slot?.department || params.departmentFallback,
+      yearOfStudy: slot?.yearOfStudy || params.yearFallback || 'III Year',
+      section: (slot?.section || params.sectionFallback || 'A').toUpperCase(),
+      dayOfWeek: slot?.dayOfWeek || params.dayFallback,
+      periodNumber: slot?.periodNumber || params.periodFallback || 1,
+      alterationDate: params.alterationDate,
+      timetableSlotId: slot?.id ?? null,
+      subjectCode: (slot?.subjectCode || params.subjectCodeFallback || 'CLASS').toUpperCase(),
+      subjectName: slot?.subjectName || params.subjectNameFallback || 'Scheduled Class',
+      roomNo: slot?.roomNo || params.roomFallback || '',
+      requestingUserId: params.user.id,
+      requestingFacultyName: slot?.facultyName || params.user.fullName,
+      substituteUserId: subMatch?.userId ?? params.substituteUserId ?? null,
+      substituteFacultyName: subMatch?.fullName || params.substituteFacultyName.trim(),
+      substituteEmail: subMatch?.email || params.substituteEmail || '',
+      substitutePhone: subMatch?.phone || params.substitutePhone || '',
+      reasonCategory: params.reasonCategory,
+      reasonNote: params.reasonNote.trim().slice(0, 300),
+      status: 'pending_hod',
+    })
+    .returning();
+
+  return mapFacultyAlterationRow(created);
+}
+
+export async function listFacultyAlterationsForUser(
+  user: UserProfile
+): Promise<FacultyAlterationItem[]> {
+  await ensureBaselineData();
+  const rows = await db
+    .select()
+    .from(facultyAlterations)
+    .orderBy(desc(facultyAlterations.id))
+    .limit(120);
+  const mapped = rows.map(mapFacultyAlterationRow);
+  if (user.role === 'hod' || user.role === 'class_advisor') {
+    return mapped;
+  }
+  const userNorm = normalizeFacultyMatchKey(user.fullName);
+  return mapped.filter((a) => {
+    if (a.requestingUserId === user.id || a.substituteUserId === user.id) return true;
+    const reqNorm = normalizeFacultyMatchKey(a.requestingFacultyName);
+    const subNorm = normalizeFacultyMatchKey(a.substituteFacultyName);
+    if (userNorm && (reqNorm === userNorm || subNorm === userNorm)) return true;
+    if ((user.role === 'student' || user.role === 'class_rep') && a.status === 'approved') {
+      return !user.yearOfStudy || !a.yearOfStudy || a.yearOfStudy === user.yearOfStudy;
+    }
+    return false;
+  });
+}
+
+export async function decideFacultyAlteration(params: {
+  id: number;
+  reviewer: UserProfile;
+  decision: 'approve' | 'reject';
+  remarks: string;
+}): Promise<FacultyAlterationItem | null> {
+  await ensureBaselineData();
+  const status = params.decision === 'approve' ? 'approved' : 'rejected';
+  const [updated] = await db
+    .update(facultyAlterations)
+    .set({
+      status,
+      hodReviewedBy: params.reviewer.fullName,
+      hodRemarks: params.remarks.trim().slice(0, 300),
+      hodReviewedAt: new Date(),
+    })
+    .where(eq(facultyAlterations.id, params.id))
+    .returning();
+  return updated ? mapFacultyAlterationRow(updated) : null;
+}
+
+// ============================================================
+// HOD Biometric Photo Unlock Governance (Students, Faculty & HOD)
+// ============================================================
+const BIOMETRIC_UNLOCK_REQUESTS_KEY = 'biometric_unlock_requests_json';
+
+export async function listBiometricUnlockRequests(): Promise<
+  import('../types.ts').BiometricUnlockRequestItem[]
+> {
+  await ensureBaselineData();
+  const raw = await getSetting(BIOMETRIC_UNLOCK_REQUESTS_KEY, '[]');
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+async function saveBiometricUnlockRequests(
+  items: import('../types.ts').BiometricUnlockRequestItem[]
+): Promise<void> {
+  await setSetting(BIOMETRIC_UNLOCK_REQUESTS_KEY, JSON.stringify(items.slice(0, 200)));
+}
+
+export async function listUsersBiometricLockStatus(): Promise<
+  import('../types.ts').BiometricLockUserSummary[]
+> {
+  await ensureBaselineData();
+  const rows = await db
+    .select()
+    .from(users)
+    .where(eq(users.status, 'approved'))
+    .orderBy(asc(users.role), asc(users.fullName));
+  const enriched = await enrichUsersWithMeta(rows);
+  return enriched.map((u) => ({
+    id: u.id,
+    fullName: u.fullName,
+    email: u.email,
+    role: u.role,
+    staffOrRollId: u.staffOrRollId || '',
+    department: u.department,
+    profileImageData: u.profileImageData || '',
+    faceRegisteredLocked: Boolean(u.faceRegisteredLocked),
+    faceRegisteredAt: u.faceRegisteredAt ?? null,
+  }));
+}
+
+export async function createBiometricUnlockRequest(params: {
+  user: UserProfile;
+  reason: string;
+}): Promise<import('../types.ts').BiometricUnlockRequestItem> {
+  const current = await listBiometricUnlockRequests();
+  const existingPending = current.find(
+    (r) => r.userId === params.user.id && r.status === 'pending'
+  );
+  if (existingPending) {
+    existingPending.reason = params.reason.trim().slice(0, 240) || existingPending.reason;
+    existingPending.requestedAt = formatTs(new Date());
+    await saveBiometricUnlockRequests(current);
+    return existingPending;
+  }
+
+  const item: import('../types.ts').BiometricUnlockRequestItem = {
+    id: `bu_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
+    userId: params.user.id,
+    fullName: params.user.fullName,
+    email: params.user.email,
+    role: params.user.role,
+    staffOrRollId: params.user.staffOrRollId || '',
+    department: params.user.department,
+    reason: params.reason.trim().slice(0, 240) || 'Requesting permission to retake biometric photo',
+    status: 'pending',
+    requestedAt: formatTs(new Date()),
+  };
+  await saveBiometricUnlockRequests([item, ...current]);
+  return item;
+}
+
+export async function setUserBiometricLockInDb(params: {
+  targetUserId: number;
+  locked: boolean;
+  hodName: string;
+  remarks?: string;
+}): Promise<UserProfile> {
+  await ensureBaselineData();
+  const target = await findUserWithMetaById(params.targetUserId);
+  if (!target) {
+    const err = new Error('Target user account not found.');
+    (err as Error & { statusCode?: number }).statusCode = 404;
+    throw err;
+  }
+
+  const existingMeta = await db
+    .select()
+    .from(userProfileMeta)
+    .where(eq(userProfileMeta.userId, params.targetUserId))
+    .limit(1);
+  const cur = existingMeta[0];
+
+  const lockedAt = params.locked
+    ? cur?.faceRegisteredAt || target.faceRegisteredAt || formatTs(new Date())
+    : '';
+
+  await db
+    .insert(userProfileMeta)
+    .values({
+      userId: params.targetUserId,
+      profileImageData: cur?.profileImageData || target.profileImageData || '',
+      faceRegisteredLocked: params.locked,
+      faceRegisteredAt: lockedAt,
+      designation: cur?.designation ?? target.designation ?? '',
+      specialization: cur?.specialization ?? target.specialization ?? '',
+      bio: cur?.bio ?? target.bio ?? '',
+      updatedAt: new Date(),
+    })
+    .onConflictDoUpdate({
+      target: userProfileMeta.userId,
+      set: {
+        profileImageData: cur?.profileImageData || target.profileImageData || '',
+        faceRegisteredLocked: params.locked,
+        faceRegisteredAt: lockedAt,
+        updatedAt: new Date(),
+      },
+    });
+
+  // When HOD unlocks a user, automatically approve any pending unlock requests for that user
+  if (!params.locked) {
+    const reqs = await listBiometricUnlockRequests();
+    let changed = false;
+    const nowTs = formatTs(new Date());
+    const updatedReqs = reqs.map((r) => {
+      if (r.userId === params.targetUserId && r.status === 'pending') {
+        changed = true;
+        return {
+          ...r,
+          status: 'approved' as const,
+          hodReviewedBy: params.hodName,
+          hodRemarks: (params.remarks || 'Unlocked by HOD for biometric photo retake').slice(0, 240),
+          hodReviewedAt: nowTs,
+        };
+      }
+      return r;
+    });
+    if (changed) {
+      await saveBiometricUnlockRequests(updatedReqs);
+    }
+  }
+
+  const refreshed = await findUserWithMetaById(params.targetUserId);
+  if (!refreshed) throw new Error('Unable to reload user after biometric lock change.');
+  return refreshed;
+}
+
+export async function decideBiometricUnlockRequestInDb(params: {
+  requestId: string;
+  decision: 'approve' | 'reject';
+  hodName: string;
+  remarks?: string;
+}): Promise<{
+  request: import('../types.ts').BiometricUnlockRequestItem;
+  user: UserProfile | null;
+}> {
+  const reqs = await listBiometricUnlockRequests();
+  const targetReq = reqs.find((r) => r.id === params.requestId);
+  if (!targetReq) {
+    const err = new Error('Biometric unlock request not found.');
+    (err as Error & { statusCode?: number }).statusCode = 404;
+    throw err;
+  }
+
+  const nowTs = formatTs(new Date());
+  const nextStatus = params.decision === 'approve' ? 'approved' : 'rejected';
+  let updatedUser: UserProfile | null = null;
+
+  if (params.decision === 'approve') {
+    updatedUser = await setUserBiometricLockInDb({
+      targetUserId: targetReq.userId,
+      locked: false,
+      hodName: params.hodName,
+      remarks: params.remarks,
+    });
+  }
+
+  const latestReqs = await listBiometricUnlockRequests();
+  const updatedReqs = latestReqs.map((r) =>
+    r.id === params.requestId
+      ? {
+          ...r,
+          status: nextStatus as 'approved' | 'rejected',
+          hodReviewedBy: params.hodName,
+          hodRemarks: (params.remarks || '').trim().slice(0, 240),
+          hodReviewedAt: nowTs,
+        }
+      : r
+  );
+  await saveBiometricUnlockRequests(updatedReqs);
+
+  const finalReq = updatedReqs.find((r) => r.id === params.requestId)!;
+  return { request: finalReq, user: updatedUser };
+}
+
+
 

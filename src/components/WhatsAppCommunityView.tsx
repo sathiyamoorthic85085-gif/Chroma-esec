@@ -52,8 +52,10 @@ import {
   type UserProfile,
   type UserRole,
 } from '../types';
+import { ClassroomMapPicker } from './ClassroomMapPicker';
 import { CommunityCallRoom, type CallSignalFrame } from './CommunityCallRoom';
 import { PowerBoostEngagementSummary } from './PowerBoostEngagementSummary';
+import { RecordProfileModal, type RecordShowcasePerson } from './RecordProfileModal';
 
 interface WhatsAppCommunityViewProps {
   token: string;
@@ -402,24 +404,120 @@ export function WhatsAppCommunityView({
     fileKey: string;
   } | null>(null);
 
+  // Read-only Sender Profile & Wake-Up Page-Call Modal
+  const [profileModalTarget, setProfileModalTarget] = useState<RecordShowcasePerson | null>(null);
+
+  const openSenderProfile = useCallback(
+    (msg: ChatMessageItem) => {
+      const normalizedName = msg.senderName.trim().toLowerCase();
+      const matchedStudent = students.find(
+        (s) =>
+          (msg.senderStaffOrRollId &&
+            s.rollNo.toLowerCase() === msg.senderStaffOrRollId.toLowerCase()) ||
+          s.fullName.toLowerCase() === normalizedName
+      );
+      const matchedDeptStaff = deptStaff.find(
+        (f) =>
+          (msg.senderStaffOrRollId &&
+            f.employeeId.toLowerCase() === msg.senderStaffOrRollId.toLowerCase()) ||
+          f.fullName.toLowerCase() === normalizedName
+      );
+      const matchedOtherStaff = otherStaff.find(
+        (f) =>
+          (msg.senderStaffOrRollId &&
+            f.employeeId.toLowerCase() === msg.senderStaffOrRollId.toLowerCase()) ||
+          f.fullName.toLowerCase() === normalizedName
+      );
+
+      setProfileModalTarget({
+        userId: msg.senderUserId ?? null,
+        fullName: msg.senderName,
+        roleLabel: ROLE_LABELS[msg.senderRole as UserRole] ?? msg.senderRole,
+        roleKey: msg.senderRole,
+        identifier:
+          msg.senderStaffOrRollId ||
+          matchedStudent?.rollNo ||
+          matchedDeptStaff?.employeeId ||
+          matchedOtherStaff?.employeeId ||
+          '',
+        email:
+          msg.senderEmail ||
+          matchedStudent?.email ||
+          matchedDeptStaff?.email ||
+          matchedOtherStaff?.email ||
+          '',
+        phone:
+          msg.senderPhone ||
+          matchedStudent?.phone ||
+          matchedDeptStaff?.phone ||
+          matchedOtherStaff?.phone ||
+          '',
+        department:
+          msg.senderDepartment ||
+          matchedStudent?.department ||
+          matchedDeptStaff?.department ||
+          matchedOtherStaff?.homeDepartment ||
+          user.department,
+        yearSectionOrSpec:
+          msg.senderYearSection ||
+          (matchedStudent
+            ? `${matchedStudent.yearOfStudy} · Sec ${matchedStudent.section}`
+            : matchedDeptStaff?.specialization || matchedOtherStaff?.handlingSubject || ''),
+        designationOrSubLabel:
+          matchedDeptStaff?.designation || matchedOtherStaff?.designation || undefined,
+        photoData:
+          msg.senderPhotoData ||
+          matchedStudent?.photoData ||
+          matchedDeptStaff?.photoData ||
+          matchedOtherStaff?.photoData ||
+          '',
+        faceRegisteredLocked: Boolean(
+          matchedStudent?.faceRegisteredLocked ||
+            matchedDeptStaff?.faceRegisteredLocked ||
+            matchedOtherStaff?.faceRegisteredLocked
+        ),
+      });
+    },
+    [students, deptStaff, otherStaff, user.department]
+  );
+
+  const canPostInGroup = useCallback(
+    (comm: CommunityItem | undefined, grp: CommunityGroupItem | undefined) => {
+      if (!comm || !grp) return false;
+      if (!grp.onlyAdminsCanPost) return true;
+      return comm.canManage || user.role === 'class_advisor';
+    },
+    [user.role]
+  );
+
+  const pickPreferredGroup = useCallback(
+    (comm: CommunityItem | undefined): CommunityGroupItem | undefined => {
+      if (!comm || comm.groups.length === 0) return undefined;
+      return comm.groups.find((g) => canPostInGroup(comm, g)) ?? comm.groups[0];
+    },
+    [canPostInGroup]
+  );
+
   const loadCommunities = useCallback(async () => {
     try {
       const res = await api.getCommunities(token);
       setCommunities(res.communities);
       setCanCreateCommunity(res.canCreateCommunity);
       const allGroups = res.communities.flatMap((c) => c.groups);
+      const defaultComm = res.communities[0];
+      const preferredGroup = pickPreferredGroup(defaultComm);
 
       setSelectedCommunityId((prevComm) => {
         if (prevComm && res.communities.some((c) => c.id === prevComm)) return prevComm;
-        return res.communities[0]?.id ?? null;
+        return defaultComm?.id ?? null;
       });
       setSelectedGroupId((prevGroup) => {
         if (prevGroup && allGroups.some((g) => g.id === prevGroup)) return prevGroup;
-        return res.communities[0]?.groups[0]?.id ?? null;
+        return preferredGroup?.id ?? null;
       });
       setShareTargetGroupId((prev) => {
         if (prev && allGroups.some((g) => g.id === prev)) return prev;
-        return res.communities[0]?.groups[0]?.id ?? null;
+        return preferredGroup?.id ?? null;
       });
       setErrorMsg(null);
     } catch (err) {
@@ -427,7 +525,7 @@ export function WhatsAppCommunityView({
     } finally {
       setLoading(false);
     }
-  }, [token]);
+  }, [token, pickPreferredGroup]);
 
   const loadMessages = useCallback(
     async (groupId: number) => {
@@ -1465,7 +1563,8 @@ export function WhatsAppCommunityView({
                   type="button"
                   onClick={() => {
                     setSelectedCommunityId(comm.id);
-                    if (comm.groups[0]) setSelectedGroupId(comm.groups[0].id);
+                    const targetGrp = pickPreferredGroup(comm);
+                    if (targetGrp) setSelectedGroupId(targetGrp.id);
                   }}
                   className="text-left min-w-0 flex-1"
                 >
@@ -1739,15 +1838,36 @@ export function WhatsAppCommunityView({
                     >
                       {/* Sender Header & Message Actions */}
                       <div className="flex items-center justify-between gap-4">
-                        <span className="text-[11px] font-semibold text-slate-800 flex items-center gap-1.5 flex-wrap">
+                        <button
+                          type="button"
+                          onClick={() => openSenderProfile(msg)}
+                          title={`View ${msg.senderName}'s profile or send Wake-Up Page-Call`}
+                          className="text-[11px] font-semibold text-slate-800 hover:text-indigo-700 flex items-center gap-1.5 flex-wrap text-left transition-colors"
+                        >
+                          {msg.senderPhotoData ? (
+                            <img
+                              src={msg.senderPhotoData}
+                              alt={msg.senderName}
+                              className="w-5 h-5 rounded-full object-cover border border-slate-200 shrink-0"
+                            />
+                          ) : (
+                            <span className="w-5 h-5 rounded-full bg-indigo-100 text-indigo-800 text-[9px] font-bold flex items-center justify-center shrink-0">
+                              {msg.senderName
+                                .split(' ')
+                                .filter(Boolean)
+                                .slice(0, 2)
+                                .map((p) => p[0]?.toUpperCase() || '')
+                                .join('') || 'U'}
+                            </span>
+                          )}
                           {msg.powerBoostEnabled && (
                             <Zap className="w-3.5 h-3.5 text-amber-600 shrink-0" />
                           )}
-                          <span>{msg.senderName}</span>
+                          <span className="underline-offset-2 hover:underline">{msg.senderName}</span>
                           <span className="font-normal text-slate-500">
                             · {ROLE_LABELS[msg.senderRole as UserRole] ?? msg.senderRole}
                           </span>
-                        </span>
+                        </button>
 
                         <div className="flex items-center gap-1.5 text-slate-400 shrink-0">
                           <button
@@ -2464,8 +2584,28 @@ export function WhatsAppCommunityView({
                   )}
                 </form>
               ) : (
-                <div className="text-xs text-slate-500 text-center py-2">
-                  Only community administrators, HOD, or Class Advisors can post in this announcement channel.
+                <div className="flex flex-wrap items-center justify-center gap-3 text-xs text-slate-600 py-2">
+                  <span>
+                    Only community administrators, HOD, or Class Advisors can post in this announcement channel.
+                  </span>
+                  {(() => {
+                    const writable = activeCommunity.groups.find((g) => canPostInGroup(activeCommunity, g));
+                    if (!writable) return null;
+                    return (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSelectedGroupId(writable.id);
+                          setEditingMsg(null);
+                          setReplyTarget(null);
+                          setPendingAttachment(null);
+                        }}
+                        className="px-3 py-1.5 text-xs font-medium text-white bg-emerald-700 hover:bg-emerald-800 rounded-md whitespace-nowrap"
+                      >
+                        Switch to {writable.name}
+                      </button>
+                    );
+                  })()}
                 </div>
               )}
             </div>
@@ -2690,7 +2830,7 @@ export function WhatsAppCommunityView({
       {/* Live Location Modal */}
       {locationModalOpen && (
         <div className="fixed inset-0 z-50 bg-slate-900/45 flex items-center justify-center p-4">
-          <div className="bg-white border border-slate-200 rounded-lg w-full max-w-md p-5 space-y-4">
+          <div className="bg-white border border-slate-200 rounded-xl w-full max-w-lg max-h-[90vh] overflow-y-auto p-5 space-y-4">
             <div className="flex items-center justify-between border-b border-slate-200 pb-3">
               <h3 className="text-sm font-semibold text-slate-900">Share Live Location</h3>
               <button
@@ -2712,6 +2852,21 @@ export function WhatsAppCommunityView({
                 {locError}
               </div>
             )}
+
+            <ClassroomMapPicker
+              latitude={locLat && Number.isFinite(Number(locLat)) ? Number(locLat) : null}
+              longitude={locLng && Number.isFinite(Number(locLng)) ? Number(locLng) : null}
+              radiusMeters={100}
+              label={locLabel || 'Pinned Chat Location'}
+              height="220px"
+              onSelectLocation={({ lat, lng, label: pickedLabel }) => {
+                setLocLat(lat.toFixed(6));
+                setLocLng(lng.toFixed(6));
+                if (pickedLabel && !locLabel.trim()) {
+                  setLocLabel(pickedLabel);
+                }
+              }}
+            />
 
             <form onSubmit={handleAttachLocation} className="space-y-3 text-xs">
               <div className="grid grid-cols-2 gap-2.5">
@@ -3113,6 +3268,12 @@ export function WhatsAppCommunityView({
           </div>
         </div>
       )}
+      <RecordProfileModal
+        open={Boolean(profileModalTarget)}
+        onClose={() => setProfileModalTarget(null)}
+        token={token}
+        person={profileModalTarget}
+      />
     </div>
       )}
     </div>

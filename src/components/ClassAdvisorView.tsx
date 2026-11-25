@@ -1,7 +1,8 @@
 import { useMemo, useState } from 'react';
-import { PenLine, RotateCcw, Upload } from 'lucide-react';
+import { BellRing, Lock, PenLine, RotateCcw, Upload } from 'lucide-react';
 import type { DepartmentStudent, UploadModule, UserProfile } from '../types';
 import { ManualRecordForm } from './ManualRecordForm';
+import { RecordProfileModal, type RecordShowcasePerson } from './RecordProfileModal';
 import {
   DirectorySearchBar,
   matchesDirectorySearch,
@@ -48,6 +49,7 @@ export function ClassAdvisorView({
   const [departmentFilter, setDepartmentFilter] = useState('ALL');
   const [roleFilter, setRoleFilter] = useState<'all' | 'cr' | 'student'>('all');
   const [manualModule, setManualModule] = useState<'department_students' | 'class_representatives' | null>(null);
+  const [selectedProfile, setSelectedProfile] = useState<RecordShowcasePerson | null>(null);
 
   const hasActiveFilters =
     query.trim().length > 0 ||
@@ -230,11 +232,11 @@ export function ClassAdvisorView({
             <thead>
               <tr className="border-b border-slate-200 bg-slate-50 text-xs font-semibold text-slate-600">
                 <th className="py-3 px-4">Roll No</th>
-                <th className="py-3 px-4">Representative Name</th>
+                <th className="py-3 px-4">Representative Profile</th>
                 <th className="py-3 px-4">Class &amp; Department</th>
                 <th className="py-3 px-4">Assigned CR Responsibility</th>
                 <th className="py-3 px-4">Contact</th>
-                <th className="py-3 px-4 text-right">CGPA</th>
+                <th className="py-3 px-4 text-right">Profile / Call</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-200 text-sm">
@@ -243,8 +245,24 @@ export function ClassAdvisorView({
                   <td className="py-3.5 px-4 font-mono text-xs tabular-nums font-semibold text-indigo-800">
                     {cr.rollNo}
                   </td>
-                  <td className="py-3.5 px-4 font-medium text-slate-900">
-                    {cr.fullName}
+                  <td className="py-3.5 px-4">
+                    <div className="flex items-center gap-2.5">
+                      {cr.photoData ? (
+                        <img
+                          src={cr.photoData}
+                          alt={cr.fullName}
+                          className="w-8 h-8 rounded-lg object-cover border border-indigo-200 shrink-0"
+                        />
+                      ) : (
+                        <div className="w-8 h-8 rounded-lg bg-indigo-100 text-indigo-800 font-bold text-[11px] flex items-center justify-center shrink-0">
+                          {cr.fullName.slice(0, 2).toUpperCase()}
+                        </div>
+                      )}
+                      <span className="font-medium text-slate-900 flex items-center gap-1">
+                        {cr.fullName}
+                        {cr.faceRegisteredLocked && <Lock className="w-3 h-3 text-emerald-600" />}
+                      </span>
+                    </div>
                   </td>
                   <td className="py-3.5 px-4 text-xs text-slate-700">
                     <div className="whitespace-nowrap font-medium text-slate-800">
@@ -261,8 +279,28 @@ export function ClassAdvisorView({
                     <div>{cr.email}</div>
                     {cr.phone && <div className="text-slate-500">{cr.phone}</div>}
                   </td>
-                  <td className="py-3.5 px-4 text-right font-mono text-xs tabular-nums text-slate-800">
-                    {cr.cgpa || '—'}
+                  <td className="py-3.5 px-4 text-right">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setSelectedProfile({
+                          fullName: cr.fullName,
+                          roleLabel: 'Class Representative',
+                          identifier: cr.rollNo,
+                          email: cr.email,
+                          phone: cr.phone,
+                          department: cr.department,
+                          yearSectionOrSpec: `${cr.yearOfStudy} · Sec ${cr.section}`,
+                          designationOrSubLabel: cr.crResponsibility || cr.advisorName,
+                          photoData: cr.photoData,
+                          faceRegisteredLocked: cr.faceRegisteredLocked,
+                        })
+                      }
+                      className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 text-xs font-semibold whitespace-nowrap"
+                    >
+                      <BellRing className="w-3 h-3" />
+                      Profile / Call
+                    </button>
                   </td>
                 </tr>
               ))}
@@ -313,11 +351,11 @@ export function ClassAdvisorView({
             <thead>
               <tr className="border-b border-slate-200 bg-slate-50 text-xs font-semibold text-slate-600">
                 <th className="py-3 px-4">Roll No</th>
-                <th className="py-3 px-4">Student Name</th>
+                <th className="py-3 px-4">Student Profile</th>
                 <th className="py-3 px-4">Department &amp; Role</th>
                 <th className="py-3 px-4">Email &amp; Phone</th>
                 <th className="py-3 px-4">Advisor</th>
-                <th className="py-3 px-4 text-right">CGPA</th>
+                <th className="py-3 px-4 text-right">Profile / Call</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-200 text-sm">
@@ -326,8 +364,24 @@ export function ClassAdvisorView({
                   <td className="py-3 px-4 font-mono text-xs tabular-nums font-medium text-slate-900">
                     {st.rollNo}
                   </td>
-                  <td className="py-3 px-4 font-medium text-slate-900">
-                    {st.fullName}
+                  <td className="py-3 px-4">
+                    <div className="flex items-center gap-2.5">
+                      {st.photoData ? (
+                        <img
+                          src={st.photoData}
+                          alt={st.fullName}
+                          className="w-8 h-8 rounded-lg object-cover border border-slate-200 shrink-0"
+                        />
+                      ) : (
+                        <div className="w-8 h-8 rounded-lg bg-slate-100 text-slate-700 font-bold text-[11px] flex items-center justify-center shrink-0">
+                          {st.fullName.slice(0, 2).toUpperCase()}
+                        </div>
+                      )}
+                      <span className="font-medium text-slate-900 flex items-center gap-1">
+                        {st.fullName}
+                        {st.faceRegisteredLocked && <Lock className="w-3 h-3 text-emerald-600" />}
+                      </span>
+                    </div>
                   </td>
                   <td className="py-3 px-4 text-xs">
                     {st.isClassRep ? (
@@ -346,8 +400,28 @@ export function ClassAdvisorView({
                   <td className="py-3 px-4 text-xs text-slate-700">
                     {st.advisorName || '—'}
                   </td>
-                  <td className="py-3 px-4 text-right font-mono text-xs tabular-nums text-slate-800">
-                    {st.cgpa || '—'}
+                  <td className="py-3 px-4 text-right">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setSelectedProfile({
+                          fullName: st.fullName,
+                          roleLabel: st.isClassRep ? 'Class Representative' : 'Student',
+                          identifier: st.rollNo,
+                          email: st.email,
+                          phone: st.phone,
+                          department: st.department,
+                          yearSectionOrSpec: `${st.yearOfStudy} · Sec ${st.section}`,
+                          designationOrSubLabel: st.crResponsibility || st.advisorName,
+                          photoData: st.photoData,
+                          faceRegisteredLocked: st.faceRegisteredLocked,
+                        })
+                      }
+                      className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 text-xs font-semibold whitespace-nowrap"
+                    >
+                      <BellRing className="w-3 h-3" />
+                      Profile / Call
+                    </button>
                   </td>
                 </tr>
               ))}
@@ -376,6 +450,12 @@ export function ClassAdvisorView({
           </table>
         </div>
       </section>
+      <RecordProfileModal
+        open={Boolean(selectedProfile)}
+        onClose={() => setSelectedProfile(null)}
+        token={token}
+        person={selectedProfile}
+      />
     </div>
   );
 }

@@ -8,6 +8,7 @@ import {
   FileUp,
   GraduationCap,
   LayoutDashboard,
+  Lock,
   LogOut,
   Menu,
   MessageSquare,
@@ -32,13 +33,16 @@ import { OdLeaveView } from './components/OdLeaveView';
 import { OfflineIndicator } from './components/OfflineIndicator';
 import { OverviewView, type NavSection } from './components/OverviewView';
 import { PowerBoostAlertBar } from './components/PowerBoostAlertBar';
+import { ProfileView } from './components/ProfileView';
 import { PWAInstallButton } from './components/PWAInstallButton';
 import { SplashScreen } from './components/SplashScreen';
 import { TimetableView } from './components/TimetableView';
 import { WhatsAppCommunityView } from './components/WhatsAppCommunityView';
 import { WorkspaceNotificationCenter } from './components/WorkspaceNotificationCenter';
+import { signOut as firebaseSignOut } from 'firebase/auth';
 import { useServerTime } from './hooks/useServerTime';
 import { api } from './lib/api';
+import { auth } from './lib/firebase';
 import {
   ROLE_LABELS,
   type DepartmentStaff,
@@ -105,6 +109,7 @@ export default function App() {
       'advisor_class',
       'timetable',
       'uploads',
+      'profile',
     ];
     const tab = rawTab && validTabs.includes(rawTab as NavSection) ? (rawTab as NavSection) : null;
     const sub: 'chat' | 'analytics' = rawSub === 'analytics' ? 'analytics' : 'chat';
@@ -196,27 +201,41 @@ export default function App() {
     }
   }, [token, user, loadWorkspaceData]);
 
-  const handleAuthenticated = (newToken: string, newUser: UserProfile) => {
-    setToken(newToken);
-    setUser(newUser);
-    setTransitBufferInput(newUser.transitBufferMinutes ?? 15);
-    if (incomingShare) {
-      setCommunityInitialSubTab('chat');
-      setActiveSection('communities');
-    } else if (initialLaunchTarget.tab) {
-      setCommunityInitialSubTab(initialLaunchTarget.sub);
-      setActiveSection(initialLaunchTarget.tab);
-    } else if (newUser.role === 'class_advisor') {
-      setActiveSection('advisor_class');
-    } else {
-      setActiveSection('overview');
-    }
-  };
+  const handleAuthenticated = useCallback(
+    (newToken: string, newUser: UserProfile) => {
+      try {
+        sessionStorage.removeItem('chromagrade_signed_out');
+      } catch {
+        // Ignore storage errors
+      }
+      setToken(newToken);
+      setUser(newUser);
+      setTransitBufferInput(newUser.transitBufferMinutes ?? 15);
+      if (incomingShare) {
+        setCommunityInitialSubTab('chat');
+        setActiveSection('communities');
+      } else if (initialLaunchTarget.tab) {
+        setCommunityInitialSubTab(initialLaunchTarget.sub);
+        setActiveSection(initialLaunchTarget.tab);
+      } else if (newUser.role === 'class_advisor') {
+        setActiveSection('advisor_class');
+      } else {
+        setActiveSection('overview');
+      }
+    },
+    [incomingShare, initialLaunchTarget]
+  );
 
   const handleSignOut = async () => {
+    try {
+      sessionStorage.setItem('chromagrade_signed_out', '1');
+    } catch {
+      // Ignore storage errors
+    }
     if (token) {
       await api.logout(token).catch(() => {});
     }
+    await firebaseSignOut(auth).catch(() => {});
     setToken(null);
     setUser(null);
     setActivePowerBoostCount(0);
@@ -362,8 +381,10 @@ export default function App() {
       { id: 'communities', label: 'Communities & Chat', icon: MessageSquare },
       { id: 'attendance', label: 'Camera Attendance', icon: Camera },
       { id: 'od_leave', label: 'OD & Leave Permission', icon: FileCheck2 },
-      { id: 'timetable', label: 'Class Timetable', icon: CalendarClock },
+      { id: 'students', label: 'Department Students', icon: GraduationCap },
       { id: 'advisor_class', label: 'Class Reps & Roster', icon: UserCheck },
+      { id: 'timetable', label: 'Class Timetable', icon: CalendarClock },
+      { id: 'uploads', label: 'Upload & Manual Entry', icon: FileUp },
       { id: 'dept_staff', label: 'Department Faculty', icon: Users },
       { id: 'other_staff', label: 'Other Dept Faculty', icon: Building2 },
     ];
@@ -394,9 +415,14 @@ export default function App() {
     advisor_class: 'Students & Class Representatives',
     timetable: 'Timetable & Server-Time Availability',
     uploads: 'Document Upload & Manual Record Entry',
+    profile: 'My Profile, Face Lock & HOD Delegation',
   };
 
-  const canUpload = user.role === 'hod' || user.role === 'class_advisor';
+  const canUpload =
+    user.role === 'hod' ||
+    user.role === 'class_advisor' ||
+    user.role === 'student' ||
+    user.role === 'class_rep';
   const mobileHomeSection: NavSection =
     user.role === 'class_advisor' ? 'advisor_class' : 'overview';
   const mobileBottomTabs: { id: NavSection; label: string; icon: typeof LayoutDashboard }[] = [
@@ -461,14 +487,50 @@ export default function App() {
         </nav>
 
         <div className="p-4 border-t border-slate-200 space-y-2.5">
-          <div className="min-w-0">
-            <div className="text-xs font-semibold text-slate-900 truncate">
-              {user.fullName}
+          <button
+            type="button"
+            onClick={() => setActiveSection('profile')}
+            className={`w-full flex items-center gap-2.5 p-2 rounded-xl border text-left transition-colors ${
+              activeSection === 'profile'
+                ? 'bg-indigo-50 border-indigo-300'
+                : 'bg-slate-50/70 border-slate-200 hover:bg-slate-100'
+            }`}
+          >
+            {user.profileImageData ? (
+              <img
+                src={user.profileImageData}
+                alt={user.fullName}
+                className="w-10 h-10 rounded-xl object-cover border border-indigo-200 shrink-0"
+              />
+            ) : (
+              <div className="w-10 h-10 rounded-xl bg-indigo-700 text-white text-xs font-bold flex items-center justify-center shrink-0">
+                {user.fullName
+                  .split(' ')
+                  .filter(Boolean)
+                  .slice(0, 2)
+                  .map((p) => p[0]?.toUpperCase() || '')
+                  .join('')}
+              </div>
+            )}
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-1">
+                <span className="text-xs font-semibold text-slate-900 truncate">
+                  {user.fullName}
+                </span>
+                {user.faceRegisteredLocked && (
+                  <span title="Face photo locked" className="inline-flex shrink-0">
+                    <Lock className="w-3 h-3 text-emerald-600" />
+                  </span>
+                )}
+              </div>
+              <div className="text-[11px] text-slate-500 truncate">
+                {ROLE_LABELS[user.role]}
+              </div>
+              <div className="text-[10px] font-medium text-indigo-700">
+                View / Edit Profile
+              </div>
             </div>
-            <div className="text-xs text-slate-500 truncate">
-              {ROLE_LABELS[user.role]}
-            </div>
-          </div>
+          </button>
           <PWAInstallButton variant="sidebar" />
           <button
             type="button"
@@ -504,7 +566,7 @@ export default function App() {
           />
           <aside className="relative z-10 w-72 max-w-[85vw] bg-white flex flex-col border-r border-slate-200">
             <div className="h-16 px-5 flex items-center justify-between border-b border-slate-200">
-              <ChromaGradeMark size="sm" />
+              <ChromaGradeMark size="sm" showSubline />
               <button
                 type="button"
                 onClick={() => setMobileMenuOpen(false)}
@@ -546,14 +608,51 @@ export default function App() {
               })}
             </nav>
             <div className="p-4 border-t border-slate-200 space-y-2.5 pb-safe">
-              <div className="min-w-0 pb-1">
-                <div className="text-xs font-semibold text-slate-900 truncate">
-                  {user.fullName}
+              <button
+                type="button"
+                onClick={() => {
+                  setActiveSection('profile');
+                  setMobileMenuOpen(false);
+                }}
+                className={`w-full flex items-center gap-2.5 p-2 rounded-xl border text-left transition-colors ${
+                  activeSection === 'profile'
+                    ? 'bg-indigo-50 border-indigo-300'
+                    : 'bg-slate-50/70 border-slate-200'
+                }`}
+              >
+                {user.profileImageData ? (
+                  <img
+                    src={user.profileImageData}
+                    alt={user.fullName}
+                    className="w-10 h-10 rounded-xl object-cover border border-indigo-200 shrink-0"
+                  />
+                ) : (
+                  <div className="w-10 h-10 rounded-xl bg-indigo-700 text-white text-xs font-bold flex items-center justify-center shrink-0">
+                    {user.fullName
+                      .split(' ')
+                      .filter(Boolean)
+                      .slice(0, 2)
+                      .map((p) => p[0]?.toUpperCase() || '')
+                      .join('')}
+                  </div>
+                )}
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-1">
+                    <span className="text-xs font-semibold text-slate-900 truncate">
+                      {user.fullName}
+                    </span>
+                    {user.faceRegisteredLocked && (
+                      <Lock className="w-3 h-3 text-emerald-600 shrink-0" />
+                    )}
+                  </div>
+                  <div className="text-[11px] text-slate-500 truncate">
+                    {ROLE_LABELS[user.role]}
+                  </div>
+                  <div className="text-[10px] font-medium text-indigo-700">
+                    Tap for Profile & Name Edit
+                  </div>
                 </div>
-                <div className="text-xs text-slate-500 truncate">
-                  {ROLE_LABELS[user.role]}
-                </div>
-              </div>
+              </button>
               <PWAInstallButton variant="sidebar" />
               <button
                 type="button"
@@ -595,6 +694,15 @@ export default function App() {
               >
                 <Menu className="w-5 h-5" />
               </button>
+              <button
+                type="button"
+                onClick={() => setShowSplash(true)}
+                title="Replay Academia-ESEC intro animation"
+                aria-label="Academia-ESEC logo"
+                className="lg:hidden shrink-0 hover:opacity-90 transition-opacity focus:outline-none"
+              >
+                <ChromaGradeMark size="sm" showWordmark={false} />
+              </button>
               <div className="flex items-center gap-2 text-sm min-w-0">
                 <span className="text-slate-500 hidden sm:inline truncate">
                   {user.department}
@@ -631,6 +739,17 @@ export default function App() {
                 onOpenAttendance={() => setActiveSection('attendance')}
                 onOpenOverview={() => setActiveSection('overview')}
                 onFacultyDelayCountChange={setActiveFacultyDelayCount}
+                onDelegationChanged={() => {
+                  if (token) {
+                    api
+                      .getMyProfile(token)
+                      .then((res) => {
+                        setUser(res.user);
+                        loadWorkspaceData(token, res.user);
+                      })
+                      .catch(() => null);
+                  }
+                }}
               />
 
               <PWAInstallButton compact />
@@ -798,6 +917,17 @@ export default function App() {
                   initialModule={uploadTargetModule}
                   batches={batches}
                   onImportCommitted={() => loadWorkspaceData(token, user)}
+                />
+              )}
+
+              {activeSection === 'profile' && (
+                <ProfileView
+                  user={user}
+                  token={token}
+                  onUserUpdated={(updated) => {
+                    setUser(updated);
+                    loadWorkspaceData(token, updated);
+                  }}
                 />
               )}
             </>

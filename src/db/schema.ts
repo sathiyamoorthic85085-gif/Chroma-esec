@@ -520,3 +520,77 @@ export const attendanceRiskAlerts = pgTable('attendance_risk_alerts', {
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
+// ============================================================
+// User Profile Photos, Face-Registration Lock & Bio Metadata
+// ============================================================
+export const userProfileMeta = pgTable('user_profile_meta', {
+  userId: integer('user_id')
+    .references(() => users.id, { onDelete: 'cascade' })
+    .primaryKey(),
+  profileImageData: text('profile_image_data').notNull().default(''),
+  faceRegisteredLocked: boolean('face_registered_locked').notNull().default(false),
+  faceRegisteredAt: text('face_registered_at').notNull().default(''),
+  designation: text('designation').notNull().default(''),
+  specialization: text('specialization').notNull().default(''),
+  bio: text('bio').notNull().default(''),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});
+
+// ============================================================
+// HOD Role Delegation While on Leave
+// ============================================================
+export const hodDelegations = pgTable('hod_delegations', {
+  id: serial('id').primaryKey(),
+  originalHodUserId: integer('original_hod_user_id')
+    .references(() => users.id, { onDelete: 'cascade' })
+    .notNull(),
+  originalHodName: text('original_hod_name').notNull(),
+  originalHodEmail: text('original_hod_email').notNull(),
+  delegateUserId: integer('delegate_user_id')
+    .references(() => users.id, { onDelete: 'cascade' })
+    .notNull(),
+  delegateName: text('delegate_name').notNull(),
+  delegateEmail: text('delegate_email').notNull(),
+  delegatePreviousRole: text('delegate_previous_role').notNull(),
+  reason: text('reason').notNull().default(''),
+  status: text('status').notNull().default('active'), // 'active' | 'restored'
+  delegatedAt: timestamp('delegated_at').defaultNow().notNull(),
+  restoredAt: timestamp('restored_at'),
+});
+
+// ============================================================
+// Faculty Alteration / Class Substitution Requests (Busy / OD / Absent -> HOD Approval)
+// ============================================================
+export const facultyAlterations = pgTable('faculty_alterations', {
+  id: serial('id').primaryKey(),
+  department: text('department').notNull(),
+  yearOfStudy: text('year_of_study').notNull().default(''),
+  section: text('section').notNull().default(''),
+  dayOfWeek: text('day_of_week').notNull(),
+  periodNumber: integer('period_number').notNull(),
+  alterationDate: text('alteration_date').notNull(), // YYYY-MM-DD
+  timetableSlotId: integer('timetable_slot_id').references(() => timetableSlots.id, {
+    onDelete: 'set null',
+  }),
+  subjectCode: text('subject_code').notNull(),
+  subjectName: text('subject_name').notNull(),
+  roomNo: text('room_no').notNull().default(''),
+  requestingUserId: integer('requesting_user_id').references(() => users.id, {
+    onDelete: 'set null',
+  }),
+  requestingFacultyName: text('requesting_faculty_name').notNull(),
+  substituteUserId: integer('substitute_user_id').references(() => users.id, {
+    onDelete: 'set null',
+  }),
+  substituteFacultyName: text('substitute_faculty_name').notNull(),
+  substituteEmail: text('substitute_email').notNull().default(''),
+  substitutePhone: text('substitute_phone').notNull().default(''),
+  reasonCategory: text('reason_category').notNull().default('busy'), // 'busy' | 'od' | 'absent'
+  reasonNote: text('reason_note').notNull().default(''),
+  status: text('status').notNull().default('pending_hod'), // 'pending_hod' | 'approved' | 'rejected'
+  hodReviewedBy: text('hod_reviewed_by').notNull().default(''),
+  hodRemarks: text('hod_remarks').notNull().default(''),
+  hodReviewedAt: timestamp('hod_reviewed_at'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+

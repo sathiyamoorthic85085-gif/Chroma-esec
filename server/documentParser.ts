@@ -469,16 +469,34 @@ export async function parseUploadedDocument(
   rawRows.forEach((r, idx) => {
     const dayRaw = pickField(r, ['dayofweek', 'day', 'weekday']);
     const periodRaw = pickField(r, ['periodnumber', 'period', 'hour', 'slot']);
+    const timePeriodField = pickField(r, ['timeperiodperhour', 'timeperiod', 'periodtime', 'timing']);
     const subjectName = pickField(r, ['subjectname', 'subject', 'course', 'coursename']);
     const facultyName = pickField(r, ['facultyname', 'faculty', 'staff', 'instructor']);
-    const periodNumber = Math.max(1, Math.min(8, Number.parseInt(periodRaw, 10) || 0));
+    const rawPeriodInt = Number.parseInt(periodRaw, 10);
+    const periodNumber = Number.isFinite(rawPeriodInt)
+      ? Math.max(1, Math.min(12, rawPeriodInt))
+      : 1;
 
-    if (!dayRaw || !periodNumber || !subjectName || !facultyName) {
-      warnings.push(`Row ${idx + 2}: Skipped (requires Day, Period 1-8, Subject Name, and Faculty Name).`);
+    if (!dayRaw || !subjectName || !facultyName) {
+      warnings.push(`Row ${idx + 2}: Skipped (requires Day, Subject Name, and Faculty Name).`);
       return;
     }
 
     const periodWindow = ACADEMIC_PERIODS.find((p) => p.periodNumber === periodNumber) ?? ACADEMIC_PERIODS[0];
+    let parsedStart = pickField(r, ['starttime', 'start', 'from']);
+    let parsedEnd = pickField(r, ['endtime', 'end', 'to']);
+
+    if ((!parsedStart || !parsedEnd) && timePeriodField) {
+      const rangeMatch = timePeriodField.match(/(\d{1,2}:\d{2})\s*[–—-]\s*(\d{1,2}:\d{2})/);
+      if (rangeMatch) {
+        parsedStart = parsedStart || rangeMatch[1].padStart(5, '0');
+        parsedEnd = parsedEnd || rangeMatch[2].padStart(5, '0');
+      }
+    }
+
+    const startTime = parsedStart || periodWindow.startTime;
+    const endTime = parsedEnd || periodWindow.endTime;
+
     const fTypeRaw = pickField(r, ['facultytype', 'stafftype', 'type']).toLowerCase();
     const facultyType =
       fTypeRaw.includes('other') || fTypeRaw.includes('visit') || fTypeRaw.includes('external')
@@ -491,8 +509,9 @@ export async function parseUploadedDocument(
       section: (pickField(r, ['section', 'sec']) || 'A').toUpperCase(),
       dayOfWeek: normalizeDay(dayRaw),
       periodNumber,
-      startTime: pickField(r, ['starttime', 'start', 'from']) || periodWindow.startTime,
-      endTime: pickField(r, ['endtime', 'end', 'to']) || periodWindow.endTime,
+      startTime,
+      endTime,
+      timePeriodPerHour: `${startTime}–${endTime}`,
       subjectCode: (pickField(r, ['subjectcode', 'coursecode', 'code']) || `CS350${periodNumber}`).toUpperCase(),
       subjectName,
       facultyName,
@@ -501,7 +520,43 @@ export async function parseUploadedDocument(
     });
   });
 
+  // Sort chronologically by startTime -> endTime within each cohort & day, then re-sequence Period 1..N
+  const parseMins = (hhmm: unknown): number => {
+    const m = String(hhmm ?? '').trim().match(/^(\d{1,2}):(\d{2})$/);
+    return m ? Number(m[1]) * 60 + Number(m[2]) : 1440;
+  };
+
+  const cohortBuckets = new Map<string, Record<string, string | number | boolean>[]>();
+  for (const row of validRows) {
+    const k = `${row.department}|${row.yearOfStudy}|${row.section}|${row.dayOfWeek}`;
+    const list = cohortBuckets.get(k) ?? [];
+    list.push(row);
+    cohortBuckets.set(k, list);
+  }
+  for (const list of cohortBuckets.values()) {
+    list.sort((a, b) => {
+      const sDiff = parseMins(a.startTime) - parseMins(b.startTime);
+      if (sDiff !== 0) return sDiff;
+      const eDiff = parseMins(a.endTime) - parseMins(b.endTime);
+      if (eDiff !== 0) return eDiff;
+      return Number(a.periodNumber) - Number(b.periodNumber);
+    });
+    list.forEach((row, idx) => {
+      const seq = idx + 1;
+      const sM = parseMins(row.startTime);
+      const eM = parseMins(row.endTime);
+      const dur = eM > sM && sM < 1440 && eM <= 1440 ? eM - sM : 50;
+      row.periodNumber = seq;
+      row.timePeriodPerHour = `${row.startTime}–${row.endTime} (${dur} min / Hr ${seq})`;
+    });
+  }
+
   validRows.sort((a, b) => {
+    const yA = YEAR_ORDER[String(a.yearOfStudy).toLowerCase()] ?? 9;
+    const yB = YEAR_ORDER[String(b.yearOfStudy).toLowerCase()] ?? 9;
+    if (yA !== yB) return yA - yB;
+    const secCmp = String(a.section).localeCompare(String(b.section));
+    if (secCmp !== 0) return secCmp;
     const dA = DAY_ORDER[String(a.dayOfWeek).toLowerCase()] ?? 9;
     const dB = DAY_ORDER[String(b.dayOfWeek).toLowerCase()] ?? 9;
     if (dA !== dB) return dA - dB;
@@ -520,6 +575,7 @@ export async function parseUploadedDocument(
       'section',
       'dayOfWeek',
       'periodNumber',
+      'timePeriodPerHour',
       'startTime',
       'endTime',
       'subjectCode',
@@ -559,10 +615,10 @@ export function getTemplateRows(module: UploadModule): string[][] {
       ];
     case 'timetable':
       return [
-        ['Year', 'Section', 'Day', 'Period', 'Start Time', 'End Time', 'Subject Code', 'Subject Name', 'Faculty Name', 'Faculty Type', 'Room No'],
-        ['III Year', 'B', 'Monday', '1', '08:45', '09:35', 'CS3505', 'Compiler Design', 'Prof. Meenakshi Sundaram', 'department', 'CSE-302'],
-        ['III Year', 'B', 'Monday', '2', '09:35', '10:25', 'MA3502', 'Probability & Queueing Theory', 'Dr. Srinivasamurthy R', 'other_department', 'CSE-302'],
-        ['III Year', 'B', 'Monday', '3', '10:40', '11:30', 'CS3501', 'Machine Learning', 'Prof. Arvind Narayanan', 'department', 'CSE-302'],
+        ['Year', 'Section', 'Day', 'Period', 'Time Period (Per Hour)', 'Start Time', 'End Time', 'Subject Code', 'Subject Name', 'Faculty Name', 'Faculty Type', 'Room No'],
+        ['III Year', 'B', 'Monday', '1', '08:45–09:35 (50 min / Hr 1)', '08:45', '09:35', 'CS3505', 'Compiler Design', 'Prof. Meenakshi Sundaram', 'department', 'CSE-302'],
+        ['III Year', 'B', 'Monday', '2', '09:35–10:25 (50 min / Hr 2)', '09:35', '10:25', 'MA3502', 'Probability & Queueing Theory', 'Dr. Srinivasamurthy R', 'other_department', 'CSE-302'],
+        ['III Year', 'B', 'Monday', '3', '10:40–11:30 (50 min / Hr 3)', '10:40', '11:30', 'CS3501', 'Machine Learning', 'Prof. Arvind Narayanan', 'department', 'CSE-302'],
       ];
   }
 }

@@ -6,7 +6,9 @@ import { resolveUserFromToken } from '../src/middleware/auth.ts';
 import type {
   CallParticipantInfo,
   ChatMessageItem,
+  FacultyAlterationItem,
   FacultyDelayAlertItem,
+  HodDelegationInfo,
   OdLeaveRequestItem,
   PowerBoostAcknowledgementItem,
   UserProfile,
@@ -430,6 +432,52 @@ class ChatWebSocketHub {
     });
     for (const c of this.clients.values()) {
       if (c.ws.readyState === WebSocket.OPEN && idSet.has(c.user.id)) {
+        c.ws.send(frame);
+      }
+    }
+  }
+
+  emitFacultyAlterationChanged(alteration: FacultyAlterationItem): void {
+    this.broadcastAll({
+      type: 'faculty_alteration:changed',
+      alteration,
+    });
+  }
+
+  emitHodDelegationChanged(delegation: HodDelegationInfo | null): void {
+    this.broadcastAll({
+      type: 'hod_delegation:changed',
+      delegation,
+    });
+  }
+
+  emitWakeUpPageCall(payload: {
+    targetName: string;
+    targetEmail?: string;
+    targetId?: string;
+    targetPhone?: string;
+    callerName: string;
+    callerRole: string;
+    reason: string;
+    sentAt: string;
+  }): void {
+    const frame = JSON.stringify({
+      type: 'profile:page_call',
+      pageCall: payload,
+    });
+    const normTargetName = payload.targetName.trim().toLowerCase();
+    const normTargetEmail = (payload.targetEmail || '').trim().toLowerCase();
+    const normTargetId = (payload.targetId || '').trim().toUpperCase();
+
+    for (const c of this.clients.values()) {
+      if (c.ws.readyState !== WebSocket.OPEN) continue;
+      const matchesUser =
+        (normTargetEmail && c.user.email.trim().toLowerCase() === normTargetEmail) ||
+        (normTargetId && c.user.staffOrRollId.trim().toUpperCase() === normTargetId) ||
+        (normTargetName && c.user.fullName.trim().toLowerCase() === normTargetName) ||
+        c.user.role === 'hod' ||
+        c.user.role === 'class_advisor';
+      if (matchesUser) {
         c.ws.send(frame);
       }
     }

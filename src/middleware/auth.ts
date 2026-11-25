@@ -28,6 +28,7 @@ export async function resolveUserFromToken(token: string): Promise<UserProfile |
       uid: decoded.uid,
       email: decoded.email,
       displayName: decoded.name || decoded.email.split('@')[0],
+      photoUrl: decoded.picture,
     });
     return synced;
   } catch {

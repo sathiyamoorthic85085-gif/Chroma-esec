@@ -34,6 +34,7 @@ import type {
   TimetableSlot,
   UserProfile,
 } from '../types';
+import { ClassroomMapPicker } from './ClassroomMapPicker';
 import { FacultyDelayButton } from './FacultyDelayButton';
 import { WeeklyAttendanceChart } from './WeeklyAttendanceChart';
 
@@ -1031,12 +1032,41 @@ export function CameraAttendanceView({
           </div>
         )}
 
-        {/* HOD-Only Pin Controls */}
-        {user.role === 'hod' && (
+        {/* Interactive Google Maps Classroom Geofence & Click-to-Pin Target Location */}
+        <div className="space-y-2">
+          <ClassroomMapPicker
+            latitude={
+              pinLat && Number.isFinite(Number(pinLat))
+                ? Number(pinLat)
+                : pinnedLocation?.latitude ?? null
+            }
+            longitude={
+              pinLng && Number.isFinite(Number(pinLng))
+                ? Number(pinLng)
+                : pinnedLocation?.longitude ?? null
+            }
+            radiusMeters={Number(pinRadius) || pinnedLocation?.radiusMeters || 150}
+            label={pinLabel || pinnedLocation?.label || 'Target Classroom Pin'}
+            currentLatitude={gpsCoords?.lat ?? null}
+            currentLongitude={gpsCoords?.lng ?? null}
+            readOnly={user.role !== 'hod' && user.role !== 'class_advisor'}
+            height="260px"
+            onSelectLocation={({ lat, lng }) => {
+              setPinLat(lat.toFixed(6));
+              setPinLng(lng.toFixed(6));
+              setPinMessage(
+                `Target pin placed at ${lat.toFixed(6)}, ${lng.toFixed(6)}. Click "Save Pinned Classroom Location" to apply.`
+              );
+            }}
+          />
+        </div>
+
+        {/* HOD & Class Advisor Pin Controls */}
+        {(user.role === 'hod' || user.role === 'class_advisor') && (
           <div className="pt-3 border-t border-slate-200 space-y-3">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <span className="text-xs font-semibold text-slate-800">
-                HOD Classroom Location Pinning Controls
+                Classroom Location Pinning Controls (Click anywhere on map or use GPS)
               </span>
               <button
                 type="button"
@@ -1327,8 +1357,21 @@ export function CameraAttendanceView({
           <div className="grid grid-cols-2 gap-3">
             {/* Photo 1 Preview */}
             <div className="space-y-1.5">
-              <div className="text-[11px] font-medium text-slate-700">
-                1. Face Photo {faceImageData ? '· Captured' : '· Required'}
+              <div className="flex items-center justify-between gap-1 text-[11px] font-medium text-slate-700">
+                <span>1. Face Photo {faceImageData ? '· Captured' : '· Required'}</span>
+                {faceImageData && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setFaceImageData('');
+                      setCaptureStep('face');
+                      if (!cameraActive) void startCamera('user');
+                    }}
+                    className="text-[11px] font-semibold text-indigo-700 hover:text-indigo-900 underline"
+                  >
+                    Retake
+                  </button>
+                )}
               </div>
               <div className="aspect-[4/3] rounded-md border border-slate-200 bg-slate-50 overflow-hidden flex items-center justify-center">
                 {faceImageData ? (
@@ -1347,8 +1390,21 @@ export function CameraAttendanceView({
 
             {/* Photo 2 Preview */}
             <div className="space-y-1.5">
-              <div className="text-[11px] font-medium text-slate-700">
-                2. Work Environment {environmentImageData ? '· Captured' : '· Required'}
+              <div className="flex items-center justify-between gap-1 text-[11px] font-medium text-slate-700">
+                <span>2. Work Environment {environmentImageData ? '· Captured' : '· Required'}</span>
+                {environmentImageData && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setEnvironmentImageData('');
+                      setCaptureStep('environment');
+                      if (!cameraActive) void startCamera('environment');
+                    }}
+                    className="text-[11px] font-semibold text-indigo-700 hover:text-indigo-900 underline"
+                  >
+                    Retake
+                  </button>
+                )}
               </div>
               <div className="aspect-[4/3] rounded-md border border-slate-200 bg-slate-50 overflow-hidden flex items-center justify-center">
                 {environmentImageData ? (

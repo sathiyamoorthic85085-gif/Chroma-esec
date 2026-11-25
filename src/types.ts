@@ -31,6 +31,45 @@ export interface UserProfile {
   approvedAt: string | null;
   createdAt: string;
   transitBufferMinutes?: number;
+  profileImageData?: string;
+  faceRegisteredLocked?: boolean;
+  faceRegisteredAt?: string | null;
+  designation?: string;
+  specialization?: string;
+  bio?: string;
+  delegationInfo?: HodDelegationInfo | null;
+}
+
+export interface HodDelegationInfo {
+  id: number;
+  originalHodUserId: number;
+  originalHodName: string;
+  originalHodEmail: string;
+  delegateUserId: number;
+  delegateName: string;
+  delegateEmail: string;
+  delegatePreviousRole: UserRole;
+  reason: string;
+  status: 'active' | 'restored';
+  delegatedAt: string;
+  restoredAt: string | null;
+}
+
+export interface HodDirectoryRecord {
+  id: number;
+  fullName: string;
+  email: string;
+  role: UserRole;
+  department: string;
+  staffOrRollId: string;
+  phone: string;
+  designation: string;
+  specialization: string;
+  bio: string;
+  photoData?: string;
+  faceRegisteredLocked?: boolean;
+  isActingHod?: boolean;
+  delegationReason?: string;
 }
 
 export interface ServerTimePayload {
@@ -77,6 +116,8 @@ export interface DepartmentStudent {
   sourceBatchId: number | null;
   sourceFilename: string | null;
   createdAt: string;
+  photoData?: string;
+  faceRegisteredLocked?: boolean;
 }
 
 export interface DepartmentStaff {
@@ -93,6 +134,8 @@ export interface DepartmentStaff {
   sourceBatchId: number | null;
   sourceFilename: string | null;
   createdAt: string;
+  photoData?: string;
+  faceRegisteredLocked?: boolean;
 }
 
 export interface OtherDepartmentStaff {
@@ -108,6 +151,35 @@ export interface OtherDepartmentStaff {
   sourceBatchId: number | null;
   sourceFilename: string | null;
   createdAt: string;
+  photoData?: string;
+  faceRegisteredLocked?: boolean;
+}
+
+export interface FacultyAlterationItem {
+  id: number;
+  department: string;
+  yearOfStudy: string;
+  section: string;
+  dayOfWeek: string;
+  periodNumber: number;
+  alterationDate: string;
+  timetableSlotId: number | null;
+  subjectCode: string;
+  subjectName: string;
+  roomNo: string;
+  requestingUserId: number | null;
+  requestingFacultyName: string;
+  substituteUserId: number | null;
+  substituteFacultyName: string;
+  substituteEmail: string;
+  substitutePhone: string;
+  reasonCategory: 'busy' | 'od' | 'absent';
+  reasonNote: string;
+  status: 'pending_hod' | 'approved' | 'rejected';
+  hodReviewedBy: string;
+  hodRemarks: string;
+  hodReviewedAt: string | null;
+  createdAt: string;
 }
 
 export interface TimetableSlot {
@@ -119,6 +191,7 @@ export interface TimetableSlot {
   periodNumber: number;
   startTime: string;
   endTime: string;
+  timePeriodPerHour?: string;
   subjectCode: string;
   subjectName: string;
   facultyName: string;
@@ -126,6 +199,7 @@ export interface TimetableSlot {
   roomNo: string;
   sourceBatchId: number | null;
   createdAt: string;
+  activeAlteration?: FacultyAlterationItem | null;
 }
 
 export interface UploadBatch {
@@ -279,6 +353,12 @@ export interface ChatMessageItem {
   isPinned: boolean;
   editedAt: string | null;
   createdAt: string;
+  senderPhotoData?: string;
+  senderStaffOrRollId?: string;
+  senderDepartment?: string;
+  senderYearSection?: string;
+  senderEmail?: string;
+  senderPhone?: string;
 }
 
 export interface ActivePowerBoostAlert {
@@ -532,6 +612,8 @@ export interface FacultyDelayAlertItem {
   acknowledgedByName: string;
   acknowledgedAt: string | null;
   createdAt: string;
+  isAutoDetected?: boolean;
+  facultyPhone?: string;
 }
 
 export interface DeduplicateReport {
@@ -858,4 +940,33 @@ export interface ArchivalRecordSummary {
   status: 'completed' | 'failed';
   createdAt: string;
 }
+
+export interface BiometricUnlockRequestItem {
+  id: string;
+  userId: number;
+  fullName: string;
+  email: string;
+  role: UserRole;
+  staffOrRollId: string;
+  department: string;
+  reason: string;
+  status: 'pending' | 'approved' | 'rejected';
+  requestedAt: string;
+  hodReviewedBy?: string;
+  hodRemarks?: string;
+  hodReviewedAt?: string;
+}
+
+export interface BiometricLockUserSummary {
+  id: number;
+  fullName: string;
+  email: string;
+  role: UserRole;
+  staffOrRollId: string;
+  department: string;
+  profileImageData: string;
+  faceRegisteredLocked: boolean;
+  faceRegisteredAt: string | null;
+}
+
 

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState, type FormEvent } from 'react';
 import {
   AlertCircle,
+  ArrowLeftRight,
   CalendarDays,
   Camera,
   CheckCircle2,
@@ -24,12 +25,14 @@ import {
 import { api } from '../lib/api';
 import {
   ROLE_LABELS,
+  type FacultyAlterationItem,
   type OdLeaveFieldType,
   type OdLeaveFormConfig,
   type OdLeaveFormFieldConfig,
   type OdLeaveRequestItem,
   type OdLeaveRequestType,
   type ServerTimePayload,
+  type TimetableSlot,
   type UserProfile,
   type UserRole,
 } from '../types';
@@ -60,7 +63,9 @@ export function OdLeaveView({
   const isStudent = user.role === 'student' || user.role === 'class_rep';
   const applicantCategory: 'student' | 'faculty' = isStudent ? 'student' : 'faculty';
 
-  const [activeTab, setActiveTab] = useState<'requests' | 'apply' | 'customize'>(
+  const isFacultyRole = !isStudent;
+
+  const [activeTab, setActiveTab] = useState<'requests' | 'apply' | 'alterations' | 'customize'>(
     isHod || isClassAdvisor ? 'requests' : 'apply'
   );
 
@@ -122,9 +127,40 @@ export function OdLeaveView({
   const [draftConfig, setDraftConfig] = useState<OdLeaveFormConfig | null>(null);
   const [savingConfig, setSavingConfig] = useState(false);
 
+  // Faculty Alterations state (Busy / OD / Absent -> HOD Permission)
+  const [alterations, setAlterations] = useState<FacultyAlterationItem[]>([]);
+  const [alterCandidates, setAlterCandidates] = useState<
+    {
+      userId: number | null;
+      fullName: string;
+      email: string;
+      phone: string;
+      designation: string;
+      role: string;
+    }[]
+  >([]);
+  const [alterSlots, setAlterSlots] = useState<TimetableSlot[]>([]);
+  const [selectedAlterSlotId, setSelectedAlterSlotId] = useState<string>('');
+  const [alterDate, setAlterDate] = useState<string>(
+    () => serverTime?.isoDate || new Date().toISOString().slice(0, 10)
+  );
+  const [alterReason, setAlterReason] = useState<'busy' | 'od' | 'absent'>('busy');
+  const [alterSubName, setAlterSubName] = useState('');
+  const [alterNote, setAlterNote] = useState('');
+  const [alterManualSubject, setAlterManualSubject] = useState('');
+  const [alterManualPeriod, setAlterManualPeriod] = useState(1);
+  const [alterManualDay, setAlterManualDay] = useState('Monday');
+  const [alterSubmitting, setAlterSubmitting] = useState(false);
+  const [alterDecidingId, setAlterDecidingId] = useState<number | null>(null);
+  const [alterRemarksById, setAlterRemarksById] = useState<Record<number, string>>({});
+
   const loadData = useCallback(async () => {
     try {
-      const res = await api.getOdLeaveRequests(token);
+      const [res, altRes, ttRes] = await Promise.all([
+        api.getOdLeaveRequests(token),
+        isFacultyRole ? api.getFacultyAlterations(token).catch(() => null) : Promise.resolve(null),
+        isFacultyRole ? api.getTimetable(token).catch(() => null) : Promise.resolve(null),
+      ]);
       setRequests(res.requests);
       setActiveToday(res.activeToday);
       setFormConfig(res.config);
@@ -132,18 +168,25 @@ export function OdLeaveView({
       if (res.serverDate) {
         setServerDate(res.serverDate);
       }
+      if (altRes) {
+        setAlterations(altRes.alterations || []);
+        setAlterCandidates(altRes.candidates || []);
+      }
+      if (ttRes) {
+        setAlterSlots(ttRes.slots || []);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Unable to load OD & Leave requests.');
     } finally {
       setLoading(false);
     }
-  }, [token]);
+  }, [token, isFacultyRole]);
 
   useEffect(() => {
     loadData();
   }, [loadData]);
 
-  // Real-time refresh over WebSocket when requests are submitted or approved/rejected
+  // Real-time refresh over WebSocket when requests or faculty alterations are updated
   useEffect(() => {
     let closed = false;
     let ws: WebSocket | null = null;
@@ -158,7 +201,11 @@ export function OdLeaveView({
       ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
-          if (data.type === 'od_leave:created' || data.type === 'od_leave:updated') {
+          if (
+            data.type === 'od_leave:created' ||
+            data.type === 'od_leave:updated' ||
+            data.type === 'faculty_alteration:changed'
+          ) {
             loadData();
           }
         } catch {
@@ -204,6 +251,82 @@ export function OdLeaveView({
     () => requests.filter((r) => canReviewRequest(r)).length,
     [requests, canReviewRequest]
   );
+
+  const pendingAlterationsCount = useMemo(
+    () => alterations.filter((a) => a.status === 'pending_hod').length,
+    [alterations]
+  );
+
+  const handleSubmitAlteration = async (e: FormEvent) => {
+    e.preventDefault();
+    setError(null);
+    setNotice(null);
+    const chosenSub = alterSubName.trim();
+    if (!chosenSub) {
+      setError('Please select or type the substitute faculty name.');
+      return;
+    }
+    const slot = selectedAlterSlotId
+      ? alterSlots.find((s) => String(s.id) === selectedAlterSlotId) ?? null
+      : null;
+    const candidate = alterCandidates.find(
+      (c) => c.fullName.toLowerCase() === chosenSub.toLowerCase()
+    );
+    setAlterSubmitting(true);
+    try {
+      await api.createFacultyAlteration(token, {
+        timetableSlotId: slot?.id ?? null,
+        alterationDate: alterDate,
+        substituteFacultyName: chosenSub,
+        substituteUserId: candidate?.userId ?? null,
+        substituteEmail: candidate?.email ?? '',
+        substitutePhone: candidate?.phone ?? '',
+        reasonCategory: alterReason,
+        reasonNote: alterNote.trim(),
+        dayOfWeek: slot?.dayOfWeek ?? alterManualDay,
+        periodNumber: slot?.periodNumber ?? alterManualPeriod,
+        subjectCode: slot?.subjectCode ?? (alterManualSubject.trim().slice(0, 12) || 'ALT'),
+        subjectName: slot?.subjectName ?? (alterManualSubject.trim() || 'Scheduled Lecture'),
+        yearOfStudy: slot?.yearOfStudy ?? yearOfStudy,
+        section: slot?.section ?? section,
+        roomNo: slot?.roomNo ?? '',
+      });
+      setAlterSubName('');
+      setAlterNote('');
+      setAlterManualSubject('');
+      setSelectedAlterSlotId('');
+      setNotice(
+        isHod
+          ? `Faculty alteration approved & active (${chosenSub}).`
+          : `Faculty alteration request sent to HOD for permission (${chosenSub}).`
+      );
+      await loadData();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to submit faculty alteration.');
+    } finally {
+      setAlterSubmitting(false);
+    }
+  };
+
+  const handleDecideAlteration = async (id: number, decision: 'approve' | 'reject') => {
+    setAlterDecidingId(id);
+    setError(null);
+    setNotice(null);
+    try {
+      await api.decideFacultyAlteration(token, id, decision, alterRemarksById[id] || '');
+      setNotice(
+        decision === 'approve'
+          ? 'Faculty alteration approved and synced to timetable.'
+          : 'Faculty alteration request rejected.'
+      );
+      await loadData();
+      if (onAttendanceUpdated) onAttendanceUpdated();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to update alteration request.');
+    } finally {
+      setAlterDecidingId(null);
+    }
+  };
 
   const filteredRequests = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
@@ -467,6 +590,25 @@ export function OdLeaveView({
                 </span>
               )}
             </button>
+            {isFacultyRole && (
+              <button
+                type="button"
+                onClick={() => setActiveTab('alterations')}
+                className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap ${
+                  activeTab === 'alterations'
+                    ? 'bg-white text-indigo-900 shadow-sm'
+                    : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                <ArrowLeftRight className="w-3.5 h-3.5" />
+                <span>Alter Faculty</span>
+                {isHod && pendingAlterationsCount > 0 && (
+                  <span className="font-mono text-[11px] font-semibold text-amber-700">
+                    ({pendingAlterationsCount})
+                  </span>
+                )}
+              </button>
+            )}
             {isHod && (
               <button
                 type="button"
@@ -1635,6 +1777,263 @@ export function OdLeaveView({
             </button>
           </div>
         </form>
+      )}
+
+      {/* Faculty Alteration Tab (Busy / OD / Absent -> HOD Permission) */}
+      {activeTab === 'alterations' && isFacultyRole && (
+        <div className="space-y-5">
+          <form
+            onSubmit={handleSubmitAlteration}
+            className="bg-white border border-slate-200 rounded-xl p-5 space-y-4"
+          >
+            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-3">
+              <div>
+                <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
+                  <ArrowLeftRight className="w-4 h-4 text-indigo-700" />
+                  Request Faculty Class Alteration
+                </h3>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Alter your assigned period with another faculty when Busy, On Duty (OD), or Absent. All requests route to HOD for permission.
+                </p>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 text-xs">
+              <label className="space-y-1">
+                <span className="block font-medium text-slate-700">Scheduled Period (Optional)</span>
+                <select
+                  value={selectedAlterSlotId}
+                  onChange={(e) => setSelectedAlterSlotId(e.target.value)}
+                  className="w-full px-3 py-2 border border-slate-300 rounded-lg bg-white text-slate-900"
+                >
+                  <option value="">-- Enter custom class / period --</option>
+                  {alterSlots.map((slot) => (
+                    <option key={slot.id} value={String(slot.id)}>
+                      {slot.dayOfWeek} · Hr {slot.periodNumber} ({slot.startTime}–{slot.endTime}) · {slot.subjectCode} ({slot.facultyName})
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label className="space-y-1">
+                <span className="block font-medium text-slate-700">Alteration Date</span>
+                <input
+                  type="date"
+                  required
+                  value={alterDate}
+                  onChange={(e) => setAlterDate(e.target.value)}
+                  className="w-full px-3 py-2 border border-slate-300 rounded-lg bg-white text-slate-900"
+                />
+              </label>
+
+              <label className="space-y-1">
+                <span className="block font-medium text-slate-700">Reason Category</span>
+                <select
+                  value={alterReason}
+                  onChange={(e) => setAlterReason(e.target.value as 'busy' | 'od' | 'absent')}
+                  className="w-full px-3 py-2 border border-slate-300 rounded-lg bg-white text-slate-900"
+                >
+                  <option value="busy">Busy / Official Work</option>
+                  <option value="od">On Duty (OD)</option>
+                  <option value="absent">Absent / Leave</option>
+                </select>
+              </label>
+
+              {!selectedAlterSlotId && (
+                <>
+                  <label className="space-y-1">
+                    <span className="block font-medium text-slate-700">Day of Week</span>
+                    <select
+                      value={alterManualDay}
+                      onChange={(e) => setAlterManualDay(e.target.value)}
+                      className="w-full px-3 py-2 border border-slate-300 rounded-lg bg-white text-slate-900"
+                    >
+                      {['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'].map((d) => (
+                        <option key={d} value={d}>
+                          {d}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+
+                  <label className="space-y-1">
+                    <span className="block font-medium text-slate-700">Period / Hour (1–12)</span>
+                    <select
+                      value={alterManualPeriod}
+                      onChange={(e) => setAlterManualPeriod(Number(e.target.value))}
+                      className="w-full px-3 py-2 border border-slate-300 rounded-lg bg-white text-slate-900"
+                    >
+                      {Array.from({ length: 12 }, (_, i) => i + 1).map((p) => (
+                        <option key={p} value={p}>
+                          Hr {p}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+
+                  <label className="space-y-1">
+                    <span className="block font-medium text-slate-700">Subject / Class Name</span>
+                    <input
+                      type="text"
+                      value={alterManualSubject}
+                      onChange={(e) => setAlterManualSubject(e.target.value)}
+                      placeholder="e.g. EI3401 Process Control"
+                      className="w-full px-3 py-2 border border-slate-300 rounded-lg bg-white text-slate-900"
+                    />
+                  </label>
+                </>
+              )}
+
+              <label className="space-y-1">
+                <span className="block font-medium text-slate-700">Substitute Faculty *</span>
+                <input
+                  type="text"
+                  required
+                  list="od-alter-candidates"
+                  value={alterSubName}
+                  onChange={(e) => setAlterSubName(e.target.value)}
+                  placeholder="Select or type substitute faculty..."
+                  className="w-full px-3 py-2 border border-slate-300 rounded-lg bg-white text-slate-900"
+                />
+                <datalist id="od-alter-candidates">
+                  {alterCandidates.map((c, idx) => (
+                    <option key={idx} value={c.fullName}>
+                      {c.designation || c.role}
+                    </option>
+                  ))}
+                </datalist>
+              </label>
+
+              <label className="space-y-1 sm:col-span-2">
+                <span className="block font-medium text-slate-700">Reason / Coordination Note for HOD</span>
+                <input
+                  type="text"
+                  value={alterNote}
+                  onChange={(e) => setAlterNote(e.target.value)}
+                  placeholder="e.g. Lab inspection / OD at Anna University; substitute faculty confirmed"
+                  className="w-full px-3 py-2 border border-slate-300 rounded-lg bg-white text-slate-900"
+                />
+              </label>
+            </div>
+
+            <div className="flex justify-end">
+              <button
+                type="submit"
+                disabled={alterSubmitting}
+                className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-indigo-700 hover:bg-indigo-800 text-white text-xs font-semibold disabled:opacity-60"
+              >
+                <ArrowLeftRight className="w-3.5 h-3.5" />
+                {alterSubmitting
+                  ? 'Submitting...'
+                  : isHod
+                  ? 'Approve & Apply Alteration'
+                  : 'Request HOD Permission'}
+              </button>
+            </div>
+          </form>
+
+          {/* Alterations List & HOD Approval Queue */}
+          <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+            <div className="px-5 py-3.5 border-b border-slate-200 bg-slate-50 flex items-center justify-between">
+              <h4 className="text-xs font-bold uppercase tracking-wider text-slate-700">
+                Faculty Alterations Log ({alterations.length})
+              </h4>
+              {isHod && pendingAlterationsCount > 0 && (
+                <span className="px-2 py-0.5 rounded bg-amber-100 text-amber-900 text-[11px] font-semibold">
+                  {pendingAlterationsCount} Pending HOD Approval
+                </span>
+              )}
+            </div>
+
+            {alterations.length === 0 ? (
+              <div className="p-8 text-center text-xs text-slate-500">
+                No faculty alteration requests recorded yet.
+              </div>
+            ) : (
+              <div className="divide-y divide-slate-200">
+                {alterations.map((alt) => (
+                  <div key={alt.id} className="p-4 space-y-2.5 text-xs">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-semibold text-slate-900">
+                          {alt.requestingFacultyName} → {alt.substituteFacultyName}
+                        </span>
+                        <span className="px-2 py-0.5 rounded bg-slate-100 text-slate-700 font-mono text-[10px] uppercase">
+                          {alt.reasonCategory}
+                        </span>
+                        <span
+                          className={`px-2 py-0.5 rounded font-semibold text-[10px] uppercase ${
+                            alt.status === 'approved'
+                              ? 'bg-emerald-100 text-emerald-800'
+                              : alt.status === 'rejected'
+                              ? 'bg-rose-100 text-rose-800'
+                              : 'bg-amber-100 text-amber-800'
+                          }`}
+                        >
+                          {alt.status === 'pending_hod' ? 'Pending HOD' : alt.status}
+                        </span>
+                      </div>
+                      <span className="font-mono text-[11px] text-slate-500">
+                        {alt.alterationDate} · {alt.dayOfWeek} Hr {alt.periodNumber}
+                      </span>
+                    </div>
+
+                    <div className="text-slate-600">
+                      <span className="font-mono font-semibold text-indigo-800">{alt.subjectCode}</span>{' '}
+                      {alt.subjectName} · {alt.yearOfStudy} Sec {alt.section}
+                      {alt.roomNo ? ` · Room ${alt.roomNo}` : ''}
+                    </div>
+                    {alt.reasonNote && (
+                      <p className="text-slate-600 bg-slate-50 border border-slate-200 rounded-md px-3 py-1.5">
+                        {alt.reasonNote}
+                      </p>
+                    )}
+                    {alt.hodReviewedBy && (
+                      <p className="text-[11px] text-slate-500">
+                        Reviewed by {alt.hodReviewedBy}
+                        {alt.hodRemarks ? ` — "${alt.hodRemarks}"` : ''}
+                      </p>
+                    )}
+
+                    {isHod && alt.status === 'pending_hod' && (
+                      <div className="flex flex-col sm:flex-row gap-2 pt-1">
+                        <input
+                          type="text"
+                          value={alterRemarksById[alt.id] || ''}
+                          onChange={(e) =>
+                            setAlterRemarksById((prev) => ({ ...prev, [alt.id]: e.target.value }))
+                          }
+                          placeholder="Optional HOD remarks..."
+                          className="flex-1 px-3 py-1.5 border border-slate-300 rounded-lg text-xs"
+                        />
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            disabled={alterDecidingId === alt.id}
+                            onClick={() => handleDecideAlteration(alt.id, 'approve')}
+                            className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white font-semibold disabled:opacity-60"
+                          >
+                            <CheckCircle2 className="w-3.5 h-3.5" />
+                            Approve
+                          </button>
+                          <button
+                            type="button"
+                            disabled={alterDecidingId === alt.id}
+                            onClick={() => handleDecideAlteration(alt.id, 'reject')}
+                            className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-700 text-white font-semibold disabled:opacity-60"
+                          >
+                            <XCircle className="w-3.5 h-3.5" />
+                            Reject
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
       )}
 
       {/* Attachment Preview Modal */}
