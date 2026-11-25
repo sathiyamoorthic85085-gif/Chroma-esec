@@ -14,11 +14,19 @@ import {
   type UploadBatch,
   type UserProfile,
 } from '../types';
+import { AcademicCalendarCard } from './AcademicCalendarCard';
+import { AcademicGoalTrackerCard } from './AcademicGoalTrackerCard';
+import { BatchComparisonRadarCard } from './BatchComparisonRadarCard';
+import { DailyArchivalCard } from './DailyArchivalCard';
+import { DepartmentalPerformanceChart } from './DepartmentalPerformanceChart';
 import { MonthlyAttendanceChart } from './MonthlyAttendanceChart';
+import { StudentAchievementCard } from './StudentAchievementCard';
+import { TopPerformersAndStudyBuddySection } from './TopPerformersAndStudyBuddySection';
 
 export type NavSection =
   | 'overview'
   | 'approvals'
+  | 'od_leave'
   | 'students'
   | 'dept_staff'
   | 'other_staff'
@@ -238,6 +246,49 @@ export function OverviewView({
         serverTime={serverTime}
         onOpenAttendance={() => onNavigate('attendance')}
       />
+
+      {/* Departmental Performance: Average Attendance vs. Academic Engagement across Student Batches (Recharts) */}
+      <DepartmentalPerformanceChart
+        token={token}
+        refreshKey={students.length + batches.length}
+        onOpenAttendance={() => onNavigate('attendance')}
+        onOpenStudents={() => onNavigate(user.role === 'hod' || user.role === 'dept_staff' || user.role === 'other_dept_staff' ? 'students' : 'advisor_class')}
+      />
+
+      {/* Academic Goal Tracker & Daily Nudge Progress */}
+      <AcademicGoalTrackerCard
+        token={token}
+        user={user}
+        refreshKey={students.length + batches.length}
+      />
+
+      {/* Student Achievement Badges & Batch Filter */}
+      <StudentAchievementCard
+        token={token}
+        refreshKey={students.length + batches.length}
+      />
+
+      {/* Side-by-Side Batch Comparison Radar, Predictive Risk, Trends Projection & Bulk PDF Export */}
+      <BatchComparisonRadarCard
+        token={token}
+        refreshKey={students.length + batches.length}
+      />
+
+      {/* Top Performers Leaderboard & Study Buddy Complementary Pairings */}
+      <TopPerformersAndStudyBuddySection
+        token={token}
+        refreshKey={students.length + batches.length}
+      />
+
+      {/* Academic Calendar View */}
+      <AcademicCalendarCard
+        token={token}
+        user={user}
+        todayIsoDate={serverTime?.isoDate}
+      />
+
+      {/* Automated Daily Archival & Backup Logs (HOD / Class Advisor) */}
+      <DailyArchivalCard token={token} user={user} />
 
       {/* HOD Record Integrity & Duplicate Cleanup Bar */}
       {user.role === 'hod' && (

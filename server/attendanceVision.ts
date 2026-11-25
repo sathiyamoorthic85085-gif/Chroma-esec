@@ -50,6 +50,9 @@ function stripDataUrl(dataUrl: string): { mimeType: string; data: string } {
 export async function verifyDualCameraAttendance(params: {
   faceImageData: string;
   environmentImageData: string;
+  registeredFaceImageData?: string | null;
+  registeredEnvironmentImageData?: string | null;
+  geofenceSummary?: string;
   personType: 'student' | 'faculty';
   personName: string;
   subjectName: string;
@@ -57,27 +60,71 @@ export async function verifyDualCameraAttendance(params: {
 }): Promise<DualCameraVerificationResult> {
   const faceImg = stripDataUrl(params.faceImageData);
   const envImg = stripDataUrl(params.environmentImageData);
+  const regFaceImg = params.registeredFaceImageData
+    ? (() => {
+        try {
+          return stripDataUrl(params.registeredFaceImageData);
+        } catch {
+          return null;
+        }
+      })()
+    : null;
+  const regEnvImg = params.registeredEnvironmentImageData
+    ? (() => {
+        try {
+          return stripDataUrl(params.registeredEnvironmentImageData);
+        } catch {
+          return null;
+        }
+      })()
+    : null;
 
   const ai = getGeminiClient();
 
-  const prompt = [
+  const parts: Array<
+    { inlineData: { mimeType: string; data: string } } | { text: string }
+  > = [
+    { inlineData: { mimeType: faceImg.mimeType, data: faceImg.data } },
+    { inlineData: { mimeType: envImg.mimeType, data: envImg.data } },
+  ];
+
+  const promptLines = [
     `You are an academic attendance verification vision inspector for ChromaGrade.`,
-    `Inspect the TWO live camera photos provided in order:`,
-    `1) FIRST IMAGE (Face Capture): Must clearly show a live human face of the ${params.personType} (${params.personName}). Check if a real human face is visible, clearly framed, and NOT a photo of another phone/monitor screen or blank wall.`,
-    `2) SECOND IMAGE (Work/Classroom Environment Capture): Must show a real surrounding classroom, laboratory, lecture hall, office, desk, whiteboard, computer workstation, or institutional study/work environment (expected context: ${params.subjectName} · Room ${params.roomNo || 'Campus'}).`,
+    `Inspect the LIVE camera photos provided:`,
+    `1) FIRST IMAGE (Live Face Capture): Must clearly show a live human face of the ${params.personType} (${params.personName}). Check if a real human face is visible, clearly framed, and NOT a photo of another phone/monitor screen or blank wall.`,
+    `2) SECOND IMAGE (Live Work/Classroom Environment Capture): Must show a real surrounding classroom, laboratory, lecture hall, office, desk, whiteboard, computer workstation, or institutional study/work environment (expected context: ${params.subjectName} · Room ${params.roomNo || 'Campus'}).`,
+  ];
+
+  if (regFaceImg) {
+    parts.push({ inlineData: { mimeType: regFaceImg.mimeType, data: regFaceImg.data } });
+    promptLines.push(
+      `3) REGISTERED FACE BASELINE (Image ${parts.length}): Compare the Live Face Capture (Image 1) against this student's registered enrollment face photo. Reject if it clearly appears to be a completely different person.`
+    );
+  }
+
+  if (regEnvImg) {
+    parts.push({ inlineData: { mimeType: regEnvImg.mimeType, data: regEnvImg.data } });
+    promptLines.push(
+      `4) REGISTERED CLASSROOM ENVIRONMENT BASELINE (Image ${parts.length}): Compare the Live Environment Capture (Image 2) against the student's registered classroom environment at the HOD-pinned campus location. Confirm it is a genuine matching classroom/academic space.`
+    );
+  }
+
+  if (params.geofenceSummary) {
+    promptLines.push(`GPS Geofence Context: ${params.geofenceSummary}`);
+  }
+
+  promptLines.push(
     `Return strict JSON matching the schema.`,
-    `Set approvedForAttendance = true ONLY if faceDetected is true, spoofSuspected is false, and environmentVerified is true.`,
-    `Keep summary under 25 words in plain, factual language.`,
-  ].join('\n');
+    `Set approvedForAttendance = true ONLY if faceDetected is true, spoofSuspected is false, and environmentVerified is true (and identity/environment matches registered baselines when provided).`,
+    `Keep summary under 25 words in plain, factual language.`
+  );
+
+  parts.push({ text: promptLines.join('\n') });
 
   const response = await ai.models.generateContent({
     model: 'gemini-4-hydrogen',
     contents: {
-      parts: [
-        { inlineData: { mimeType: faceImg.mimeType, data: faceImg.data } },
-        { inlineData: { mimeType: envImg.mimeType, data: envImg.data } },
-        { text: prompt },
-      ],
+      parts,
     },
     config: {
       responseMimeType: 'application/json',
@@ -86,11 +133,11 @@ export async function verifyDualCameraAttendance(params: {
         properties: {
           faceDetected: {
             type: Type.BOOLEAN,
-            description: 'True if a clear human face is visible in Image 1.',
+            description: 'True if a clear human face is visible in Image 1 (and matches registered face when provided).',
           },
           faceConfidence: {
             type: Type.INTEGER,
-            description: 'Confidence score 0-100 for face presence and clarity.',
+            description: 'Confidence score 0-100 for face presence and identity clarity.',
           },
           spoofSuspected: {
             type: Type.BOOLEAN,

@@ -30,6 +30,7 @@ export interface UserProfile {
   approvedBy: string | null;
   approvedAt: string | null;
   createdAt: string;
+  transitBufferMinutes?: number;
 }
 
 export interface ServerTimePayload {
@@ -373,7 +374,7 @@ export interface AttendanceRecordItem {
   personIdentifier: string;
   personName: string;
   markedByName: string;
-  status: 'present' | 'late' | 'rejected';
+  status: 'present' | 'late' | 'rejected' | 'od' | 'absent';
   faceImageData: string;
   environmentImageData: string;
   faceDetected: boolean;
@@ -411,6 +412,128 @@ export interface MonthlyAttendanceTrendsPayload {
   days: MonthlyAttendanceDayPoint[];
 }
 
+export interface WeeklyAttendanceBucketPoint {
+  weekStart: string;
+  weekEnd: string;
+  label: string;
+  present: number;
+  rejected: number;
+  studentsPresent: number;
+  facultyPresent: number;
+  total: number;
+  verificationRate: number;
+}
+
+export interface WeeklyAttendanceDailyPoint {
+  date: string;
+  dayName: string;
+  shortDay: string;
+  present: number;
+  rejected: number;
+  studentsPresent: number;
+  facultyPresent: number;
+  total: number;
+  verificationRate: number;
+}
+
+export interface WeeklyAttendanceTrendsPayload {
+  departmentName: string;
+  currentWeekRangeLabel: string;
+  totalPresent: number;
+  totalRejected: number;
+  studentPresent: number;
+  facultyPresent: number;
+  overallRate: number;
+  weekOverWeekDeltaPct: number | null;
+  currentWeekDays: WeeklyAttendanceDailyPoint[];
+  weeklyHistory: WeeklyAttendanceBucketPoint[];
+}
+
+export interface BatchPerformancePoint {
+  batchKey: string;
+  batchLabel: string;
+  yearOfStudy: string;
+  section: string;
+  studentCount: number;
+  averageAttendanceRate: number;
+  academicEngagementScore: number;
+  hasAttendanceData: boolean;
+  attendancePresentCount: number;
+  attendanceOdCount: number;
+  attendanceTotalLogs: number;
+  averageCgpa: number | null;
+  cgpaScore: number | null;
+  powerBoostResponseRate: number | null;
+  portalParticipationRate: number;
+  chatMessagesCount: number;
+  activeRegisteredCount: number;
+  standing:
+    | 'High Performing'
+    | 'On Track'
+    | 'Attendance Watch'
+    | 'Engagement Watch'
+    | 'Pending Attendance';
+}
+
+export interface DepartmentalPerformancePayload {
+  departmentName: string;
+  groupBy: 'year' | 'section';
+  totalStudents: number;
+  totalBatches: number;
+  departmentAverageAttendance: number;
+  departmentAverageEngagement: number;
+  batchesWithAttendanceData: number;
+  topPerformingBatch: string | null;
+  batches: BatchPerformancePoint[];
+}
+
+export interface PinnedLocationConfig {
+  configured: boolean;
+  label: string;
+  latitude: number | null;
+  longitude: number | null;
+  radiusMeters: number;
+  updatedBy: string;
+  updatedAt: string;
+}
+
+export interface StudentBiometricProfileSummary {
+  rollNo: string;
+  email: string;
+  fullName: string;
+  hasFaceBaseline: boolean;
+  hasEnvironmentBaseline: boolean;
+  capturedLatitude: string;
+  capturedLongitude: string;
+  distanceMeters: number | null;
+  locationVerified: boolean;
+  pinnedLocationLabel: string;
+  updatedAt: string;
+}
+
+export interface FacultyDelayAlertItem {
+  id: number;
+  department: string;
+  yearOfStudy: string;
+  section: string;
+  dayOfWeek: string;
+  periodNumber: number;
+  timetableSlotId: number | null;
+  subjectCode: string;
+  subjectName: string;
+  roomNo: string;
+  facultyName: string;
+  reportedByUserId: number | null;
+  reportedByName: string;
+  reportedByRole: UserRole | string;
+  delayMinutes: number;
+  note: string;
+  status: 'active' | 'acknowledged' | 'resolved';
+  acknowledgedByName: string;
+  acknowledgedAt: string | null;
+  createdAt: string;
+}
+
 export interface DeduplicateReport {
   studentsCleaned: number;
   deptStaffCleaned: number;
@@ -419,6 +542,90 @@ export interface DeduplicateReport {
   attendanceCleaned: number;
   totalRemoved: number;
   message: string;
+}
+
+// ============================================================
+// OD & Leave Permission Workflow + HOD Form Customization Types
+// ============================================================
+export type OdLeaveRequestType = 'od' | 'leave';
+export type OdLeaveApplicantCategory = 'student' | 'faculty';
+export type OdLeaveWorkflowStatus =
+  | 'pending_advisor'
+  | 'pending_hod'
+  | 'approved'
+  | 'rejected';
+
+export type OdLeaveFieldType =
+  | 'text'
+  | 'textarea'
+  | 'number'
+  | 'phone'
+  | 'date'
+  | 'select';
+
+export interface OdLeaveFormFieldConfig {
+  id: string;
+  label: string;
+  type: OdLeaveFieldType;
+  required: boolean;
+  enabled: boolean;
+  appliesTo: 'all' | 'student' | 'faculty';
+  placeholder: string;
+  options: string[];
+  systemCore?: boolean;
+}
+
+export interface OdLeaveFormConfig {
+  requireClassAdvisorForStudents: boolean;
+  allowDocumentUpload: boolean;
+  requireDocumentUploadForOd: boolean;
+  requireDocumentUploadForLeave: boolean;
+  allowPhotoUpload: boolean;
+  requirePhotoUpload: boolean;
+  maxOdDays: number;
+  maxLeaveDays: number;
+  declarationText: string;
+  fields: OdLeaveFormFieldConfig[];
+  updatedBy: string;
+  updatedAt: string;
+}
+
+export interface OdLeaveRequestItem {
+  id: number;
+  requestType: OdLeaveRequestType;
+  applicantCategory: OdLeaveApplicantCategory;
+  applicantUserId: number | null;
+  applicantName: string;
+  applicantRole: UserRole | string;
+  rollOrEmployeeId: string;
+  mobileNumber: string;
+  department: string;
+  yearOfStudy: string;
+  section: string;
+  fromDate: string;
+  toDate: string;
+  totalDays: number;
+  reason: string;
+  customFields: Record<string, string>;
+  documentFileKey: string;
+  documentFileName: string;
+  documentMimeType: string;
+  photoFileKey: string;
+  photoFileName: string;
+  photoMimeType: string;
+  status: OdLeaveWorkflowStatus;
+  advisorStatus: 'not_required' | 'pending' | 'approved' | 'rejected';
+  advisorReviewedBy: string;
+  advisorRemarks: string;
+  advisorReviewedAt: string | null;
+  hodStatus: 'pending' | 'approved' | 'rejected';
+  hodReviewedBy: string;
+  hodRemarks: string;
+  hodReviewedAt: string | null;
+  attendanceMarkedStatus: '' | 'od' | 'absent';
+  attendanceDaysMarked: number;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export const ROLE_LABELS: Record<UserRole, string> = {
@@ -437,3 +644,218 @@ export const MODULE_LABELS: Record<UploadModule, string> = {
   class_representatives: 'Class Representatives',
   timetable: 'Department Timetable',
 };
+
+// ============================================================
+// Student Achievements, Batch Comparison Radar & Predictive Risk
+// ============================================================
+export interface StudentAchievementBadge {
+  code: string;
+  title: string;
+  tier: 'platinum' | 'gold' | 'silver';
+  criteria: string;
+}
+
+export interface StudentAchievementItem {
+  rollNo: string;
+  fullName: string;
+  yearOfStudy: string;
+  section: string;
+  attendanceRate: number;
+  engagementScore: number;
+  streakDays: number;
+  badges: StudentAchievementBadge[];
+}
+
+export interface StudentAchievementsPayload {
+  availableBatches: string[];
+  selectedBatch: string;
+  totalAwardsCount: number;
+  students: StudentAchievementItem[];
+}
+
+export interface BatchRadarMetricPoint {
+  metric: string;
+  batchAValue: number;
+  batchBValue: number;
+  fullMark: number;
+}
+
+export interface BatchTrendWeekPoint {
+  weekLabel: string;
+  weekIndex: number;
+  isProjection: boolean;
+  batchAAttendance: number | null;
+  batchBAttendance: number | null;
+  batchAEngagement: number | null;
+  batchBEngagement: number | null;
+  batchAProjected: number | null;
+  batchBProjected: number | null;
+}
+
+export interface BatchRiskStatus {
+  batchKey: string;
+  batchLabel: string;
+  atPredictiveRisk: boolean;
+  attendanceSlope4Wk: number;
+  engagementSlope4Wk: number;
+  reason: string;
+}
+
+export interface BatchComparisonPayload {
+  departmentName: string;
+  availableBatches: { batchKey: string; batchLabel: string }[];
+  batchA: BatchPerformancePoint & { badgesCount: number; streakAvg: number };
+  batchB: BatchPerformancePoint & { badgesCount: number; streakAvg: number };
+  radarMetrics: BatchRadarMetricPoint[];
+  weeklySeries: BatchTrendWeekPoint[];
+  predictiveRisk: {
+    batchA: BatchRiskStatus;
+    batchB: BatchRiskStatus;
+  };
+}
+
+// ============================================================
+// Academic Goal Tracker & Semester History
+// ============================================================
+export interface AcademicGoalWeekLog {
+  weekStart: string;
+  weekLabel: string;
+  attendancePct: number;
+  engagementPct: number;
+  attendanceTarget: number;
+  engagementTarget: number;
+  completedTargets: boolean;
+  checkInsCount: number;
+}
+
+export interface AcademicGoalPayload {
+  weeklyAttendanceTarget: number;
+  weeklyEngagementTarget: number;
+  currentAttendancePct: number;
+  currentEngagementPct: number;
+  lastCheckedInDate: string;
+  checkedInToday: boolean;
+  todayIsoDate: string;
+  note: string;
+  semesterHistory: AcademicGoalWeekLog[];
+}
+
+// ============================================================
+// Top Performers Leaderboard & Study Buddy Pairing
+// ============================================================
+export interface TopPerformerHistoryPoint {
+  weekLabel: string;
+  attendanceRate: number;
+  engagementScore: number;
+}
+
+export interface TopPerformerItem {
+  rank: number;
+  rollNo: string;
+  fullName: string;
+  yearOfStudy: string;
+  section: string;
+  attendanceRate: number;
+  engagementScore: number;
+  streakDays: number;
+  badgesCount: number;
+  compositeScore: number;
+  history: TopPerformerHistoryPoint[];
+}
+
+export interface StudyBuddySuggestion {
+  id: string;
+  mentor: {
+    rollNo: string;
+    fullName: string;
+    yearOfStudy: string;
+    section: string;
+    attendanceRate: number;
+    engagementScore: number;
+  };
+  mentee: {
+    rollNo: string;
+    fullName: string;
+    yearOfStudy: string;
+    section: string;
+    attendanceRate: number;
+    engagementScore: number;
+  };
+  matchReason: string;
+  focusArea: string;
+}
+
+export interface LeaderboardAndBuddiesPayload {
+  performers: TopPerformerItem[];
+  studyBuddies: StudyBuddySuggestion[];
+}
+
+// ============================================================
+// Academic Calendar Events
+// ============================================================
+export type AcademicEventCategory = 'event' | 'exam' | 'deadline' | 'holiday';
+
+export interface AcademicCalendarEventItem {
+  id: number;
+  title: string;
+  eventDate: string;
+  category: AcademicEventCategory;
+  department: string;
+  yearOfStudy: string;
+  description: string;
+  createdByName: string;
+  createdAt: string;
+}
+
+// ============================================================
+// Attendance Alerts, Low-Risk Watch, Session Overlaps & Archival
+// ============================================================
+export interface AttendanceRiskAlertItem {
+  id?: number;
+  rollNo: string;
+  studentName: string;
+  yearOfStudy: string;
+  section: string;
+  presentCount: number;
+  totalSessions: number;
+  cumulativeRate: number;
+  notifiedAt: string;
+  advisorNotified: boolean;
+}
+
+export interface FacultyAvailabilitySummaryItem {
+  employeeId: string;
+  fullName: string;
+  designation: string;
+  availableNow: boolean;
+  currentAssignment: string | null;
+  transitWindowMinutes: number;
+}
+
+export interface SessionOverlapWarning {
+  facultyName: string;
+  periodA: number;
+  roomA: string;
+  endTimeA: string;
+  periodB: number;
+  roomB: string;
+  startTimeB: string;
+  gapMinutes: number;
+  requiredTransitMinutes: number;
+  dayOfWeek: string;
+  yearOfStudy: string;
+  section: string;
+}
+
+export interface ArchivalRecordSummary {
+  id: number;
+  archiveDate: string;
+  storagePath: string;
+  attendanceCount: number;
+  studentsCount: number;
+  checksumSha256: string;
+  triggerType: 'scheduled' | 'manual';
+  status: 'completed' | 'failed';
+  createdAt: string;
+}
+

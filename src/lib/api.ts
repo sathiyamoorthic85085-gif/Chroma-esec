@@ -1,7 +1,13 @@
 import type {
+  AcademicCalendarEventItem,
+  AcademicEventCategory,
+  AcademicGoalPayload,
   ActivePowerBoostAlert,
+  ArchivalRecordSummary,
   AttendancePersonType,
   AttendanceRecordItem,
+  AttendanceRiskAlertItem,
+  BatchComparisonPayload,
   BootstrapStatus,
   CallParticipantInfo,
   ChatAttachmentPayload,
@@ -10,21 +16,32 @@ import type {
   CommunityCategory,
   CommunityItem,
   DeduplicateReport,
+  DepartmentalPerformancePayload,
   DepartmentStaff,
   DepartmentStudent,
   EmailIntimation,
+  FacultyDelayAlertItem,
+  LeaderboardAndBuddiesPayload,
   MonthlyAttendanceTrendsPayload,
+  OdLeaveFormConfig,
+  OdLeaveRequestItem,
+  OdLeaveRequestType,
   OtherDepartmentStaff,
   ParsedPreviewResponse,
+  PinnedLocationConfig,
   PowerBoostAcknowledgementItem,
   PowerBoostEngagementSummary,
   ServerTimePayload,
+  StudentAchievementsPayload,
+  StudentBiometricProfileSummary,
   TimetableSlot,
   UploadBatch,
   UploadModule,
   UserProfile,
   UserRole,
+  WeeklyAttendanceTrendsPayload,
 } from '../types';
+import { notifyExportSaved } from './exportNotify';
 
 export class ApiError extends Error {
   status: number;
@@ -91,6 +108,9 @@ export const api = {
       body: JSON.stringify(payload),
     }),
 
+  getPublicPinnedLocation: () =>
+    requestJson<{ pinnedLocation: PinnedLocationConfig }>('/api/auth/pinned-location'),
+
   register: (payload: {
     fullName: string;
     email: string;
@@ -101,6 +121,10 @@ export const api = {
     yearOfStudy: string;
     section: string;
     phone: string;
+    faceImageData?: string;
+    environmentImageData?: string;
+    latitude?: number | null;
+    longitude?: number | null;
   }) =>
     requestJson<{ user: UserProfile; message: string }>('/api/auth/register', {
       method: 'POST',
@@ -196,6 +220,60 @@ export const api = {
       token
     ),
 
+  saveTimetableSlot: (
+    token: string,
+    payload: {
+      department?: string;
+      yearOfStudy: string;
+      section: string;
+      dayOfWeek: string;
+      periodNumber: number;
+      startTime: string;
+      endTime: string;
+      subjectCode: string;
+      subjectName: string;
+      facultyName: string;
+      facultyType: 'department' | 'other_department';
+      roomNo: string;
+    }
+  ) =>
+    requestJson<{ slot: TimetableSlot }>(
+      '/api/records/timetable',
+      { method: 'POST', body: JSON.stringify(payload) },
+      token
+    ),
+
+  updateTimetableSlot: (
+    token: string,
+    id: number,
+    payload: {
+      department?: string;
+      yearOfStudy: string;
+      section: string;
+      dayOfWeek: string;
+      periodNumber: number;
+      startTime: string;
+      endTime: string;
+      subjectCode: string;
+      subjectName: string;
+      facultyName: string;
+      facultyType: 'department' | 'other_department';
+      roomNo: string;
+    }
+  ) =>
+    requestJson<{ slot: TimetableSlot }>(
+      `/api/records/timetable/${id}`,
+      { method: 'PUT', body: JSON.stringify(payload) },
+      token
+    ),
+
+  deleteTimetableSlot: (token: string, id: number) =>
+    requestJson<{ ok: boolean }>(
+      `/api/records/timetable/${id}`,
+      { method: 'DELETE' },
+      token
+    ),
+
   getUploadBatches: (token: string) =>
     requestJson<{ batches: UploadBatch[] }>('/api/records/batches', {}, token),
 
@@ -240,13 +318,15 @@ export const api = {
     }
     const blob = await res.blob();
     const url = URL.createObjectURL(blob);
+    const filename = `ChromaGrade_${module}_template.${format}`;
     const a = document.createElement('a');
     a.href = url;
-    a.download = `ChromaGrade_${module}_template.${format}`;
+    a.download = filename;
     document.body.appendChild(a);
     a.click();
     a.remove();
     URL.revokeObjectURL(url);
+    notifyExportSaved(filename, format.toUpperCase());
   },
 
   // WhatsApp-Style Communities & Messaging
@@ -495,6 +575,8 @@ export const api = {
       roomNo: string;
       faceImageData: string;
       environmentImageData: string;
+      latitude?: number | null;
+      longitude?: number | null;
     }
   ) =>
     requestJson<{
@@ -509,15 +591,111 @@ export const api = {
         summary: string;
       };
       record: AttendanceRecordItem;
+      sessionAlert?: {
+        subjectCode: string;
+        subjectName: string;
+        yearOfStudy: string;
+        section: string;
+        periodNumber: number;
+        presentCount: number;
+        expectedCount: number;
+        ratePct: number;
+      } | null;
+      lowAttendanceRisk?: {
+        rollNo: string;
+        studentName: string;
+        cumulativeRate: number;
+      } | null;
     }>(
       '/api/attendance/verify-and-mark',
       { method: 'POST', body: JSON.stringify(payload) },
       token
     ),
 
+  getPinnedLocation: (token: string) =>
+    requestJson<{ pinnedLocation: PinnedLocationConfig }>(
+      '/api/attendance/pinned-location',
+      {},
+      token
+    ),
+
+  updatePinnedLocation: (
+    token: string,
+    payload: {
+      label: string;
+      latitude: number;
+      longitude: number;
+      radiusMeters: number;
+    }
+  ) =>
+    requestJson<{ pinnedLocation: PinnedLocationConfig }>(
+      '/api/attendance/pinned-location',
+      { method: 'PATCH', body: JSON.stringify(payload) },
+      token
+    ),
+
+  getBiometricProfiles: (token: string) =>
+    requestJson<{ profiles: StudentBiometricProfileSummary[] }>(
+      '/api/attendance/biometric-profiles',
+      {},
+      token
+    ),
+
+  getWeeklyAttendanceTrends: (
+    token: string,
+    params?: { weeks?: number; personType?: AttendancePersonType }
+  ) => {
+    const qs = new URLSearchParams();
+    if (params?.weeks) qs.set('weeks', String(params.weeks));
+    if (params?.personType) qs.set('personType', params.personType);
+    const suffix = qs.toString() ? `?${qs.toString()}` : '';
+    return requestJson<WeeklyAttendanceTrendsPayload>(
+      `/api/attendance/weekly-trends${suffix}`,
+      {},
+      token
+    );
+  },
+
+  // Faculty Delay Alerts
+  getFacultyDelays: (token: string) =>
+    requestJson<{ alerts: FacultyDelayAlertItem[] }>('/api/faculty-delays', {}, token),
+
+  reportFacultyDelay: (
+    token: string,
+    payload: {
+      timetableSlotId?: number | null;
+      yearOfStudy?: string;
+      section?: string;
+      dayOfWeek?: string;
+      periodNumber?: number;
+      subjectCode?: string;
+      subjectName?: string;
+      roomNo?: string;
+      facultyName: string;
+      delayMinutes: number;
+      note?: string;
+    }
+  ) =>
+    requestJson<{ alert: FacultyDelayAlertItem }>(
+      '/api/faculty-delays',
+      { method: 'POST', body: JSON.stringify(payload) },
+      token
+    ),
+
+  updateFacultyDelayStatus: (
+    token: string,
+    id: number,
+    status: 'acknowledged' | 'resolved'
+  ) =>
+    requestJson<{ alert: FacultyDelayAlertItem }>(
+      `/api/faculty-delays/${id}`,
+      { method: 'PATCH', body: JSON.stringify({ status }) },
+      token
+    ),
+
   exportAttendance: async (
     token: string,
-    format: 'csv' | 'pdf',
+    format: 'csv' | 'pdf' | 'xlsx',
     params?: {
       date?: string;
       month?: string;
@@ -548,18 +726,24 @@ export const api = {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     const scopeSlug = params?.personType || 'all';
+    let downloadName: string;
     if (params?.scope === 'month') {
       const monthSlug = params?.month || new Date().toISOString().slice(0, 7);
-      a.download = `ChromaGrade_Monthly_Summary_${monthSlug}_${scopeSlug}.${format}`;
+      downloadName = `ChromaGrade_Monthly_Summary_${monthSlug}_${scopeSlug}.${format}`;
     } else {
       const dateSlug = params?.scope === 'all_dates' ? 'all_dates' : params?.date || 'today';
-      a.download = `ChromaGrade_Attendance_${dateSlug}_${scopeSlug}.${format}`;
+      downloadName = `ChromaGrade_Attendance_${dateSlug}_${scopeSlug}.${format}`;
     }
+    a.download = downloadName;
     a.href = url;
     document.body.appendChild(a);
     a.click();
     a.remove();
     URL.revokeObjectURL(url);
+    notifyExportSaved(
+      downloadName,
+      format === 'xlsx' ? 'Excel (.xlsx)' : format.toUpperCase()
+    );
   },
 
   getMonthlyAttendanceTrends: (
@@ -576,4 +760,251 @@ export const api = {
       token
     );
   },
+
+  // OD & Leave Permission Workflow + HOD Form Customization
+  getOdLeaveRequests: (token: string) =>
+    requestJson<{
+      requests: OdLeaveRequestItem[];
+      config: OdLeaveFormConfig;
+      activeToday: OdLeaveRequestItem[];
+      serverDate: string;
+    }>('/api/od-leave/requests', {}, token),
+
+  getOdLeaveFormConfig: (token: string) =>
+    requestJson<{ config: OdLeaveFormConfig }>('/api/od-leave/form-config', {}, token),
+
+  updateOdLeaveFormConfig: (
+    token: string,
+    payload: Omit<OdLeaveFormConfig, 'updatedBy' | 'updatedAt'>
+  ) =>
+    requestJson<{ config: OdLeaveFormConfig }>(
+      '/api/od-leave/form-config',
+      { method: 'PUT', body: JSON.stringify(payload) },
+      token
+    ),
+
+  uploadOdLeaveAttachment: async (
+    token: string,
+    file: File,
+    kind: 'document' | 'photo'
+  ): Promise<{ fileKey: string; fileName: string; mimeType: string; fileSize: number }> => {
+    const fd = new FormData();
+    fd.append('file', file);
+    fd.append('kind', kind);
+    const res = await fetch('/api/od-leave/attachments', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+      body: fd,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new ApiError(data?.error || 'Upload failed.', res.status);
+    }
+    return data as { fileKey: string; fileName: string; mimeType: string; fileSize: number };
+  },
+
+  fetchOdLeaveAttachmentBlobUrl: async (token: string, fileKey: string, fileName?: string) => {
+    const qs = fileName ? `?name=${encodeURIComponent(fileName)}` : '';
+    const res = await fetch(`/api/od-leave/attachments/${encodeURIComponent(fileKey)}${qs}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) throw new Error('Unable to load attachment.');
+    const blob = await res.blob();
+    return URL.createObjectURL(blob);
+  },
+
+  downloadOdLeaveAttachment: async (token: string, fileKey: string, fileName: string) => {
+    const qs = `?name=${encodeURIComponent(fileName)}&download=1`;
+    const res = await fetch(`/api/od-leave/attachments/${encodeURIComponent(fileKey)}${qs}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) throw new Error('Unable to download attachment.');
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = fileName || 'attachment';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  },
+
+  submitOdLeaveRequest: (
+    token: string,
+    payload: {
+      requestType: OdLeaveRequestType;
+      applicantName: string;
+      rollOrEmployeeId: string;
+      mobileNumber: string;
+      yearOfStudy: string;
+      section: string;
+      fromDate: string;
+      toDate: string;
+      reason: string;
+      customFields: Record<string, string>;
+      documentFileKey: string;
+      documentFileName: string;
+      documentMimeType: string;
+      photoFileKey: string;
+      photoFileName: string;
+      photoMimeType: string;
+    }
+  ) =>
+    requestJson<{ request: OdLeaveRequestItem }>(
+      '/api/od-leave/requests',
+      { method: 'POST', body: JSON.stringify(payload) },
+      token
+    ),
+
+  decideOdLeaveRequest: (
+    token: string,
+    id: number,
+    payload: { decision: 'approve' | 'reject'; remarks: string }
+  ) =>
+    requestJson<{ request: OdLeaveRequestItem }>(
+      `/api/od-leave/requests/${id}/decision`,
+      { method: 'PATCH', body: JSON.stringify(payload) },
+      token
+    ),
+
+  // Departmental Performance (Avg Attendance vs Academic Engagement across Student Batches)
+  getDepartmentalPerformance: (token: string, groupBy: 'year' | 'section' = 'year') =>
+    requestJson<DepartmentalPerformancePayload>(
+      `/api/analytics/departmental-performance?groupBy=${encodeURIComponent(groupBy)}`,
+      {},
+      token
+    ),
+
+  // Profile Settings (Transit Buffer)
+  updateProfileSettings: (token: string, payload: { transitBufferMinutes: number }) =>
+    requestJson<{ user: UserProfile }>(
+      '/api/auth/profile-settings',
+      { method: 'PATCH', body: JSON.stringify(payload) },
+      token
+    ),
+
+  // Student Achievements & Batch Filter
+  getStudentAchievements: (token: string, batch = 'all') =>
+    requestJson<StudentAchievementsPayload>(
+      `/api/analytics/student-achievements?batch=${encodeURIComponent(batch)}`,
+      {},
+      token
+    ),
+
+  // Batch Comparison Radar, Predictive Risk, 2-Week Projection & Bulk PDF Export
+  getBatchComparison: (token: string, batchA?: string, batchB?: string) => {
+    const qs = new URLSearchParams();
+    if (batchA) qs.set('batchA', batchA);
+    if (batchB) qs.set('batchB', batchB);
+    const suffix = qs.toString() ? `?${qs.toString()}` : '';
+    return requestJson<BatchComparisonPayload>(
+      `/api/analytics/batch-comparison${suffix}`,
+      {},
+      token
+    );
+  },
+
+  exportBatchComparisonPdf: async (token: string, batchA?: string, batchB?: string) => {
+    const qs = new URLSearchParams();
+    if (batchA) qs.set('batchA', batchA);
+    if (batchB) qs.set('batchB', batchB);
+    const suffix = qs.toString() ? `?${qs.toString()}` : '';
+    const res = await fetch(`/api/analytics/batch-comparison/export-pdf${suffix}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) {
+      throw new Error('Could not export batch comparison PDF report.');
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const slugA = (batchA || 'Batch_A').replace(/[^a-z0-9]+/gi, '_');
+    const slugB = (batchB || 'Batch_B').replace(/[^a-z0-9]+/gi, '_');
+    const filename = `ChromaGrade_Batch_Comparison_${slugA}_vs_${slugB}.pdf`;
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    notifyExportSaved(filename, 'PDF');
+  },
+
+  // Top Performers Leaderboard & Study Buddy Pairing
+  getLeaderboardAndBuddies: (token: string) =>
+    requestJson<LeaderboardAndBuddiesPayload>('/api/analytics/leaderboard-buddies', {}, token),
+
+  // Academic Goal Tracker & Daily Nudge
+  getMyAcademicGoal: (token: string) =>
+    requestJson<{ goal: AcademicGoalPayload }>('/api/goals/me', {}, token),
+
+  saveMyAcademicGoal: (
+    token: string,
+    payload: { weeklyAttendanceTarget: number; weeklyEngagementTarget: number; note?: string }
+  ) =>
+    requestJson<{ goal: AcademicGoalPayload }>(
+      '/api/goals/me',
+      { method: 'PUT', body: JSON.stringify(payload) },
+      token
+    ),
+
+  checkInAcademicGoal: (token: string, note?: string) =>
+    requestJson<{ goal: AcademicGoalPayload }>(
+      '/api/goals/me/checkin',
+      { method: 'POST', body: JSON.stringify({ note }) },
+      token
+    ),
+
+  triggerGoalDailyNudgeCheck: (token: string) =>
+    requestJson<{ nudgedCount: number; isoDate: string }>(
+      '/api/goals/nudge-check',
+      { method: 'POST' },
+      token
+    ),
+
+  // Academic Calendar
+  getAcademicCalendar: (token: string) =>
+    requestJson<{ events: AcademicCalendarEventItem[] }>('/api/academic-calendar', {}, token),
+
+  createAcademicCalendarEvent: (
+    token: string,
+    payload: {
+      title: string;
+      eventDate: string;
+      category: AcademicEventCategory;
+      yearOfStudy: string;
+      description: string;
+    }
+  ) =>
+    requestJson<{ event: AcademicCalendarEventItem }>(
+      '/api/academic-calendar',
+      { method: 'POST', body: JSON.stringify(payload) },
+      token
+    ),
+
+  deleteAcademicCalendarEvent: (token: string, id: number) =>
+    requestJson<{ ok: boolean }>(`/api/academic-calendar/${id}`, { method: 'DELETE' }, token),
+
+  // Low Attendance Risk Watch & Alerts
+  getAttendanceAlertsAndRisk: (token: string) =>
+    requestJson<{ lowRiskStudents: AttendanceRiskAlertItem[]; serverDate: string }>(
+      '/api/attendance/alerts-and-risk',
+      {},
+      token
+    ),
+
+  notifyLowRiskStudents: (token: string) =>
+    requestJson<{ notifiedCount: number; lowRiskStudents: AttendanceRiskAlertItem[] }>(
+      '/api/attendance/notify-low-risk',
+      { method: 'POST' },
+      token
+    ),
+
+  // Automated Daily Archival
+  getArchivalLogs: (token: string) =>
+    requestJson<{ logs: ArchivalRecordSummary[] }>('/api/hod/archival', {}, token),
+
+  triggerManualArchival: (token: string) =>
+    requestJson<{ record: ArchivalRecordSummary }>('/api/hod/archival', { method: 'POST' }, token),
 };

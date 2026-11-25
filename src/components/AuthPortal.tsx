@@ -1,11 +1,24 @@
-import { type FormEvent, useEffect, useState } from 'react';
+import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { signInWithPopup } from 'firebase/auth';
-import { CheckCircle2, Clock, Mail, ShieldCheck, UserPlus } from 'lucide-react';
+import {
+  Building,
+  Camera,
+  CheckCircle2,
+  Clock,
+  Mail,
+  MapPin,
+  Navigation,
+  RotateCcw,
+  ShieldCheck,
+  User,
+  UserPlus,
+} from 'lucide-react';
 import { ApiError, api } from '../lib/api';
 import { auth, googleAuthProvider } from '../lib/firebase';
 import {
   ROLE_LABELS,
   type BootstrapStatus,
+  type PinnedLocationConfig,
   type ServerTimePayload,
   type UserProfile,
   type UserRole,
@@ -14,7 +27,23 @@ import { ChromaGradeMark } from './ChromaGradeMark';
 import { OfflineIndicator } from './OfflineIndicator';
 import { PWAInstallButton } from './PWAInstallButton';
 
+function haversineMeters(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  const R = 6371000;
+  const toRad = (deg: number) => (deg * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(lat1)) *
+      Math.cos(toRad(lat2)) *
+      Math.sin(dLon / 2) *
+      Math.sin(dLon / 2);
+  return Math.round(R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
+}
+
 const CAMPUS_IMAGE_URL = '/src/assets/images/chromagrade_campus_atrium_1795283295260.jpg';
+const HERO_VIDEO_URL =
+  '/assets/aistudio/Website_hero_motion_background_a__5bdc99cd_1080p_4e59c4d7.mp4';
 
 interface AuthPortalProps {
   serverTime: ServerTimePayload | null;
@@ -31,6 +60,7 @@ export function AuthPortal({
 }: AuthPortalProps) {
   const [bootstrap, setBootstrap] = useState<BootstrapStatus | null>(null);
   const [mode, setMode] = useState<AuthMode>('login');
+  const [videoError, setVideoError] = useState(false);
   const [imageError, setImageError] = useState(false);
 
   // Login form state
@@ -54,6 +84,21 @@ export function AuthPortal({
   const [regSection, setRegSection] = useState('A');
   const [regPhone, setRegPhone] = useState('');
 
+  // Student Registration Biometric & HOD-Pinned Classroom Environment state
+  const [pinnedLocation, setPinnedLocation] = useState<PinnedLocationConfig | null>(null);
+  const [regFaceImage, setRegFaceImage] = useState<string | null>(null);
+  const [regEnvImage, setRegEnvImage] = useState<string | null>(null);
+  const [regCoords, setRegCoords] = useState<{ lat: number; lng: number; accuracy: number } | null>(
+    null
+  );
+  const [regGpsLoading, setRegGpsLoading] = useState(false);
+  const [regGpsError, setRegGpsError] = useState<string | null>(null);
+  const regVideoRef = useRef<HTMLVideoElement | null>(null);
+  const regStreamRef = useRef<MediaStream | null>(null);
+  const [regCameraActive, setRegCameraActive] = useState(false);
+  const [regFacingMode, setRegFacingMode] = useState<'user' | 'environment'>('user');
+  const [regCameraError, setRegCameraError] = useState<string | null>(null);
+
   // Status check state
   const [statusEmail, setStatusEmail] = useState('');
   const [statusResult, setStatusResult] = useState<Awaited<
@@ -63,6 +108,27 @@ export function AuthPortal({
   const [submitting, setSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
+
+  const stopRegCamera = useCallback(() => {
+    if (regStreamRef.current) {
+      regStreamRef.current.getTracks().forEach((t) => t.stop());
+      regStreamRef.current = null;
+    }
+    if (regVideoRef.current) {
+      regVideoRef.current.srcObject = null;
+    }
+    setRegCameraActive(false);
+  }, []);
+
+  useEffect(() => {
+    return () => stopRegCamera();
+  }, [stopRegCamera]);
+
+  useEffect(() => {
+    if (mode !== 'register') {
+      stopRegCamera();
+    }
+  }, [mode, stopRegCamera]);
 
   useEffect(() => {
     api
@@ -78,10 +144,128 @@ export function AuthPortal({
       .catch(() => {
         // Handled cleanly
       });
+
+    api
+      .getPublicPinnedLocation()
+      .then((res) => setPinnedLocation(res.pinnedLocation))
+      .catch(() => {
+        // Handled cleanly
+      });
   }, []);
 
-  const needsClassFields =
-    regRole === 'student' || regRole === 'class_rep' || regRole === 'class_advisor';
+  const isStudentRegistration = regRole === 'student' || regRole === 'class_rep';
+  const needsClassFields = isStudentRegistration || regRole === 'class_advisor';
+
+  const regDistanceMeters = useMemo(() => {
+    if (
+      !regCoords ||
+      !pinnedLocation?.configured ||
+      pinnedLocation.latitude === null ||
+      pinnedLocation.longitude === null
+    ) {
+      return null;
+    }
+    return haversineMeters(
+      regCoords.lat,
+      regCoords.lng,
+      pinnedLocation.latitude,
+      pinnedLocation.longitude
+    );
+  }, [regCoords, pinnedLocation]);
+
+  const regInsidePinnedZone = useMemo(() => {
+    if (!pinnedLocation?.configured) return true;
+    if (regDistanceMeters === null) return false;
+    return regDistanceMeters <= pinnedLocation.radiusMeters;
+  }, [pinnedLocation, regDistanceMeters]);
+
+  const handleVerifyRegGps = () => {
+    if (typeof navigator === 'undefined' || !navigator.geolocation) {
+      setRegGpsError('Geolocation is not supported in this browser.');
+      return;
+    }
+    setRegGpsLoading(true);
+    setRegGpsError(null);
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        setRegCoords({
+          lat: Number(pos.coords.latitude.toFixed(6)),
+          lng: Number(pos.coords.longitude.toFixed(6)),
+          accuracy: Math.round(pos.coords.accuracy || 0),
+        });
+        setRegGpsLoading(false);
+      },
+      (err) => {
+        setRegGpsError(
+          err.message ||
+            'Location permission denied. Enable GPS inside the HOD-pinned classroom to register.'
+        );
+        setRegGpsLoading(false);
+      },
+      { enableHighAccuracy: true, timeout: 12000, maximumAge: 15000 }
+    );
+  };
+
+  const startRegCamera = async (desired: 'user' | 'environment' = regFacingMode) => {
+    setRegCameraError(null);
+    stopRegCamera();
+    try {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error('Live camera is not supported in this browser.');
+      }
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: { ideal: desired },
+          width: { ideal: 640 },
+          height: { ideal: 480 },
+        },
+        audio: false,
+      });
+      regStreamRef.current = stream;
+      setRegFacingMode(desired);
+      setRegCameraActive(true);
+      requestAnimationFrame(() => {
+        if (regVideoRef.current) {
+          regVideoRef.current.srcObject = stream;
+          regVideoRef.current.play().catch(() => {});
+        }
+      });
+    } catch (err) {
+      setRegCameraError(
+        err instanceof Error
+          ? err.message
+          : 'Camera permission denied. Allow camera access to register your face and classroom.'
+      );
+    }
+  };
+
+  const captureRegPhoto = (kind: 'face' | 'environment') => {
+    const video = regVideoRef.current;
+    if (!video || video.videoWidth === 0) {
+      setRegCameraError('Wait for the live camera stream to start before capturing.');
+      return;
+    }
+    if (kind === 'environment' && pinnedLocation?.configured && !regInsidePinnedZone) {
+      setRegCameraError(
+        `Verify your GPS inside the HOD-pinned classroom "${pinnedLocation.label}" (${pinnedLocation.radiusMeters}m radius) before capturing the classroom environment photo.`
+      );
+      return;
+    }
+    const canvas = document.createElement('canvas');
+    const scale = Math.min(1, 560 / video.videoWidth);
+    canvas.width = Math.round(video.videoWidth * scale);
+    canvas.height = Math.round(video.videoHeight * scale);
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const dataUrl = canvas.toDataURL('image/jpeg', 0.78);
+    if (kind === 'face') {
+      setRegFaceImage(dataUrl);
+    } else {
+      setRegEnvImage(dataUrl);
+    }
+    setRegCameraError(null);
+  };
 
   const handleGoogleSignIn = async () => {
     setErrorMsg(null);
@@ -146,6 +330,22 @@ export function AuthPortal({
     e.preventDefault();
     setErrorMsg(null);
     setSuccessMsg(null);
+
+    if (isStudentRegistration) {
+      if (!regFaceImage || !regEnvImage) {
+        setErrorMsg(
+          'Capture both (1) Live Face Photo and (2) Classroom Environment Photo before submitting student registration.'
+        );
+        return;
+      }
+      if (pinnedLocation?.configured && !regInsidePinnedZone) {
+        setErrorMsg(
+          `Verify your GPS inside the HOD-pinned classroom location "${pinnedLocation.label}" (within ${pinnedLocation.radiusMeters}m) before registering.`
+        );
+        return;
+      }
+    }
+
     setSubmitting(true);
     try {
       const res = await api.register({
@@ -158,6 +358,10 @@ export function AuthPortal({
         yearOfStudy: needsClassFields ? regYear : '',
         section: needsClassFields ? regSection : '',
         phone: regPhone,
+        faceImageData: isStudentRegistration ? regFaceImage ?? undefined : undefined,
+        environmentImageData: isStudentRegistration ? regEnvImage ?? undefined : undefined,
+        latitude: isStudentRegistration ? regCoords?.lat ?? null : null,
+        longitude: isStudentRegistration ? regCoords?.lng ?? null : null,
       });
       setSuccessMsg(res.message);
       setStatusEmail(regEmail);
@@ -166,6 +370,9 @@ export function AuthPortal({
       setRegPassword('');
       setRegId('');
       setRegPhone('');
+      setRegFaceImage(null);
+      setRegEnvImage(null);
+      stopRegCamera();
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Registration failed.');
     } finally {
@@ -194,14 +401,29 @@ export function AuthPortal({
     <div className="min-h-screen bg-slate-50 grid grid-cols-1 lg:grid-cols-12 items-stretch">
       {/* Left architectural showcase panel */}
       <aside className="relative lg:col-span-5 bg-slate-900 text-white flex flex-col justify-between p-8 lg:p-12 overflow-hidden min-h-[280px]">
-        {!imageError && (
-          <img
-            src={CAMPUS_IMAGE_URL}
-            alt="Modern engineering department sunlit atrium"
-            referrerPolicy="no-referrer"
-            onError={() => setImageError(true)}
+        {!videoError ? (
+          <video
+            autoPlay
+            loop
+            muted
+            playsInline
+            poster={CAMPUS_IMAGE_URL}
+            onError={() => setVideoError(true)}
+            aria-label="ChromaGrade campus motion background"
             className="absolute inset-0 w-full h-full object-cover opacity-55"
-          />
+          >
+            <source src={HERO_VIDEO_URL} type="video/mp4" />
+          </video>
+        ) : (
+          !imageError && (
+            <img
+              src={CAMPUS_IMAGE_URL}
+              alt="Modern engineering department sunlit atrium"
+              referrerPolicy="no-referrer"
+              onError={() => setImageError(true)}
+              className="absolute inset-0 w-full h-full object-cover opacity-55"
+            />
+          )
         )}
         <div
           className="absolute inset-0 bg-gradient-to-t from-slate-950/95 via-slate-900/75 to-slate-950/60"
@@ -686,6 +908,188 @@ export function AuthPortal({
                   className="w-full px-3.5 py-2.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-600/20 focus:border-indigo-600"
                 />
               </div>
+
+              {/* Mandatory Student Face & HOD-Pinned Classroom Environment Registration */}
+              {isStudentRegistration && (
+                <div className="border border-slate-200 rounded-xl p-4 bg-slate-50/70 space-y-3.5">
+                  <div className="flex flex-wrap items-start justify-between gap-2">
+                    <div>
+                      <div className="text-xs font-semibold text-slate-900">
+                        Face & Classroom Environment Registration (Required)
+                      </div>
+                      <p className="text-[11px] text-slate-600 mt-0.5">
+                        Register your live face and classroom photo at the HOD-pinned campus location for daily dual-camera attendance verification.
+                      </p>
+                    </div>
+                  </div>
+
+                  {/* HOD-Pinned Location Geofence Check */}
+                  <div className="bg-white border border-slate-200 rounded-lg p-3 space-y-2">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex items-center gap-1.5 text-xs font-medium text-slate-800">
+                        <MapPin className="w-3.5 h-3.5 text-indigo-700 shrink-0" />
+                        <span>
+                          {pinnedLocation?.configured
+                            ? `HOD Pinned Classroom: ${pinnedLocation.label} (${pinnedLocation.radiusMeters}m radius)`
+                            : 'Classroom GPS Location Check'}
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        disabled={regGpsLoading}
+                        onClick={handleVerifyRegGps}
+                        className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-[11px] font-semibold text-indigo-800 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 rounded-md whitespace-nowrap"
+                      >
+                        <Navigation className="w-3 h-3" />
+                        {regGpsLoading ? 'Verifying GPS...' : 'Verify My Classroom GPS'}
+                      </button>
+                    </div>
+
+                    {regGpsError && (
+                      <div className="text-[11px] text-rose-700">{regGpsError}</div>
+                    )}
+
+                    {regCoords && (
+                      <div
+                        className={`text-[11px] font-medium ${
+                          regInsidePinnedZone ? 'text-emerald-700' : 'text-rose-700'
+                        }`}
+                      >
+                        {pinnedLocation?.configured
+                          ? regInsidePinnedZone
+                            ? `Verified inside HOD-pinned classroom (${regDistanceMeters}m away · limit ${pinnedLocation.radiusMeters}m)`
+                            : `Outside HOD-pinned classroom (${regDistanceMeters}m away · move within ${pinnedLocation.radiusMeters}m to capture environment photo)`
+                          : `GPS locked (${regCoords.lat}, ${regCoords.lng} · ±${regCoords.accuracy}m)`}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Live Camera Feed & 2 Capture Controls */}
+                  <div className="space-y-2.5">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="text-[11px] font-medium text-slate-700">
+                        Live Camera Capture (No gallery uploads)
+                      </span>
+                      <div className="flex items-center gap-1.5">
+                        {!regCameraActive ? (
+                          <button
+                            type="button"
+                            onClick={() => startRegCamera('user')}
+                            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-indigo-700 hover:bg-indigo-800 rounded-md"
+                          >
+                            <Camera className="w-3.5 h-3.5" />
+                            Start Camera
+                          </button>
+                        ) : (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                startRegCamera(regFacingMode === 'user' ? 'environment' : 'user')
+                              }
+                              className="inline-flex items-center gap-1 px-2.5 py-1.5 text-[11px] font-medium text-slate-700 bg-white border border-slate-300 hover:bg-slate-50 rounded-md"
+                            >
+                              <RotateCcw className="w-3 h-3" />
+                              {regFacingMode === 'user' ? 'Rear Lens' : 'Front Lens'}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={stopRegCamera}
+                              className="px-2.5 py-1.5 text-[11px] font-medium text-slate-600 bg-white border border-slate-300 hover:bg-slate-50 rounded-md"
+                            >
+                              Stop
+                            </button>
+                          </>
+                        )}
+                      </div>
+                    </div>
+
+                    {regCameraActive && (
+                      <div className="relative aspect-video bg-slate-900 rounded-lg overflow-hidden border border-slate-200">
+                        <video
+                          ref={regVideoRef}
+                          autoPlay
+                          playsInline
+                          muted
+                          className="w-full h-full object-cover"
+                        />
+                      </div>
+                    )}
+
+                    {regCameraError && (
+                      <div className="text-[11px] text-rose-700 bg-rose-50 border border-rose-200 rounded-md px-2.5 py-2">
+                        {regCameraError}
+                      </div>
+                    )}
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                      <button
+                        type="button"
+                        disabled={!regCameraActive}
+                        onClick={() => captureRegPhoto('face')}
+                        className="inline-flex items-center justify-center gap-1.5 px-3 py-2 text-xs font-medium text-white bg-slate-900 hover:bg-slate-800 disabled:opacity-45 rounded-lg"
+                      >
+                        <User className="w-3.5 h-3.5" />
+                        {regFaceImage ? 'Retake 1. Face Photo' : '1. Capture Face Photo'}
+                      </button>
+                      <button
+                        type="button"
+                        disabled={
+                          !regCameraActive ||
+                          Boolean(pinnedLocation?.configured && !regInsidePinnedZone)
+                        }
+                        onClick={() => captureRegPhoto('environment')}
+                        className="inline-flex items-center justify-center gap-1.5 px-3 py-2 text-xs font-medium text-white bg-slate-900 hover:bg-slate-800 disabled:opacity-45 rounded-lg"
+                      >
+                        <Building className="w-3.5 h-3.5" />
+                        {regEnvImage
+                          ? 'Retake 2. Class Environment'
+                          : '2. Capture Class Environment'}
+                      </button>
+                    </div>
+
+                    {/* Captured Previews */}
+                    <div className="grid grid-cols-2 gap-2.5">
+                      <div className="space-y-1">
+                        <div className="text-[11px] font-medium text-slate-600">
+                          1. Registered Face {regFaceImage ? '· Ready' : '· Required'}
+                        </div>
+                        <div className="aspect-[4/3] rounded-md border border-slate-200 bg-white overflow-hidden flex items-center justify-center">
+                          {regFaceImage ? (
+                            <img
+                              src={regFaceImage}
+                              alt="Registered student face"
+                              className="w-full h-full object-cover"
+                            />
+                          ) : (
+                            <span className="text-[10px] text-slate-400 px-2 text-center">
+                              Capture face photo
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                      <div className="space-y-1">
+                        <div className="text-[11px] font-medium text-slate-600">
+                          2. Classroom Env {regEnvImage ? '· Ready' : '· Required'}
+                        </div>
+                        <div className="aspect-[4/3] rounded-md border border-slate-200 bg-white overflow-hidden flex items-center justify-center">
+                          {regEnvImage ? (
+                            <img
+                              src={regEnvImage}
+                              alt="Registered classroom environment"
+                              className="w-full h-full object-cover"
+                            />
+                          ) : (
+                            <span className="text-[10px] text-slate-400 px-2 text-center">
+                              Capture at HOD pinned location
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
 
               <div className="pt-2 flex flex-wrap items-center justify-between gap-3">
                 <button

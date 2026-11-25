@@ -10,9 +10,13 @@ import { createServer as createViteServer } from 'vite';
 import {
   buildAttendanceCsvBuffer,
   buildAttendancePdfBuffer,
+  buildAttendanceXlsxBuffer,
+  buildBatchComparisonPdfBuffer,
   buildMonthlySummaryCsvBuffer,
   buildMonthlySummaryPdfBuffer,
+  buildMonthlySummaryXlsxBuffer,
 } from './server/attendanceExporter.ts';
+import { runDailyDepartmentArchival, startDailyArchivalScheduler } from './server/archivalService.ts';
 import { verifyDualCameraAttendance } from './server/attendanceVision.ts';
 import {
   buildCsvTemplateBuffer,
@@ -26,41 +30,76 @@ import { wsHub } from './server/wsHub.ts';
 import { db } from './src/db/index.ts';
 import {
   acknowledgePowerBoostMessage,
+  calculateDistanceMeters,
   canUserCreateCommunity,
   canUserManageCommunity,
+  checkInAcademicGoalToday,
   commitDocumentRowsToDb,
+  createAcademicCalendarEvent,
   createChatMessageInDb,
   createCommunityInDb,
+  createFacultyDelayAlert,
+  createOdLeaveRequest,
   createSession,
+  decideOdLeaveRequest,
+  deleteAcademicCalendarEvent,
   deleteSession,
+  deleteTimetableSlot,
   ensureBaselineData,
+  enumerateDateRangeInclusive,
+  evaluateSessionAttendanceStatus,
   findUserByEmail,
   findUserById,
   generateSessionToken,
+  getAcademicGoalForUser,
+  getBatchComparisonAnalytics,
+  getDepartmentalPerformanceSummary,
   getHodCount,
+  getLowAttendanceRiskStudents,
+  getOdLeaveFormConfig,
+  getOdLeaveRequestById,
+  getPinnedLocationConfig,
   getPowerBoostEngagementSummary,
   getSetting,
+  getStudentAchievements,
+  getStudentBiometricProfile,
+  getTopPerformersAndStudyBuddies,
   hashPassword,
+  listAcademicCalendarEvents,
+  listActiveApprovedOdLeaveForDate,
   listActivePowerBoostAlertsForUser,
+  listArchivalLogs,
   listAttendanceRecords,
   listAttendanceSummaryForMonth,
   listCommunitiesForUser,
   listDepartmentStaff,
   listDepartmentStudents,
   listEmailIntimations,
+  listFacultyDelayAlertsForUser,
   listGroupMessages,
+  listOdLeaveRequestsForUser,
   listOtherDepartmentStaff,
   listRegistrations,
+  listStudentBiometricSummaries,
+  listStudentUserIdsNeedingGoalNudge,
   listTimetableSlots,
   listUploadBatches,
   mapChatMessageRow,
   mapUser,
+  recordAttendanceRiskAlertIfNeeded,
   runDeduplicationSweep,
+  saveOdLeaveFormConfig,
+  savePinnedLocationConfig,
+  saveTimetableSlot,
   setSetting,
   stopPowerBoostMessage,
   syncFirebaseUserToDb,
   updateCommunityInDb,
+  updateFacultyDelayAlertStatus,
+  updateUserTransitBuffer,
+  upsertAcademicGoalForUser,
   upsertAttendanceRecord,
+  upsertStudentBiometricProfile,
   upsertStudentFromRegistration,
   verifyPassword,
 } from './src/db/repository.ts';
@@ -82,6 +121,7 @@ import {
   requireRoles,
 } from './src/middleware/auth.ts';
 import type {
+  AcademicEventCategory,
   AttendancePersonType,
   ChatAttachmentPayload,
   ChatAttachmentType,
@@ -101,7 +141,28 @@ const upload = multer({
 const CHAT_UPLOADS_DIR = path.resolve(process.cwd(), 'uploads', 'chat');
 fs.mkdirSync(CHAT_UPLOADS_DIR, { recursive: true });
 
+const OD_LEAVE_UPLOADS_DIR = path.resolve(process.cwd(), 'uploads', 'od-leave');
+fs.mkdirSync(OD_LEAVE_UPLOADS_DIR, { recursive: true });
+
 const POWER_BOOST_ROLES: UserRole[] = ['hod', 'class_advisor', 'class_rep'];
+
+const ALLOWED_OD_DOC_EXTENSIONS = new Set([
+  '.pdf',
+  '.doc',
+  '.docx',
+  '.png',
+  '.jpg',
+  '.jpeg',
+  '.webp',
+  '.txt',
+]);
+
+const ALLOWED_OD_PHOTO_EXTENSIONS = new Set([
+  '.png',
+  '.jpg',
+  '.jpeg',
+  '.webp',
+]);
 
 const ALLOWED_CHAT_EXTENSIONS = new Set([
   '.pdf',
@@ -339,6 +400,15 @@ app.post('/api/auth/bootstrap-hod', async (req, res) => {
   }
 });
 
+app.get('/api/auth/pinned-location', async (_req, res) => {
+  try {
+    const config = await getPinnedLocationConfig();
+    res.json({ pinnedLocation: config });
+  } catch (error) {
+    res.status(500).json({ error: error instanceof Error ? error.message : 'Unable to fetch pinned classroom location.' });
+  }
+});
+
 app.post('/api/auth/register', async (req, res) => {
   try {
     await ensureBaselineData();
@@ -353,6 +423,22 @@ app.post('/api/auth/register', async (req, res) => {
     const yearOfStudy = String(req.body?.yearOfStudy ?? '').trim();
     const section = String(req.body?.section ?? '').trim().toUpperCase();
     const phone = String(req.body?.phone ?? '').trim();
+
+    const faceImageData = String(req.body?.faceImageData ?? '').trim();
+    const environmentImageData = String(req.body?.environmentImageData ?? '').trim();
+    const rawLat = req.body?.latitude;
+    const rawLng = req.body?.longitude;
+    const hasCoords =
+      rawLat !== undefined &&
+      rawLat !== null &&
+      rawLat !== '' &&
+      rawLng !== undefined &&
+      rawLng !== null &&
+      rawLng !== '' &&
+      Number.isFinite(Number(rawLat)) &&
+      Number.isFinite(Number(rawLng));
+    const latitude = hasCoords ? Number(rawLat) : null;
+    const longitude = hasCoords ? Number(rawLng) : null;
 
     const allowedRoles: UserRole[] = [
       'class_advisor',
@@ -375,6 +461,49 @@ app.post('/api/auth/register', async (req, res) => {
     if (!staffOrRollId) {
       res.status(400).json({ error: 'Employee ID or Student Roll Number is required.' });
       return;
+    }
+
+    const isStudentRole = role === 'student' || role === 'class_rep';
+    const pinnedLocation = await getPinnedLocationConfig();
+    let distanceMeters: number | null = null;
+    let locationVerified = false;
+
+    if (isStudentRole) {
+      if (!faceImageData || !environmentImageData) {
+        res.status(400).json({
+          error:
+            'Students and Class Representatives must capture both (1) Live Face Photo and (2) Classroom Environment Photo during registration.',
+        });
+        return;
+      }
+
+      if (
+        pinnedLocation.configured &&
+        pinnedLocation.latitude !== null &&
+        pinnedLocation.longitude !== null
+      ) {
+        if (latitude === null || longitude === null) {
+          res.status(400).json({
+            error: `Enable GPS location at "${pinnedLocation.label}" (within ${pinnedLocation.radiusMeters}m of HOD pinned location) before registering your classroom environment photo.`,
+          });
+          return;
+        }
+        distanceMeters = calculateDistanceMeters(
+          latitude,
+          longitude,
+          pinnedLocation.latitude,
+          pinnedLocation.longitude
+        );
+        if (distanceMeters > pinnedLocation.radiusMeters) {
+          res.status(400).json({
+            error: `You are ${distanceMeters}m away from the HOD-pinned classroom location "${pinnedLocation.label}" (allowed radius: ${pinnedLocation.radiusMeters}m). Move inside the pinned classroom zone and recapture.`,
+          });
+          return;
+        }
+        locationVerified = true;
+      } else if (latitude !== null && longitude !== null) {
+        locationVerified = true;
+      }
     }
 
     const existing = await findUserByEmail(email);
@@ -404,8 +533,8 @@ app.post('/api/auth/register', async (req, res) => {
       })
       .returning();
 
-    // Automatically add registering students & class reps to the main Department Students records
-    if (role === 'student' || role === 'class_rep') {
+    // Automatically add registering students & class reps to main Department Students + Biometric Baselines
+    if (isStudentRole) {
       await upsertStudentFromRegistration({
         rollNo: staffOrRollId,
         fullName,
@@ -416,14 +545,29 @@ app.post('/api/auth/register', async (req, res) => {
         phone,
         isClassRep: role === 'class_rep',
       });
+
+      await upsertStudentBiometricProfile({
+        rollNo: staffOrRollId,
+        email,
+        fullName,
+        department,
+        yearOfStudy: yearOfStudy || 'I Year',
+        section: section || 'A',
+        faceImageData,
+        environmentImageData,
+        capturedLatitude: latitude !== null ? String(latitude) : '',
+        capturedLongitude: longitude !== null ? String(longitude) : '',
+        distanceMeters,
+        locationVerified,
+        pinnedLocationLabel: pinnedLocation.label,
+      });
     }
 
     res.status(201).json({
       user: mapUser(created),
-      message:
-        role === 'student' || role === 'class_rep'
-          ? 'Registration submitted and your student record has been added to the department directory. Once the HOD approves your account, an email intimation will notify you to sign in.'
-          : 'Registration submitted. Once the HOD approves your request, an email intimation will notify you to sign in with your registered credentials.',
+      message: isStudentRole
+        ? 'Registration submitted! Your student record, live face baseline, and verified classroom environment photo are saved. Once the HOD approves your account, an email intimation will notify you to sign in.'
+        : 'Registration submitted. Once the HOD approves your request, an email intimation will notify you to sign in with your registered credentials.',
     });
   } catch (error) {
     console.error('Register failed:', error);
@@ -790,6 +934,125 @@ app.get('/api/records/timetable', requireAuth, async (_req, res) => {
     res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to fetch timetable.' });
   }
 });
+
+const VALID_TIMETABLE_DAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+
+function parseTimetableSlotBody(body: Record<string, unknown>, defaultDept: string) {
+  const department = String(body?.department ?? defaultDept).trim() || defaultDept;
+  const yearOfStudy = String(body?.yearOfStudy ?? '').trim();
+  const section = String(body?.section ?? '').trim().toUpperCase();
+  const dayOfWeek = String(body?.dayOfWeek ?? '').trim();
+  const periodNumber = Number(body?.periodNumber);
+  const startTime = String(body?.startTime ?? '').trim();
+  const endTime = String(body?.endTime ?? '').trim();
+  const subjectCode = String(body?.subjectCode ?? '').trim().toUpperCase();
+  const subjectName = String(body?.subjectName ?? '').trim();
+  const facultyName = String(body?.facultyName ?? '').trim();
+  const facultyType: 'department' | 'other_department' =
+    body?.facultyType === 'other_department' ? 'other_department' : 'department';
+  const roomNo = String(body?.roomNo ?? '').trim();
+
+  if (!yearOfStudy || !section) {
+    return { error: 'Year of study and section are required.' };
+  }
+  if (!VALID_TIMETABLE_DAYS.includes(dayOfWeek)) {
+    return { error: 'Day of week must be Monday through Saturday.' };
+  }
+  if (!Number.isInteger(periodNumber) || periodNumber < 1 || periodNumber > 8) {
+    return { error: 'Period number must be between 1 and 8.' };
+  }
+  if (!subjectCode || !subjectName || !facultyName) {
+    return { error: 'Subject code, subject name, and faculty name are required.' };
+  }
+  if (!startTime || !endTime) {
+    return { error: 'Start time and end time are required.' };
+  }
+
+  return {
+    data: {
+      department,
+      yearOfStudy,
+      section,
+      dayOfWeek,
+      periodNumber,
+      startTime,
+      endTime,
+      subjectCode,
+      subjectName,
+      facultyName,
+      facultyType,
+      roomNo,
+    },
+  };
+}
+
+app.post(
+  '/api/records/timetable',
+  requireAuth,
+  requireRoles('hod', 'class_advisor'),
+  async (req: AuthenticatedRequest, res) => {
+    try {
+      const defaultDept = await getSetting('department_name', req.user?.department || 'Computer Science & Engineering');
+      const parsed = parseTimetableSlotBody(req.body ?? {}, defaultDept);
+      if ('error' in parsed) {
+        res.status(400).json({ error: parsed.error });
+        return;
+      }
+      const slot = await saveTimetableSlot(parsed.data);
+      res.status(201).json({ slot });
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to save timetable slot.' });
+    }
+  }
+);
+
+app.put(
+  '/api/records/timetable/:id',
+  requireAuth,
+  requireRoles('hod', 'class_advisor'),
+  async (req: AuthenticatedRequest, res) => {
+    try {
+      const id = Number(req.params.id);
+      if (!Number.isInteger(id) || id <= 0) {
+        res.status(400).json({ error: 'Invalid timetable slot ID.' });
+        return;
+      }
+      const defaultDept = await getSetting('department_name', req.user?.department || 'Computer Science & Engineering');
+      const parsed = parseTimetableSlotBody(req.body ?? {}, defaultDept);
+      if ('error' in parsed) {
+        res.status(400).json({ error: parsed.error });
+        return;
+      }
+      const slot = await saveTimetableSlot(parsed.data, id);
+      res.json({ slot });
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to update timetable slot.' });
+    }
+  }
+);
+
+app.delete(
+  '/api/records/timetable/:id',
+  requireAuth,
+  requireRoles('hod', 'class_advisor'),
+  async (req: AuthenticatedRequest, res) => {
+    try {
+      const id = Number(req.params.id);
+      if (!Number.isInteger(id) || id <= 0) {
+        res.status(400).json({ error: 'Invalid timetable slot ID.' });
+        return;
+      }
+      const deleted = await deleteTimetableSlot(id);
+      if (!deleted) {
+        res.status(404).json({ error: 'Timetable slot not found.' });
+        return;
+      }
+      res.json({ ok: true });
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to delete timetable slot.' });
+    }
+  }
+);
 
 app.get('/api/records/batches', requireAuth, async (_req, res) => {
   try {
@@ -1532,7 +1795,16 @@ app.post(
         replyToId,
       });
 
-      wsHub.emitMessageCreated(created);
+      const parentCommunity = await db
+        .select({ name: communities.name })
+        .from(communities)
+        .where(eq(communities.id, group.communityId))
+        .limit(1);
+
+      wsHub.emitMessageCreated(created, {
+        groupName: group.name,
+        communityName: parentCommunity[0]?.name ?? '',
+      });
 
       // If replying directly to an active Power Boost message, automatically acknowledge it to stop alerts for this user
       if (replyToId) {
@@ -1959,8 +2231,8 @@ app.get('/api/attendance/monthly-trends', requireAuth, async (req, res) => {
 app.get('/api/attendance/export/:format', requireAuth, async (req, res) => {
   try {
     const format = String(req.params.format ?? '').toLowerCase();
-    if (format !== 'csv' && format !== 'pdf') {
-      res.status(400).json({ error: 'Export format must be csv or pdf.' });
+    if (format !== 'csv' && format !== 'pdf' && format !== 'xlsx') {
+      res.status(400).json({ error: 'Export format must be csv, pdf, or xlsx.' });
       return;
     }
 
@@ -2026,6 +2298,16 @@ app.get('/api/attendance/export/:format', requireAuth, async (req, res) => {
         res.send(buf);
         return;
       }
+      if (format === 'xlsx') {
+        const buf = await buildMonthlySummaryXlsxBuffer(records, meta);
+        res.setHeader(
+          'Content-Type',
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        );
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+        res.send(buf);
+        return;
+      }
 
       const buf = buildMonthlySummaryPdfBuffer(records, meta);
       res.setHeader('Content-Type', 'application/pdf');
@@ -2057,6 +2339,16 @@ app.get('/api/attendance/export/:format', requireAuth, async (req, res) => {
       res.send(buf);
       return;
     }
+    if (format === 'xlsx') {
+      const buf = await buildAttendanceXlsxBuffer(records, meta);
+      res.setHeader(
+        'Content-Type',
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+      );
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      res.send(buf);
+      return;
+    }
 
     const buf = buildAttendancePdfBuffer(records, meta);
     res.setHeader('Content-Type', 'application/pdf');
@@ -2067,6 +2359,618 @@ app.get('/api/attendance/export/:format', requireAuth, async (req, res) => {
     res.status(500).json({ error: 'Unable to export attendance log.' });
   }
 });
+
+app.get('/api/attendance/pinned-location', requireAuth, async (_req, res) => {
+  try {
+    const pinnedLocation = await getPinnedLocationConfig();
+    res.json({ pinnedLocation });
+  } catch (error) {
+    res.status(500).json({ error: error instanceof Error ? error.message : 'Unable to load pinned location.' });
+  }
+});
+
+app.patch(
+  '/api/attendance/pinned-location',
+  requireAuth,
+  requireRoles('hod'),
+  async (req: AuthenticatedRequest, res) => {
+    try {
+      const label = String(req.body?.label ?? '').trim() || 'Department Classroom Zone';
+      const latitude = Number(req.body?.latitude);
+      const longitude = Number(req.body?.longitude);
+      const radiusMeters = Number(req.body?.radiusMeters ?? 200);
+
+      if (
+        !Number.isFinite(latitude) ||
+        !Number.isFinite(longitude) ||
+        latitude < -90 ||
+        latitude > 90 ||
+        longitude < -180 ||
+        longitude > 180
+      ) {
+        res.status(400).json({ error: 'Valid latitude (-90..90) and longitude (-180..180) are required.' });
+        return;
+      }
+
+      const pinnedLocation = await savePinnedLocationConfig({
+        label,
+        latitude,
+        longitude,
+        radiusMeters: Number.isFinite(radiusMeters) ? radiusMeters : 200,
+        updatedBy: req.user!.fullName,
+      });
+
+      res.json({ pinnedLocation });
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : 'Unable to save pinned location.' });
+    }
+  }
+);
+
+app.get('/api/attendance/biometric-profiles', requireAuth, async (_req, res) => {
+  try {
+    const profiles = await listStudentBiometricSummaries();
+    res.json({ profiles });
+  } catch (error) {
+    res.status(500).json({ error: error instanceof Error ? error.message : 'Unable to load biometric profiles.' });
+  }
+});
+
+app.get('/api/attendance/weekly-trends', requireAuth, async (req, res) => {
+  try {
+    const tz = await getSetting('academic_timezone', 'Asia/Kolkata');
+    const dept = await getSetting('department_name', 'Computer Science & Engineering');
+    const serverTime = computeServerTimeStatus(tz, dept);
+
+    const personType =
+      req.query.personType === 'student' || req.query.personType === 'faculty'
+        ? (req.query.personType as AttendancePersonType)
+        : undefined;
+
+    const weeksCount = Math.max(4, Math.min(12, Number(req.query.weeks) || 6));
+
+    // Parse current server date (YYYY-MM-DD) in UTC midnight arithmetic
+    const [yr, mo, dy] = serverTime.isoDate.split('-').map(Number);
+    const todayUtc = new Date(Date.UTC(yr, mo - 1, dy));
+    const dow = todayUtc.getUTCDay(); // 0=Sun, 1=Mon
+    const diffToMonday = dow === 0 ? -6 : 1 - dow;
+    const currentWeekMonday = new Date(todayUtc);
+    currentWeekMonday.setUTCDate(todayUtc.getUTCDate() + diffToMonday);
+
+    const toIso = (d: Date) => d.toISOString().slice(0, 10);
+    const fmtShortDate = (d: Date) =>
+      new Intl.DateTimeFormat('en-US', {
+        month: 'short',
+        day: 'numeric',
+        timeZone: 'UTC',
+      }).format(d);
+
+    const allRecords = await listAttendanceRecords({ personType, limit: 4000 });
+
+    // 1. Current Week Daily Fluctuation (Mon - Sat)
+    const dayNames = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+    const shortNames = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+    const currentWeekDays = dayNames.map((dayName, idx) => {
+      const d = new Date(currentWeekMonday);
+      d.setUTCDate(currentWeekMonday.getUTCDate() + idx);
+      const iso = toIso(d);
+      let present = 0;
+      let rejected = 0;
+      let studentsPresent = 0;
+      let facultyPresent = 0;
+      for (const rec of allRecords) {
+        if (rec.attendanceDate === iso) {
+          if (rec.status === 'present' || rec.status === 'late') {
+            present++;
+            if (rec.personType === 'student') studentsPresent++;
+            else facultyPresent++;
+          } else {
+            rejected++;
+          }
+        }
+      }
+      const total = present + rejected;
+      return {
+        date: iso,
+        dayName,
+        shortDay: shortNames[idx],
+        present,
+        rejected,
+        studentsPresent,
+        facultyPresent,
+        total,
+        verificationRate: total > 0 ? Math.round((present / total) * 100) : 0,
+      };
+    });
+
+    const currentWeekEnd = new Date(currentWeekMonday);
+    currentWeekEnd.setUTCDate(currentWeekMonday.getUTCDate() + 5);
+    const currentWeekRangeLabel = `${fmtShortDate(currentWeekMonday)} – ${fmtShortDate(currentWeekEnd)}`;
+
+    // 2. Past N Weeks Department Weekly History
+    const weeklyHistory = [];
+    for (let w = weeksCount - 1; w >= 0; w--) {
+      const wStart = new Date(currentWeekMonday);
+      wStart.setUTCDate(currentWeekMonday.getUTCDate() - w * 7);
+      const wEnd = new Date(wStart);
+      wEnd.setUTCDate(wStart.getUTCDate() + 6);
+      const startIso = toIso(wStart);
+      const endIso = toIso(wEnd);
+
+      let present = 0;
+      let rejected = 0;
+      let studentsPresent = 0;
+      let facultyPresent = 0;
+
+      for (const rec of allRecords) {
+        if (rec.attendanceDate >= startIso && rec.attendanceDate <= endIso) {
+          if (rec.status === 'present' || rec.status === 'late') {
+            present++;
+            if (rec.personType === 'student') studentsPresent++;
+            else facultyPresent++;
+          } else {
+            rejected++;
+          }
+        }
+      }
+      const total = present + rejected;
+      weeklyHistory.push({
+        weekStart: startIso,
+        weekEnd: endIso,
+        label: w === 0 ? `This Wk (${fmtShortDate(wStart)})` : fmtShortDate(wStart),
+        present,
+        rejected,
+        studentsPresent,
+        facultyPresent,
+        total,
+        verificationRate: total > 0 ? Math.round((present / total) * 100) : 0,
+      });
+    }
+
+    const totalPresent = weeklyHistory.reduce((acc, w) => acc + w.present, 0);
+    const totalRejected = weeklyHistory.reduce((acc, w) => acc + w.rejected, 0);
+    const studentPresent = weeklyHistory.reduce((acc, w) => acc + w.studentsPresent, 0);
+    const facultyPresent = weeklyHistory.reduce((acc, w) => acc + w.facultyPresent, 0);
+    const grandTotal = totalPresent + totalRejected;
+    const overallRate = grandTotal > 0 ? Math.round((totalPresent / grandTotal) * 100) : 0;
+
+    const thisWeek = weeklyHistory[weeklyHistory.length - 1];
+    const prevWeek = weeklyHistory[weeklyHistory.length - 2];
+    const weekOverWeekDeltaPct =
+      thisWeek && prevWeek && prevWeek.present > 0
+        ? Math.round(((thisWeek.present - prevWeek.present) / prevWeek.present) * 100)
+        : null;
+
+    res.json({
+      departmentName: dept,
+      currentWeekRangeLabel,
+      totalPresent,
+      totalRejected,
+      studentPresent,
+      facultyPresent,
+      overallRate,
+      weekOverWeekDeltaPct,
+      currentWeekDays,
+      weeklyHistory,
+    });
+  } catch (error) {
+    console.error('Weekly attendance trends failed:', error);
+    res.status(500).json({
+      error: error instanceof Error ? error.message : 'Unable to load weekly attendance trends.',
+    });
+  }
+});
+
+app.get('/api/analytics/departmental-performance', requireAuth, async (req, res) => {
+  try {
+    const groupBy = req.query.groupBy === 'section' ? 'section' : 'year';
+    const payload = await getDepartmentalPerformanceSummary(groupBy);
+    res.json(payload);
+  } catch (error) {
+    console.error('Departmental performance analytics failed:', error);
+    res.status(500).json({
+      error:
+        error instanceof Error
+          ? error.message
+          : 'Unable to load departmental performance metrics.',
+    });
+  }
+});
+
+// ============================================================
+// Profile Transit Buffer Settings & New Analytics/Engagement Endpoints
+// ============================================================
+app.patch('/api/auth/profile-settings', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const rawBuffer = Number(req.body?.transitBufferMinutes ?? 15);
+    if (!Number.isFinite(rawBuffer) || rawBuffer < 0 || rawBuffer > 60) {
+      res.status(400).json({ error: 'Transit buffer must be between 0 and 60 minutes.' });
+      return;
+    }
+    const updated = await updateUserTransitBuffer(req.user!.id, rawBuffer);
+    if (!updated) {
+      res.status(404).json({ error: 'User profile not found.' });
+      return;
+    }
+    res.json({ user: updated });
+  } catch (error) {
+    res.status(500).json({
+      error: error instanceof Error ? error.message : 'Unable to save transit buffer setting.',
+    });
+  }
+});
+
+app.get('/api/analytics/student-achievements', requireAuth, async (req, res) => {
+  try {
+    const tz = await getSetting('academic_timezone', 'Asia/Kolkata');
+    const dept = await getSetting('department_name', 'Computer Science & Engineering');
+    const serverTime = computeServerTimeStatus(tz, dept);
+    const batch = typeof req.query.batch === 'string' ? req.query.batch.trim() : 'all';
+    const payload = await getStudentAchievements(serverTime.isoDate, batch || 'all');
+    res.json(payload);
+  } catch (error) {
+    console.error('Student achievements query failed:', error);
+    res.status(500).json({ error: 'Unable to load student achievements.' });
+  }
+});
+
+app.get('/api/analytics/batch-comparison', requireAuth, async (req, res) => {
+  try {
+    const tz = await getSetting('academic_timezone', 'Asia/Kolkata');
+    const dept = await getSetting('department_name', 'Computer Science & Engineering');
+    const serverTime = computeServerTimeStatus(tz, dept);
+    const batchA = typeof req.query.batchA === 'string' ? req.query.batchA : undefined;
+    const batchB = typeof req.query.batchB === 'string' ? req.query.batchB : undefined;
+    const payload = await getBatchComparisonAnalytics(serverTime.isoDate, batchA, batchB);
+    res.json(payload);
+  } catch (error) {
+    console.error('Batch comparison analytics failed:', error);
+    res.status(500).json({ error: 'Unable to load batch comparison metrics.' });
+  }
+});
+
+app.get('/api/analytics/batch-comparison/export-pdf', requireAuth, async (req, res) => {
+  try {
+    const tz = await getSetting('academic_timezone', 'Asia/Kolkata');
+    const dept = await getSetting('department_name', 'Computer Science & Engineering');
+    const serverTime = computeServerTimeStatus(tz, dept);
+    const batchA = typeof req.query.batchA === 'string' ? req.query.batchA : undefined;
+    const batchB = typeof req.query.batchB === 'string' ? req.query.batchB : undefined;
+    const payload = await getBatchComparisonAnalytics(serverTime.isoDate, batchA, batchB);
+    const generatedAt = `${serverTime.formattedDate} ${serverTime.formattedTime} (${serverTime.academicTimezone})`;
+    const pdfBuffer = buildBatchComparisonPdfBuffer(payload, generatedAt);
+    const slugA = payload.batchA.batchLabel.replace(/[^a-z0-9]+/gi, '_');
+    const slugB = payload.batchB.batchLabel.replace(/[^a-z0-9]+/gi, '_');
+    const filename = `ChromaGrade_Batch_Comparison_${slugA}_vs_${slugB}.pdf`;
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.send(pdfBuffer);
+  } catch (error) {
+    console.error('Batch comparison PDF export failed:', error);
+    res.status(500).json({ error: 'Unable to export batch comparison PDF.' });
+  }
+});
+
+app.get('/api/analytics/leaderboard-buddies', requireAuth, async (_req, res) => {
+  try {
+    const tz = await getSetting('academic_timezone', 'Asia/Kolkata');
+    const dept = await getSetting('department_name', 'Computer Science & Engineering');
+    const serverTime = computeServerTimeStatus(tz, dept);
+    const payload = await getTopPerformersAndStudyBuddies(serverTime.isoDate);
+    res.json(payload);
+  } catch (error) {
+    console.error('Leaderboard & study buddies query failed:', error);
+    res.status(500).json({ error: 'Unable to load top performers and study buddies.' });
+  }
+});
+
+app.get('/api/goals/me', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const tz = await getSetting('academic_timezone', 'Asia/Kolkata');
+    const dept = await getSetting('department_name', 'Computer Science & Engineering');
+    const serverTime = computeServerTimeStatus(tz, dept);
+    const goal = await getAcademicGoalForUser(req.user!, serverTime.isoDate);
+    res.json({ goal });
+  } catch (error) {
+    res.status(500).json({ error: 'Unable to load Academic Goal Tracker.' });
+  }
+});
+
+app.put('/api/goals/me', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const tz = await getSetting('academic_timezone', 'Asia/Kolkata');
+    const dept = await getSetting('department_name', 'Computer Science & Engineering');
+    const serverTime = computeServerTimeStatus(tz, dept);
+    const weeklyAttendanceTarget = Number(req.body?.weeklyAttendanceTarget ?? 85);
+    const weeklyEngagementTarget = Number(req.body?.weeklyEngagementTarget ?? 80);
+    const note = typeof req.body?.note === 'string' ? req.body.note : '';
+    const goal = await upsertAcademicGoalForUser({
+      user: req.user!,
+      todayIso: serverTime.isoDate,
+      weeklyAttendanceTarget,
+      weeklyEngagementTarget,
+      note,
+    });
+    res.json({ goal });
+  } catch (error) {
+    res.status(500).json({ error: 'Unable to save Academic Goal targets.' });
+  }
+});
+
+app.post('/api/goals/me/checkin', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const tz = await getSetting('academic_timezone', 'Asia/Kolkata');
+    const dept = await getSetting('department_name', 'Computer Science & Engineering');
+    const serverTime = computeServerTimeStatus(tz, dept);
+    const note = typeof req.body?.note === 'string' ? req.body.note : undefined;
+    const goal = await checkInAcademicGoalToday(req.user!, serverTime.isoDate, note);
+    res.json({ goal });
+  } catch (error) {
+    res.status(500).json({ error: 'Unable to log daily goal check-in.' });
+  }
+});
+
+app.post('/api/goals/nudge-check', requireAuth, async (_req, res) => {
+  try {
+    const tz = await getSetting('academic_timezone', 'Asia/Kolkata');
+    const dept = await getSetting('department_name', 'Computer Science & Engineering');
+    const serverTime = computeServerTimeStatus(tz, dept);
+    const userIds = await listStudentUserIdsNeedingGoalNudge(serverTime.isoDate);
+    if (userIds.length > 0) {
+      wsHub.emitGoalTrackerNudge(userIds, serverTime.isoDate);
+    }
+    res.json({ nudgedCount: userIds.length, isoDate: serverTime.isoDate });
+  } catch (error) {
+    res.status(500).json({ error: 'Unable to run daily goal nudge check.' });
+  }
+});
+
+app.get('/api/academic-calendar', requireAuth, async (_req, res) => {
+  try {
+    const tz = await getSetting('academic_timezone', 'Asia/Kolkata');
+    const dept = await getSetting('department_name', 'Computer Science & Engineering');
+    const serverTime = computeServerTimeStatus(tz, dept);
+    const events = await listAcademicCalendarEvents(serverTime.isoDate);
+    res.json({ events });
+  } catch (error) {
+    res.status(500).json({ error: 'Unable to load academic calendar events.' });
+  }
+});
+
+app.post(
+  '/api/academic-calendar',
+  requireAuth,
+  requireRoles('hod', 'class_advisor', 'dept_staff'),
+  async (req: AuthenticatedRequest, res) => {
+    try {
+      const title = String(req.body?.title ?? '').trim();
+      const eventDate = String(req.body?.eventDate ?? '').trim();
+      const category = (['event', 'exam', 'deadline', 'holiday'].includes(
+        String(req.body?.category)
+      )
+        ? String(req.body?.category)
+        : 'event') as AcademicEventCategory;
+      const yearOfStudy = String(req.body?.yearOfStudy ?? 'All Years').trim();
+      const description = String(req.body?.description ?? '').trim();
+
+      if (!title || !/^\d{4}-\d{2}-\d{2}$/.test(eventDate)) {
+        res.status(400).json({ error: 'Event title and valid date (YYYY-MM-DD) are required.' });
+        return;
+      }
+
+      const dept = await getSetting('department_name', req.user!.department);
+      const event = await createAcademicCalendarEvent({
+        title,
+        eventDate,
+        category,
+        department: dept,
+        yearOfStudy,
+        description,
+        createdByName: req.user!.fullName,
+      });
+      res.status(201).json({ event });
+    } catch (error) {
+      res.status(500).json({ error: 'Unable to create academic calendar event.' });
+    }
+  }
+);
+
+app.delete(
+  '/api/academic-calendar/:id',
+  requireAuth,
+  requireRoles('hod', 'class_advisor'),
+  async (req, res) => {
+    try {
+      const id = Number(req.params.id);
+      if (!Number.isInteger(id) || id <= 0) {
+        res.status(400).json({ error: 'Invalid calendar event ID.' });
+        return;
+      }
+      const ok = await deleteAcademicCalendarEvent(id);
+      if (!ok) {
+        res.status(404).json({ error: 'Calendar event not found.' });
+        return;
+      }
+      res.json({ ok: true });
+    } catch (error) {
+      res.status(500).json({ error: 'Unable to delete calendar event.' });
+    }
+  }
+);
+
+app.get('/api/attendance/alerts-and-risk', requireAuth, async (_req, res) => {
+  try {
+    const tz = await getSetting('academic_timezone', 'Asia/Kolkata');
+    const dept = await getSetting('department_name', 'Computer Science & Engineering');
+    const serverTime = computeServerTimeStatus(tz, dept);
+    const lowRiskStudents = await getLowAttendanceRiskStudents(serverTime.isoDate);
+    res.json({ lowRiskStudents, serverDate: serverTime.isoDate });
+  } catch (error) {
+    res.status(500).json({ error: 'Unable to load attendance risk alerts.' });
+  }
+});
+
+app.post(
+  '/api/attendance/notify-low-risk',
+  requireAuth,
+  requireRoles('hod', 'class_advisor', 'dept_staff'),
+  async (_req, res) => {
+    try {
+      const tz = await getSetting('academic_timezone', 'Asia/Kolkata');
+      const dept = await getSetting('department_name', 'Computer Science & Engineering');
+      const serverTime = computeServerTimeStatus(tz, dept);
+      const lowRiskStudents = await getLowAttendanceRiskStudents(serverTime.isoDate);
+      const dispatched: unknown[] = [];
+
+      for (const student of lowRiskStudents) {
+        const logged = await recordAttendanceRiskAlertIfNeeded({
+          rollNo: student.rollNo,
+          todayIso: serverTime.isoDate,
+        });
+        if (logged) {
+          dispatched.push(logged);
+          wsHub.emitLowAttendanceRisk({
+            rollNo: logged.rollNo,
+            studentName: logged.studentName,
+            yearOfStudy: logged.yearOfStudy,
+            section: logged.section,
+            cumulativeRate: logged.cumulativeRate,
+            presentCount: logged.presentCount,
+            totalSessions: logged.totalSessions,
+            notifiedAt: logged.notifiedAt,
+          });
+        }
+      }
+      res.json({ notifiedCount: dispatched.length, lowRiskStudents });
+    } catch (error) {
+      res.status(500).json({ error: 'Unable to dispatch low-attendance risk notifications.' });
+    }
+  }
+);
+
+app.get('/api/hod/archival', requireAuth, requireRoles('hod', 'class_advisor'), async (_req, res) => {
+  try {
+    const logs = await listArchivalLogs();
+    res.json({ logs });
+  } catch (error) {
+    res.status(500).json({ error: 'Unable to load archival history.' });
+  }
+});
+
+app.post('/api/hod/archival', requireAuth, requireRoles('hod'), async (_req, res) => {
+  try {
+    const record = await runDailyDepartmentArchival('manual');
+    res.status(201).json({ record });
+  } catch (error) {
+    res.status(500).json({ error: 'Unable to run manual department archival.' });
+  }
+});
+
+// ============================================================
+// Faculty Delay Alert Endpoints (Class Rep / Advisor / HOD -> Faculty + HOD + Advisor)
+// ============================================================
+app.get('/api/faculty-delays', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const alerts = await listFacultyDelayAlertsForUser(req.user!);
+    res.json({ alerts });
+  } catch (error) {
+    res.status(500).json({ error: error instanceof Error ? error.message : 'Unable to fetch faculty delay alerts.' });
+  }
+});
+
+app.post(
+  '/api/faculty-delays',
+  requireAuth,
+  requireRoles('class_rep', 'class_advisor', 'hod'),
+  async (req: AuthenticatedRequest, res) => {
+    try {
+      const tz = await getSetting('academic_timezone', 'Asia/Kolkata');
+      const dept = await getSetting('department_name', req.user?.department || 'Computer Science & Engineering');
+      const serverTime = computeServerTimeStatus(tz, dept);
+
+      const timetableSlotId =
+        typeof req.body?.timetableSlotId === 'number' ? req.body.timetableSlotId : null;
+      let slot = null;
+      if (timetableSlotId) {
+        const found = await db
+          .select()
+          .from(timetableSlots)
+          .where(eq(timetableSlots.id, timetableSlotId))
+          .limit(1);
+        slot = found[0] ?? null;
+      }
+
+      const facultyName = String(req.body?.facultyName ?? slot?.facultyName ?? '').trim();
+      const subjectCode = String(req.body?.subjectCode ?? slot?.subjectCode ?? 'CLASS').trim();
+      const subjectName = String(req.body?.subjectName ?? slot?.subjectName ?? 'Scheduled Class').trim();
+      const yearOfStudy = String(req.body?.yearOfStudy ?? slot?.yearOfStudy ?? req.user!.yearOfStudy ?? '').trim();
+      const section = String(req.body?.section ?? slot?.section ?? req.user!.section ?? '').trim();
+      const roomNo = String(req.body?.roomNo ?? slot?.roomNo ?? '').trim();
+      const dayOfWeek = String(req.body?.dayOfWeek ?? slot?.dayOfWeek ?? serverTime.weekday).trim();
+      const periodNumber = Number(
+        req.body?.periodNumber ?? slot?.periodNumber ?? serverTime.activePeriod?.periodNumber ?? 1
+      );
+      const delayMinutes = Number(req.body?.delayMinutes ?? 10);
+      const note = String(req.body?.note ?? '').trim();
+
+      if (!facultyName) {
+        res.status(400).json({ error: 'Select a scheduled period or enter the respected hour faculty name.' });
+        return;
+      }
+
+      const alert = await createFacultyDelayAlert({
+        department: dept,
+        yearOfStudy,
+        section,
+        dayOfWeek,
+        periodNumber: Number.isFinite(periodNumber) ? periodNumber : 1,
+        timetableSlotId: slot?.id ?? null,
+        subjectCode,
+        subjectName,
+        roomNo,
+        facultyName,
+        user: req.user!,
+        delayMinutes: Number.isFinite(delayMinutes) ? delayMinutes : 10,
+        note,
+      });
+
+      wsHub.emitFacultyDelayCreated(alert);
+      res.status(201).json({ alert });
+    } catch (error) {
+      console.error('Failed to report faculty delay:', error);
+      res.status(500).json({ error: error instanceof Error ? error.message : 'Unable to send faculty delay alert.' });
+    }
+  }
+);
+
+app.patch(
+  '/api/faculty-delays/:id',
+  requireAuth,
+  requireRoles('hod', 'class_advisor', 'dept_staff', 'other_dept_staff'),
+  async (req: AuthenticatedRequest, res) => {
+    try {
+      const id = Number(req.params.id);
+      if (!Number.isInteger(id) || id <= 0) {
+        res.status(400).json({ error: 'Invalid faculty delay alert ID.' });
+        return;
+      }
+      const status = req.body?.status === 'resolved' ? 'resolved' : 'acknowledged';
+      const updated = await updateFacultyDelayAlertStatus({
+        id,
+        status,
+        acknowledgedByName: req.user!.fullName,
+      });
+      if (!updated) {
+        res.status(404).json({ error: 'Faculty delay alert not found.' });
+        return;
+      }
+      wsHub.emitFacultyDelayUpdated(updated);
+      res.json({ alert: updated });
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : 'Unable to update faculty delay alert.' });
+    }
+  }
+);
 
 app.post(
   '/api/attendance/verify-and-mark',
@@ -2080,6 +2984,19 @@ app.post(
         typeof req.body?.timetableSlotId === 'number' ? req.body.timetableSlotId : null;
       const faceImageData = String(req.body?.faceImageData ?? '');
       const environmentImageData = String(req.body?.environmentImageData ?? '');
+      const rawLat = req.body?.latitude;
+      const rawLng = req.body?.longitude;
+      const hasCoords =
+        rawLat !== undefined &&
+        rawLat !== null &&
+        rawLat !== '' &&
+        rawLng !== undefined &&
+        rawLng !== null &&
+        rawLng !== '' &&
+        Number.isFinite(Number(rawLat)) &&
+        Number.isFinite(Number(rawLng));
+      const latitude = hasCoords ? Number(rawLat) : null;
+      const longitude = hasCoords ? Number(rawLng) : null;
 
       if (personType !== 'student' && personType !== 'faculty') {
         res.status(400).json({ error: 'Select student or faculty attendance mode.' });
@@ -2095,6 +3012,35 @@ app.post(
             'Two live camera photos are strictly required: (1) live face capture and (2) live work/classroom environment capture.',
         });
         return;
+      }
+
+      // Enforce HOD-pinned classroom geofence if configured
+      const pinnedLocation = await getPinnedLocationConfig();
+      let geofenceSummary = '';
+      if (
+        pinnedLocation.configured &&
+        pinnedLocation.latitude !== null &&
+        pinnedLocation.longitude !== null
+      ) {
+        if (latitude === null || longitude === null) {
+          res.status(400).json({
+            error: `Enable GPS location verification for "${pinnedLocation.label}" (within ${pinnedLocation.radiusMeters}m of the HOD-pinned classroom location) before marking attendance.`,
+          });
+          return;
+        }
+        const distance = calculateDistanceMeters(
+          latitude,
+          longitude,
+          pinnedLocation.latitude,
+          pinnedLocation.longitude
+        );
+        if (distance > pinnedLocation.radiusMeters) {
+          res.status(400).json({
+            error: `Outside HOD-pinned classroom geofence "${pinnedLocation.label}" (${distance}m away; allowed radius: ${pinnedLocation.radiusMeters}m). Attendance blocked.`,
+          });
+          return;
+        }
+        geofenceSummary = `Verified inside HOD-pinned zone "${pinnedLocation.label}" (${distance}m away, max ${pinnedLocation.radiusMeters}m).`;
       }
 
       const tz = await getSetting('academic_timezone', 'Asia/Kolkata');
@@ -2121,10 +3067,17 @@ app.post(
       const roomNo = slot?.roomNo ?? String(req.body?.roomNo || 'Campus');
       const dayOfWeek = slot?.dayOfWeek ?? serverTime.weekday;
 
-      // Run real server-side Gemini Vision inspection on BOTH live camera photos
+      // Load student's registered baseline Face & Classroom Environment photos (if enrolled during registration)
+      const biometricProfile =
+        personType === 'student' ? await getStudentBiometricProfile(personIdentifier) : null;
+
+      // Run real server-side Gemini Vision inspection on BOTH live camera photos (+ registered baselines)
       const verification = await verifyDualCameraAttendance({
         faceImageData,
         environmentImageData,
+        registeredFaceImageData: biometricProfile?.faceImageData ?? null,
+        registeredEnvironmentImageData: biometricProfile?.environmentImageData ?? null,
+        geofenceSummary,
         personType,
         personName,
         subjectName,
@@ -2134,6 +3087,12 @@ app.post(
       const attendanceStatus: 'present' | 'late' | 'rejected' = verification.approvedForAttendance
         ? 'present'
         : 'rejected';
+
+      const summarySuffix = geofenceSummary
+        ? ` ${geofenceSummary}`
+        : biometricProfile
+        ? ' Cross-checked with registered face & classroom baseline.'
+        : '';
 
       const savedRecord = await upsertAttendanceRecord({
         attendanceDate: serverTime.isoDate,
@@ -2158,14 +3117,77 @@ app.post(
         faceConfidence: verification.faceConfidence,
         environmentVerified: verification.environmentVerified,
         environmentLabel: verification.environmentLabel,
-        verificationSummary: verification.summary,
+        verificationSummary: `${verification.summary}${summarySuffix}`.slice(0, 260),
         serverTimestamp: `${serverTime.formattedDate} · ${serverTime.formattedTime} (${serverTime.academicTimezone})`,
       });
+
+      let sessionAlert: {
+        subjectCode: string;
+        subjectName: string;
+        yearOfStudy: string;
+        section: string;
+        periodNumber: number;
+        presentCount: number;
+        expectedCount: number;
+        ratePct: number;
+      } | null = null;
+      let lowAttendanceRisk: {
+        rollNo: string;
+        studentName: string;
+        cumulativeRate: number;
+      } | null = null;
+
+      if (personType === 'student') {
+        const sessionStats = await evaluateSessionAttendanceStatus({
+          attendanceDate: serverTime.isoDate,
+          periodNumber,
+          yearOfStudy,
+          section,
+        });
+        if (sessionStats.ratePct < 75) {
+          sessionAlert = {
+            subjectCode,
+            subjectName,
+            yearOfStudy,
+            section,
+            periodNumber,
+            ...sessionStats,
+          };
+          wsHub.emitSessionAttendanceAlert({
+            ...sessionAlert,
+            createdAt: `${serverTime.formattedDate} · ${serverTime.formattedTime}`,
+          });
+        }
+
+        const riskLogged = await recordAttendanceRiskAlertIfNeeded({
+          rollNo: personIdentifier,
+          todayIso: serverTime.isoDate,
+        });
+        if (riskLogged && riskLogged.cumulativeRate < 75) {
+          lowAttendanceRisk = {
+            rollNo: riskLogged.rollNo,
+            studentName: riskLogged.studentName,
+            cumulativeRate: riskLogged.cumulativeRate,
+          };
+          wsHub.emitLowAttendanceRisk({
+            rollNo: riskLogged.rollNo,
+            studentName: riskLogged.studentName,
+            yearOfStudy: riskLogged.yearOfStudy,
+            section: riskLogged.section,
+            cumulativeRate: riskLogged.cumulativeRate,
+            presentCount: riskLogged.presentCount,
+            totalSessions: riskLogged.totalSessions,
+            notifiedAt: riskLogged.notifiedAt,
+          });
+        }
+      }
 
       res.status(verification.approvedForAttendance ? 201 : 200).json({
         approved: verification.approvedForAttendance,
         verification,
         record: savedRecord,
+        sessionAlert,
+        lowAttendanceRisk,
       });
     } catch (error) {
       console.error('Dual-camera attendance verification failed:', error);
@@ -2174,6 +3196,380 @@ app.post(
           error instanceof Error
             ? error.message
             : 'Camera attendance verification failed. Please retry.',
+      });
+    }
+  }
+);
+
+// ============================================================
+// 7B. OD & Leave Permission Workflow + HOD Form Customization
+// ============================================================
+app.get('/api/od-leave/form-config', requireAuth, async (_req, res) => {
+  try {
+    const config = await getOdLeaveFormConfig();
+    res.json({ config });
+  } catch (error) {
+    res.status(500).json({
+      error: error instanceof Error ? error.message : 'Unable to load OD/Leave form settings.',
+    });
+  }
+});
+
+app.put(
+  '/api/od-leave/form-config',
+  requireAuth,
+  requireRoles('hod'),
+  async (req: AuthenticatedRequest, res) => {
+    try {
+      const body = req.body ?? {};
+      const config = await saveOdLeaveFormConfig(
+        {
+          requireClassAdvisorForStudents: Boolean(body.requireClassAdvisorForStudents),
+          allowDocumentUpload: Boolean(body.allowDocumentUpload),
+          requireDocumentUploadForOd: Boolean(body.requireDocumentUploadForOd),
+          requireDocumentUploadForLeave: Boolean(body.requireDocumentUploadForLeave),
+          allowPhotoUpload: Boolean(body.allowPhotoUpload),
+          requirePhotoUpload: Boolean(body.requirePhotoUpload),
+          maxOdDays: Number(body.maxOdDays || 10),
+          maxLeaveDays: Number(body.maxLeaveDays || 15),
+          declarationText: String(body.declarationText ?? ''),
+          fields: Array.isArray(body.fields) ? body.fields : [],
+        },
+        req.user!.fullName
+      );
+      res.json({ config });
+    } catch (error) {
+      res.status(400).json({
+        error: error instanceof Error ? error.message : 'Unable to save OD/Leave form settings.',
+      });
+    }
+  }
+);
+
+app.post(
+  '/api/od-leave/attachments',
+  requireAuth,
+  upload.single('file'),
+  async (req: AuthenticatedRequest, res) => {
+    try {
+      if (!req.file) {
+        res.status(400).json({ error: 'Attach a valid document or photo file.' });
+        return;
+      }
+
+      const kind = String(req.body?.kind ?? 'document') === 'photo' ? 'photo' : 'document';
+      const rawName = path.basename(req.file.originalname || `${kind}.bin`);
+      const ext = path.extname(rawName).toLowerCase() || '.bin';
+
+      if (kind === 'photo' && !ALLOWED_OD_PHOTO_EXTENSIONS.has(ext)) {
+        res.status(400).json({
+          error: 'Proof photo must be a PNG, JPG, JPEG, or WEBP image.',
+        });
+        return;
+      }
+      if (kind === 'document' && !ALLOWED_OD_DOC_EXTENSIONS.has(ext)) {
+        res.status(400).json({
+          error: 'Supporting file must be a PDF, DOC, DOCX, TXT, PNG, JPG, or WEBP file.',
+        });
+        return;
+      }
+
+      const fileKey = `${crypto.randomUUID()}${ext}`;
+      const targetPath = path.resolve(OD_LEAVE_UPLOADS_DIR, fileKey);
+      if (!targetPath.startsWith(OD_LEAVE_UPLOADS_DIR + path.sep)) {
+        res.status(400).json({ error: 'Invalid upload destination.' });
+        return;
+      }
+
+      fs.writeFileSync(targetPath, req.file.buffer);
+      res.status(201).json({
+        fileKey,
+        fileName: rawName.slice(0, 160),
+        mimeType: req.file.mimetype || 'application/octet-stream',
+        fileSize: req.file.size,
+      });
+    } catch (error) {
+      console.error('OD/Leave attachment upload failed:', error);
+      res.status(500).json({ error: 'Unable to upload supporting file or photo.' });
+    }
+  }
+);
+
+app.get('/api/od-leave/attachments/:fileKey', requireAuth, (req, res) => {
+  try {
+    const fileKey = path.basename(String(req.params.fileKey ?? ''));
+    if (!/^[a-f0-9-]+\.[a-z0-9]+$/i.test(fileKey)) {
+      res.status(400).json({ error: 'Invalid attachment key.' });
+      return;
+    }
+
+    const fullPath = path.resolve(OD_LEAVE_UPLOADS_DIR, fileKey);
+    if (!fullPath.startsWith(OD_LEAVE_UPLOADS_DIR + path.sep) || !fs.existsSync(fullPath)) {
+      res.status(404).json({ error: 'Attachment not found.' });
+      return;
+    }
+
+    const ext = path.extname(fileKey).toLowerCase();
+    const mimeMap: Record<string, string> = {
+      '.png': 'image/png',
+      '.jpg': 'image/jpeg',
+      '.jpeg': 'image/jpeg',
+      '.webp': 'image/webp',
+      '.pdf': 'application/pdf',
+      '.txt': 'text/plain; charset=utf-8',
+      '.doc': 'application/msword',
+      '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    };
+    const contentType = mimeMap[ext] || 'application/octet-stream';
+    const isInlineSafe = INLINE_SAFE_MIME_PREFIXES.some((prefix) => contentType.startsWith(prefix));
+    const requestedName = String(req.query.name ?? fileKey).replace(/["\r\n]/g, '').slice(0, 140);
+
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Content-Type', contentType);
+    res.setHeader(
+      'Content-Disposition',
+      `${isInlineSafe && req.query.download !== '1' ? 'inline' : 'attachment'}; filename="${requestedName}"`
+    );
+    res.sendFile(fullPath);
+  } catch (error) {
+    console.error('OD/Leave attachment fetch failed:', error);
+    res.status(500).json({ error: 'Unable to retrieve attachment.' });
+  }
+});
+
+app.get('/api/od-leave/requests', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const tz = await getSetting('academic_timezone', 'Asia/Kolkata');
+    const dept = await getSetting('department_name', req.user?.department || 'Computer Science & Engineering');
+    const serverTime = computeServerTimeStatus(tz, dept);
+    const [requests, config, activeToday] = await Promise.all([
+      listOdLeaveRequestsForUser(req.user!),
+      getOdLeaveFormConfig(),
+      listActiveApprovedOdLeaveForDate(serverTime.isoDate),
+    ]);
+    res.json({ requests, config, activeToday, serverDate: serverTime.isoDate });
+  } catch (error) {
+    res.status(500).json({
+      error: error instanceof Error ? error.message : 'Unable to load OD & Leave requests.',
+    });
+  }
+});
+
+app.post('/api/od-leave/requests', requireAuth, async (req: AuthenticatedRequest, res) => {
+  try {
+    const user = req.user!;
+    const config = await getOdLeaveFormConfig();
+
+    const requestType = req.body?.requestType === 'od' ? 'od' : req.body?.requestType === 'leave' ? 'leave' : null;
+    if (!requestType) {
+      res.status(400).json({ error: 'Select either OD (On-Duty) or Leave.' });
+      return;
+    }
+
+    const applicantCategory: 'student' | 'faculty' =
+      user.role === 'student' || user.role === 'class_rep' ? 'student' : 'faculty';
+
+    const applicantName = String(req.body?.applicantName ?? user.fullName ?? '').trim();
+    const rollOrEmployeeId = String(req.body?.rollOrEmployeeId ?? user.staffOrRollId ?? '')
+      .trim()
+      .toUpperCase();
+    const mobileNumber = String(req.body?.mobileNumber ?? user.phone ?? '').trim();
+    const yearOfStudy = String(req.body?.yearOfStudy ?? user.yearOfStudy ?? '').trim();
+    const section = String(req.body?.section ?? user.section ?? '').trim().toUpperCase();
+    const fromDate = String(req.body?.fromDate ?? '').trim();
+    const toDate = String(req.body?.toDate ?? '').trim();
+    const reason = String(req.body?.reason ?? '').trim();
+
+    if (!applicantName || applicantName.length < 2) {
+      res.status(400).json({ error: 'Applicant full name is required.' });
+      return;
+    }
+    if (!rollOrEmployeeId) {
+      res.status(400).json({
+        error: applicantCategory === 'student' ? 'Roll Number is required.' : 'Employee ID is required.',
+      });
+      return;
+    }
+    if (!mobileNumber || mobileNumber.length < 7) {
+      res.status(400).json({ error: 'Valid mobile number is required.' });
+      return;
+    }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(fromDate) || !/^\d{4}-\d{2}-\d{2}$/.test(toDate)) {
+      res.status(400).json({ error: 'Select valid From and To dates (YYYY-MM-DD).' });
+      return;
+    }
+
+    const dates = enumerateDateRangeInclusive(fromDate, toDate);
+    if (dates.length === 0) {
+      res.status(400).json({ error: 'End date must be on or after the start date.' });
+      return;
+    }
+    const maxAllowed = requestType === 'od' ? config.maxOdDays : config.maxLeaveDays;
+    if (dates.length > maxAllowed) {
+      res.status(400).json({
+        error: `Maximum allowed ${requestType.toUpperCase()} duration is ${maxAllowed} day(s) per request (HOD policy).`,
+      });
+      return;
+    }
+
+    if (reason.length < 5) {
+      res.status(400).json({ error: 'Please provide a clear reason (at least 5 characters).' });
+      return;
+    }
+
+    const rawCustom = req.body?.customFields && typeof req.body.customFields === 'object'
+      ? (req.body.customFields as Record<string, unknown>)
+      : {};
+    const customFields: Record<string, string> = {};
+
+    for (const field of config.fields) {
+      if (!field.enabled) continue;
+      if (field.appliesTo !== 'all' && field.appliesTo !== applicantCategory) continue;
+      const val = String(rawCustom[field.id] ?? '').trim().slice(0, 400);
+      if (field.required && !val) {
+        res.status(400).json({ error: `Required field missing: ${field.label}.` });
+        return;
+      }
+      if (val) {
+        customFields[field.id] = val;
+      }
+    }
+
+    const documentFileKey = path.basename(String(req.body?.documentFileKey ?? '').trim());
+    const documentFileName = String(req.body?.documentFileName ?? '').trim().slice(0, 160);
+    const documentMimeType = String(req.body?.documentMimeType ?? '').trim().slice(0, 120);
+    const photoFileKey = path.basename(String(req.body?.photoFileKey ?? '').trim());
+    const photoFileName = String(req.body?.photoFileName ?? '').trim().slice(0, 160);
+    const photoMimeType = String(req.body?.photoMimeType ?? '').trim().slice(0, 120);
+
+    if (
+      config.allowDocumentUpload &&
+      ((requestType === 'od' && config.requireDocumentUploadForOd) ||
+        (requestType === 'leave' && config.requireDocumentUploadForLeave)) &&
+      !documentFileKey
+    ) {
+      res.status(400).json({
+        error: `Supporting document upload is mandatory for ${requestType.toUpperCase()} requests (HOD policy).`,
+      });
+      return;
+    }
+
+    if (config.allowPhotoUpload && config.requirePhotoUpload && !photoFileKey) {
+      res.status(400).json({
+        error: 'Proof photo upload is mandatory as configured by HOD.',
+      });
+      return;
+    }
+
+    const dept = await getSetting('department_name', user.department || 'Computer Science & Engineering');
+    const created = await createOdLeaveRequest({
+      requestType,
+      applicantCategory,
+      user,
+      applicantName,
+      rollOrEmployeeId,
+      mobileNumber,
+      department: dept,
+      yearOfStudy,
+      section,
+      fromDate,
+      toDate,
+      totalDays: dates.length,
+      reason,
+      customFields,
+      documentFileKey: /^[a-f0-9-]+\.[a-z0-9]+$/i.test(documentFileKey) ? documentFileKey : '',
+      documentFileName,
+      documentMimeType,
+      photoFileKey: /^[a-f0-9-]+\.[a-z0-9]+$/i.test(photoFileKey) ? photoFileKey : '',
+      photoFileName,
+      photoMimeType,
+      requireClassAdvisor: config.requireClassAdvisorForStudents,
+    });
+
+    wsHub.emitOdLeaveCreated(created);
+    res.status(201).json({ request: created });
+  } catch (error) {
+    console.error('Failed to submit OD/Leave request:', error);
+    res.status(500).json({
+      error: error instanceof Error ? error.message : 'Unable to submit OD/Leave application.',
+    });
+  }
+});
+
+app.patch(
+  '/api/od-leave/requests/:id/decision',
+  requireAuth,
+  requireRoles('class_advisor', 'hod'),
+  async (req: AuthenticatedRequest, res) => {
+    try {
+      const id = Number(req.params.id);
+      if (!Number.isInteger(id) || id <= 0) {
+        res.status(400).json({ error: 'Invalid OD/Leave request ID.' });
+        return;
+      }
+
+      const decision =
+        req.body?.decision === 'approve'
+          ? 'approve'
+          : req.body?.decision === 'reject'
+          ? 'reject'
+          : null;
+      if (!decision) {
+        res.status(400).json({ error: 'Decision must be approve or reject.' });
+        return;
+      }
+      const remarks = String(req.body?.remarks ?? '').trim();
+
+      const existing = await getOdLeaveRequestById(id);
+      if (!existing) {
+        res.status(404).json({ error: 'OD/Leave request not found.' });
+        return;
+      }
+
+      const reviewer = req.user!;
+      if (existing.applicantUserId === reviewer.id && reviewer.role !== 'hod') {
+        res.status(403).json({ error: 'You cannot approve or reject your own OD/Leave request.' });
+        return;
+      }
+
+      if (existing.status === 'approved' || existing.status === 'rejected') {
+        res.status(400).json({ error: `This request has already been ${existing.status}.` });
+        return;
+      }
+
+      if (reviewer.role === 'class_advisor') {
+        if (existing.applicantCategory !== 'student') {
+          res.status(403).json({
+            error: 'Faculty OD/Leave permissions are approved exclusively by the HOD.',
+          });
+          return;
+        }
+        if (existing.status !== 'pending_advisor') {
+          res.status(400).json({
+            error: 'This student request has already passed Class Advisor review and is awaiting HOD approval.',
+          });
+          return;
+        }
+      }
+
+      const tz = await getSetting('academic_timezone', 'Asia/Kolkata');
+      const dept = await getSetting('department_name', reviewer.department);
+      const serverTime = computeServerTimeStatus(tz, dept);
+
+      const updated = await decideOdLeaveRequest({
+        request: existing,
+        reviewer,
+        decision,
+        remarks,
+        serverTimestamp: `${serverTime.formattedDate} · ${serverTime.formattedTime} (${serverTime.academicTimezone})`,
+      });
+
+      wsHub.emitOdLeaveUpdated(updated);
+      res.json({ request: updated });
+    } catch (error) {
+      console.error('OD/Leave decision error:', error);
+      res.status(500).json({
+        error: error instanceof Error ? error.message : 'Unable to process OD/Leave decision.',
       });
     }
   }
@@ -2219,6 +3615,7 @@ async function startServer() {
 
   httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`ChromaGrade PostgreSQL & WebSocket server running on http://0.0.0.0:${PORT}`);
+    startDailyArchivalScheduler();
   });
 }
 

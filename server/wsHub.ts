@@ -6,6 +6,8 @@ import { resolveUserFromToken } from '../src/middleware/auth.ts';
 import type {
   CallParticipantInfo,
   ChatMessageItem,
+  FacultyDelayAlertItem,
+  OdLeaveRequestItem,
   PowerBoostAcknowledgementItem,
   UserProfile,
 } from '../src/types.ts';
@@ -312,8 +314,16 @@ class ChatWebSocketHub {
     }
   }
 
-  emitMessageCreated(message: ChatMessageItem): void {
-    this.broadcastAll({ type: 'message:created', message });
+  emitMessageCreated(
+    message: ChatMessageItem,
+    meta?: { groupName?: string; communityName?: string }
+  ): void {
+    this.broadcastAll({
+      type: 'message:created',
+      message,
+      groupName: meta?.groupName ?? '',
+      communityName: meta?.communityName ?? '',
+    });
   }
 
   emitMessageUpdated(message: ChatMessageItem): void {
@@ -347,6 +357,82 @@ class ChatWebSocketHub {
       groupId,
       messageId,
     });
+  }
+
+  emitFacultyDelayCreated(alert: FacultyDelayAlertItem): void {
+    this.broadcastAll({
+      type: 'faculty_delay:created',
+      alert,
+    });
+  }
+
+  emitFacultyDelayUpdated(alert: FacultyDelayAlertItem): void {
+    this.broadcastAll({
+      type: 'faculty_delay:updated',
+      alert,
+    });
+  }
+
+  emitOdLeaveCreated(request: OdLeaveRequestItem): void {
+    this.broadcastAll({
+      type: 'od_leave:created',
+      request,
+    });
+  }
+
+  emitOdLeaveUpdated(request: OdLeaveRequestItem): void {
+    this.broadcastAll({
+      type: 'od_leave:updated',
+      request,
+    });
+  }
+
+  emitSessionAttendanceAlert(payload: {
+    subjectCode: string;
+    subjectName: string;
+    yearOfStudy: string;
+    section: string;
+    periodNumber: number;
+    presentCount: number;
+    expectedCount: number;
+    ratePct: number;
+    createdAt: string;
+  }): void {
+    this.broadcastAll({
+      type: 'attendance:session_alert',
+      alert: payload,
+    });
+  }
+
+  emitLowAttendanceRisk(payload: {
+    rollNo: string;
+    studentName: string;
+    yearOfStudy: string;
+    section: string;
+    cumulativeRate: number;
+    presentCount: number;
+    totalSessions: number;
+    notifiedAt: string;
+  }): void {
+    this.broadcastAll({
+      type: 'attendance:low_risk',
+      risk: payload,
+    });
+  }
+
+  emitGoalTrackerNudge(userIds: number[], isoDate: string): void {
+    const idSet = new Set(userIds);
+    const frame = JSON.stringify({
+      type: 'goal:daily_nudge',
+      isoDate,
+      title: 'Academic Goal Tracker Check-in',
+      body: 'You have not updated your weekly Academic Goal Tracker activity today. Open Overview to log progress.',
+    });
+    for (const c of this.clients.values()) {
+      if (c.ws.readyState === WebSocket.OPEN && idSet.has(c.user.id)) {
+        c.ws.send(frame);
+      }
+    }
   }
 }
 

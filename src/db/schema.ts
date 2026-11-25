@@ -29,6 +29,7 @@ export const users = pgTable('users', {
   status: text('status').notNull().default('pending'), // 'pending' | 'approved' | 'rejected'
   approvedBy: text('approved_by'),
   approvedAt: text('approved_at'),
+  transitBufferMinutes: integer('transit_buffer_minutes').notNull().default(15),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
@@ -294,7 +295,7 @@ export const attendanceRecords = pgTable(
       onDelete: 'set null',
     }),
     markedByName: text('marked_by_name').notNull(),
-    status: text('status').notNull().default('present'), // 'present' | 'late' | 'rejected'
+    status: text('status').notNull().default('present'), // 'present' | 'late' | 'rejected' | 'od' | 'absent'
     faceImageData: text('face_image_data').notNull(),
     environmentImageData: text('environment_image_data').notNull(),
     faceDetected: boolean('face_detected').notNull().default(false),
@@ -315,6 +316,105 @@ export const attendanceRecords = pgTable(
   ]
 );
 
+// ============================================================
+// Student Registration Biometric & Classroom Environment Baselines
+// ============================================================
+export const studentBiometricProfiles = pgTable(
+  'student_biometric_profiles',
+  {
+    id: serial('id').primaryKey(),
+    rollNo: text('roll_no').notNull(),
+    email: text('email').notNull(),
+    fullName: text('full_name').notNull(),
+    department: text('department').notNull(),
+    yearOfStudy: text('year_of_study').notNull().default(''),
+    section: text('section').notNull().default(''),
+    faceImageData: text('face_image_data').notNull(),
+    environmentImageData: text('environment_image_data').notNull(),
+    capturedLatitude: text('captured_latitude').notNull().default(''),
+    capturedLongitude: text('captured_longitude').notNull().default(''),
+    distanceMeters: integer('distance_meters'),
+    locationVerified: boolean('location_verified').notNull().default(false),
+    pinnedLocationLabel: text('pinned_location_label').notNull().default(''),
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+    updatedAt: timestamp('updated_at').defaultNow().notNull(),
+  },
+  (table) => [uniqueIndex('student_biometric_roll_no_uidx').on(table.rollNo)]
+);
+
+// ============================================================
+// Faculty Delay Alerts (Reported by Class Rep / Class Advisor / HOD)
+// ============================================================
+export const facultyDelayAlerts = pgTable('faculty_delay_alerts', {
+  id: serial('id').primaryKey(),
+  department: text('department').notNull(),
+  yearOfStudy: text('year_of_study').notNull().default(''),
+  section: text('section').notNull().default(''),
+  dayOfWeek: text('day_of_week').notNull(),
+  periodNumber: integer('period_number').notNull(),
+  timetableSlotId: integer('timetable_slot_id').references(() => timetableSlots.id, {
+    onDelete: 'set null',
+  }),
+  subjectCode: text('subject_code').notNull(),
+  subjectName: text('subject_name').notNull(),
+  roomNo: text('room_no').notNull().default(''),
+  facultyName: text('faculty_name').notNull(),
+  reportedByUserId: integer('reported_by_user_id').references(() => users.id, {
+    onDelete: 'set null',
+  }),
+  reportedByName: text('reported_by_name').notNull(),
+  reportedByRole: text('reported_by_role').notNull(),
+  delayMinutes: integer('delay_minutes').notNull().default(10),
+  note: text('note').notNull().default(''),
+  status: text('status').notNull().default('active'), // 'active' | 'acknowledged' | 'resolved'
+  acknowledgedByName: text('acknowledged_by_name').notNull().default(''),
+  acknowledgedAt: timestamp('acknowledged_at'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+// ============================================================
+// OD & Leave Permission Requests (Students -> Advisor -> HOD; Faculty -> HOD)
+// ============================================================
+export const odLeaveRequests = pgTable('od_leave_requests', {
+  id: serial('id').primaryKey(),
+  requestType: text('request_type').notNull(), // 'od' | 'leave'
+  applicantCategory: text('applicant_category').notNull(), // 'student' | 'faculty'
+  applicantUserId: integer('applicant_user_id').references(() => users.id, {
+    onDelete: 'set null',
+  }),
+  applicantName: text('applicant_name').notNull(),
+  applicantRole: text('applicant_role').notNull(),
+  rollOrEmployeeId: text('roll_or_employee_id').notNull(),
+  mobileNumber: text('mobile_number').notNull().default(''),
+  department: text('department').notNull(),
+  yearOfStudy: text('year_of_study').notNull().default(''),
+  section: text('section').notNull().default(''),
+  fromDate: text('from_date').notNull(), // YYYY-MM-DD
+  toDate: text('to_date').notNull(), // YYYY-MM-DD
+  totalDays: integer('total_days').notNull().default(1),
+  reason: text('reason').notNull(),
+  customFieldsJson: text('custom_fields_json').notNull().default('{}'),
+  documentFileKey: text('document_file_key').notNull().default(''),
+  documentFileName: text('document_file_name').notNull().default(''),
+  documentMimeType: text('document_mime_type').notNull().default(''),
+  photoFileKey: text('photo_file_key').notNull().default(''),
+  photoFileName: text('photo_file_name').notNull().default(''),
+  photoMimeType: text('photo_mime_type').notNull().default(''),
+  status: text('status').notNull().default('pending_advisor'), // 'pending_advisor' | 'pending_hod' | 'approved' | 'rejected'
+  advisorStatus: text('advisor_status').notNull().default('pending'), // 'not_required' | 'pending' | 'approved' | 'rejected'
+  advisorReviewedBy: text('advisor_reviewed_by').notNull().default(''),
+  advisorRemarks: text('advisor_remarks').notNull().default(''),
+  advisorReviewedAt: timestamp('advisor_reviewed_at'),
+  hodStatus: text('hod_status').notNull().default('pending'), // 'pending' | 'approved' | 'rejected'
+  hodReviewedBy: text('hod_reviewed_by').notNull().default(''),
+  hodRemarks: text('hod_remarks').notNull().default(''),
+  hodReviewedAt: timestamp('hod_reviewed_at'),
+  attendanceMarkedStatus: text('attendance_marked_status').notNull().default(''), // '' | 'od' | 'absent'
+  attendanceDaysMarked: integer('attendance_days_marked').notNull().default(0),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});
+
 export const communitiesRelations = relations(communities, ({ many }) => ({
   groups: many(communityGroups),
   members: many(communityMembers),
@@ -334,3 +434,89 @@ export const chatMessagesRelations = relations(chatMessages, ({ one }) => ({
     references: [communityGroups.id],
   }),
 }));
+
+// ============================================================
+// Academic Goal Tracker & Weekly History Logs
+// ============================================================
+export const academicGoals = pgTable(
+  'academic_goals',
+  {
+    id: serial('id').primaryKey(),
+    userId: integer('user_id')
+      .references(() => users.id, { onDelete: 'cascade' })
+      .notNull(),
+    weeklyAttendanceTarget: integer('weekly_attendance_target').notNull().default(85),
+    weeklyEngagementTarget: integer('weekly_engagement_target').notNull().default(80),
+    lastCheckedInDate: text('last_checked_in_date').notNull().default(''),
+    note: text('note').notNull().default(''),
+    updatedAt: timestamp('updated_at').defaultNow().notNull(),
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+  },
+  (table) => [uniqueIndex('academic_goals_user_uidx').on(table.userId)]
+);
+
+export const academicGoalLogs = pgTable(
+  'academic_goal_logs',
+  {
+    id: serial('id').primaryKey(),
+    userId: integer('user_id')
+      .references(() => users.id, { onDelete: 'cascade' })
+      .notNull(),
+    weekStart: text('week_start').notNull(), // YYYY-MM-DD (Monday)
+    attendancePct: integer('attendance_pct').notNull().default(0),
+    engagementPct: integer('engagement_pct').notNull().default(0),
+    attendanceTarget: integer('attendance_target').notNull().default(85),
+    engagementTarget: integer('engagement_target').notNull().default(80),
+    checkInsCount: integer('check_ins_count').notNull().default(0),
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+  },
+  (table) => [uniqueIndex('academic_goal_logs_user_week_uidx').on(table.userId, table.weekStart)]
+);
+
+// ============================================================
+// Academic Calendar Events
+// ============================================================
+export const academicCalendarEvents = pgTable('academic_calendar_events', {
+  id: serial('id').primaryKey(),
+  title: text('title').notNull(),
+  eventDate: text('event_date').notNull(), // YYYY-MM-DD
+  category: text('category').notNull().default('event'), // 'event' | 'exam' | 'deadline' | 'holiday'
+  department: text('department').notNull(),
+  yearOfStudy: text('year_of_study').notNull().default('All Years'),
+  description: text('description').notNull().default(''),
+  createdByName: text('created_by_name').notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+// ============================================================
+// Automated Daily Archival Logs
+// ============================================================
+export const archivalLogs = pgTable('archival_logs', {
+  id: serial('id').primaryKey(),
+  archiveDate: text('archive_date').notNull(), // YYYY-MM-DD
+  storagePath: text('storage_path').notNull(),
+  attendanceCount: integer('attendance_count').notNull().default(0),
+  studentsCount: integer('students_count').notNull().default(0),
+  checksumSha256: text('checksum_sha256').notNull(),
+  triggerType: text('trigger_type').notNull().default('scheduled'), // 'scheduled' | 'manual'
+  status: text('status').notNull().default('completed'), // 'completed' | 'failed'
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+// ============================================================
+// Proactive Low-Attendance Risk Notifications Log
+// ============================================================
+export const attendanceRiskAlerts = pgTable('attendance_risk_alerts', {
+  id: serial('id').primaryKey(),
+  rollNo: text('roll_no').notNull(),
+  studentName: text('student_name').notNull(),
+  yearOfStudy: text('year_of_study').notNull().default(''),
+  section: text('section').notNull().default(''),
+  presentCount: integer('present_count').notNull().default(0),
+  totalSessions: integer('total_sessions').notNull().default(0),
+  cumulativeRate: integer('cumulative_rate').notNull().default(0),
+  advisorNotified: boolean('advisor_notified').notNull().default(true),
+  notifiedDate: text('notified_date').notNull(), // YYYY-MM-DD
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+

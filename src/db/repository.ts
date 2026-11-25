@@ -1,9 +1,19 @@
 import crypto from 'crypto';
 import { and, asc, desc, eq, gt, inArray, isNull, like, ne, or, sql } from 'drizzle-orm';
 import type {
+  AcademicCalendarEventItem,
+  AcademicEventCategory,
+  AcademicGoalPayload,
+  AcademicGoalWeekLog,
   ActivePowerBoostAlert,
+  ArchivalRecordSummary,
   AttendancePersonType,
   AttendanceRecordItem,
+  AttendanceRiskAlertItem,
+  BatchComparisonPayload,
+  BatchPerformancePoint,
+  BatchRiskStatus,
+  BatchTrendWeekPoint,
   ChatAttachmentPayload,
   ChatAttachmentType,
   ChatMessageItem,
@@ -11,14 +21,31 @@ import type {
   CommunityGroupItem,
   CommunityItem,
   DeduplicateReport,
+  DepartmentalPerformancePayload,
   DepartmentStaff,
   DepartmentStudent,
   EmailIntimation,
+  FacultyDelayAlertItem,
+  LeaderboardAndBuddiesPayload,
+  OdLeaveApplicantCategory,
+  OdLeaveFormConfig,
+  OdLeaveFormFieldConfig,
+  OdLeaveRequestItem,
+  OdLeaveRequestType,
+  OdLeaveWorkflowStatus,
   OtherDepartmentStaff,
+  PinnedLocationConfig,
   PowerBoostAcknowledgementItem,
   PowerBoostEngagementSummary,
   PowerBoostMessageStatItem,
+  StudentAchievementBadge,
+  StudentAchievementItem,
+  StudentAchievementsPayload,
+  StudentBiometricProfileSummary,
+  StudyBuddySuggestion,
   TimetableSlot,
+  TopPerformerHistoryPoint,
+  TopPerformerItem,
   UploadBatch,
   UploadModule,
   UserProfile,
@@ -26,8 +53,13 @@ import type {
 } from '../types.ts';
 import { db } from './index.ts';
 import {
+  academicCalendarEvents,
+  academicGoalLogs,
+  academicGoals,
   appSettings,
+  archivalLogs,
   attendanceRecords,
+  attendanceRiskAlerts,
   chatMessages,
   communities,
   communityGroups,
@@ -35,9 +67,12 @@ import {
   departmentStaff,
   departmentStudents,
   emailIntimations,
+  facultyDelayAlerts,
   messageAcknowledgements,
+  odLeaveRequests,
   otherDepartmentStaff,
   sessions,
+  studentBiometricProfiles,
   timetableSlots,
   uploadBatches,
   users,
@@ -87,6 +122,7 @@ export function mapUser(row: typeof users.$inferSelect): UserProfile {
     approvedBy: row.approvedBy ?? null,
     approvedAt: row.approvedAt ?? null,
     createdAt: formatTs(row.createdAt),
+    transitBufferMinutes: row.transitBufferMinutes ?? 15,
   };
 }
 
@@ -134,6 +170,83 @@ export async function ensureBaselineData(): Promise<void> {
         { key: 'department_name', value: 'Computer Science & Engineering' },
       ])
       .onConflictDoNothing();
+
+    // Idempotent schema sync for new columns & feature tables on existing Cloud SQL instances
+    await db.execute(
+      sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS transit_buffer_minutes integer NOT NULL DEFAULT 15;`
+    );
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS academic_goals (
+        id serial PRIMARY KEY,
+        user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        weekly_attendance_target integer NOT NULL DEFAULT 85,
+        weekly_engagement_target integer NOT NULL DEFAULT 80,
+        last_checked_in_date text NOT NULL DEFAULT '',
+        note text NOT NULL DEFAULT '',
+        updated_at timestamp NOT NULL DEFAULT now(),
+        created_at timestamp NOT NULL DEFAULT now()
+      );
+    `);
+    await db.execute(
+      sql`CREATE UNIQUE INDEX IF NOT EXISTS academic_goals_user_uidx ON academic_goals(user_id);`
+    );
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS academic_goal_logs (
+        id serial PRIMARY KEY,
+        user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        week_start text NOT NULL,
+        attendance_pct integer NOT NULL DEFAULT 0,
+        engagement_pct integer NOT NULL DEFAULT 0,
+        attendance_target integer NOT NULL DEFAULT 85,
+        engagement_target integer NOT NULL DEFAULT 80,
+        check_ins_count integer NOT NULL DEFAULT 0,
+        created_at timestamp NOT NULL DEFAULT now()
+      );
+    `);
+    await db.execute(
+      sql`CREATE UNIQUE INDEX IF NOT EXISTS academic_goal_logs_user_week_uidx ON academic_goal_logs(user_id, week_start);`
+    );
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS academic_calendar_events (
+        id serial PRIMARY KEY,
+        title text NOT NULL,
+        event_date text NOT NULL,
+        category text NOT NULL DEFAULT 'event',
+        department text NOT NULL,
+        year_of_study text NOT NULL DEFAULT 'All Years',
+        description text NOT NULL DEFAULT '',
+        created_by_name text NOT NULL,
+        created_at timestamp NOT NULL DEFAULT now()
+      );
+    `);
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS archival_logs (
+        id serial PRIMARY KEY,
+        archive_date text NOT NULL,
+        storage_path text NOT NULL,
+        attendance_count integer NOT NULL DEFAULT 0,
+        students_count integer NOT NULL DEFAULT 0,
+        checksum_sha256 text NOT NULL,
+        trigger_type text NOT NULL DEFAULT 'scheduled',
+        status text NOT NULL DEFAULT 'completed',
+        created_at timestamp NOT NULL DEFAULT now()
+      );
+    `);
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS attendance_risk_alerts (
+        id serial PRIMARY KEY,
+        roll_no text NOT NULL,
+        student_name text NOT NULL,
+        year_of_study text NOT NULL DEFAULT '',
+        section text NOT NULL DEFAULT '',
+        present_count integer NOT NULL DEFAULT 0,
+        total_sessions integer NOT NULL DEFAULT 0,
+        cumulative_rate integer NOT NULL DEFAULT 0,
+        advisor_notified boolean NOT NULL DEFAULT true,
+        notified_date text NOT NULL,
+        created_at timestamp NOT NULL DEFAULT now()
+      );
+    `);
 
     baselineEnsured = true;
   } catch (error) {
@@ -494,6 +607,132 @@ export async function listTimetableSlots(): Promise<TimetableSlot[]> {
   } catch (error) {
     console.error('Failed to list timetable slots:', error);
     throw new Error('Unable to load timetable records.', { cause: error });
+  }
+}
+
+export interface TimetableSlotInput {
+  department: string;
+  yearOfStudy: string;
+  section: string;
+  dayOfWeek: string;
+  periodNumber: number;
+  startTime: string;
+  endTime: string;
+  subjectCode: string;
+  subjectName: string;
+  facultyName: string;
+  facultyType: 'department' | 'other_department';
+  roomNo: string;
+}
+
+function mapTimetableRow(r: typeof timetableSlots.$inferSelect): TimetableSlot {
+  return {
+    id: r.id,
+    department: r.department,
+    yearOfStudy: r.yearOfStudy,
+    section: r.section,
+    dayOfWeek: r.dayOfWeek,
+    periodNumber: r.periodNumber,
+    startTime: r.startTime,
+    endTime: r.endTime,
+    subjectCode: r.subjectCode,
+    subjectName: r.subjectName,
+    facultyName: r.facultyName,
+    facultyType: r.facultyType as 'department' | 'other_department',
+    roomNo: r.roomNo,
+    sourceBatchId: r.sourceBatchId ?? null,
+    createdAt: formatTs(r.createdAt),
+  };
+}
+
+export async function saveTimetableSlot(
+  input: TimetableSlotInput,
+  existingId?: number
+): Promise<TimetableSlot> {
+  try {
+    await ensureBaselineData();
+    const values = {
+      department: input.department.trim(),
+      yearOfStudy: input.yearOfStudy.trim(),
+      section: input.section.trim().toUpperCase(),
+      dayOfWeek: input.dayOfWeek.trim(),
+      periodNumber: input.periodNumber,
+      startTime: input.startTime.trim(),
+      endTime: input.endTime.trim(),
+      subjectCode: input.subjectCode.trim().toUpperCase(),
+      subjectName: input.subjectName.trim(),
+      facultyName: input.facultyName.trim(),
+      facultyType: input.facultyType,
+      roomNo: input.roomNo.trim(),
+    };
+
+    if (existingId && Number.isInteger(existingId) && existingId > 0) {
+      // Remove any OTHER conflicting slot at the target (dept, year, section, day, period)
+      await db
+        .delete(timetableSlots)
+        .where(
+          and(
+            ne(timetableSlots.id, existingId),
+            eq(timetableSlots.department, values.department),
+            eq(timetableSlots.yearOfStudy, values.yearOfStudy),
+            eq(timetableSlots.section, values.section),
+            eq(timetableSlots.dayOfWeek, values.dayOfWeek),
+            eq(timetableSlots.periodNumber, values.periodNumber)
+          )
+        );
+
+      const [updated] = await db
+        .update(timetableSlots)
+        .set(values)
+        .where(eq(timetableSlots.id, existingId))
+        .returning();
+
+      if (updated) {
+        return mapTimetableRow(updated);
+      }
+    }
+
+    const [saved] = await db
+      .insert(timetableSlots)
+      .values(values)
+      .onConflictDoUpdate({
+        target: [
+          timetableSlots.department,
+          timetableSlots.yearOfStudy,
+          timetableSlots.section,
+          timetableSlots.dayOfWeek,
+          timetableSlots.periodNumber,
+        ],
+        set: {
+          startTime: values.startTime,
+          endTime: values.endTime,
+          subjectCode: values.subjectCode,
+          subjectName: values.subjectName,
+          facultyName: values.facultyName,
+          facultyType: values.facultyType,
+          roomNo: values.roomNo,
+        },
+      })
+      .returning();
+
+    return mapTimetableRow(saved);
+  } catch (error) {
+    console.error('Failed to save timetable slot:', error);
+    throw new Error('Unable to save timetable slot.', { cause: error });
+  }
+}
+
+export async function deleteTimetableSlot(id: number): Promise<boolean> {
+  try {
+    await ensureBaselineData();
+    const deleted = await db
+      .delete(timetableSlots)
+      .where(eq(timetableSlots.id, id))
+      .returning({ id: timetableSlots.id });
+    return deleted.length > 0;
+  } catch (error) {
+    console.error('Failed to delete timetable slot:', error);
+    throw new Error('Unable to delete timetable slot.', { cause: error });
   }
 }
 
@@ -1682,7 +1921,7 @@ export async function upsertAttendanceRecord(params: {
   personName: string;
   markedByUserId: number;
   markedByName: string;
-  status: 'present' | 'late' | 'rejected';
+  status: 'present' | 'late' | 'rejected' | 'od' | 'absent';
   faceImageData: string;
   environmentImageData: string;
   faceDetected: boolean;
@@ -1780,3 +2019,2451 @@ export async function listEmailIntimations(): Promise<EmailIntimation[]> {
     throw new Error('Unable to load email intimations.', { cause: error });
   }
 }
+
+// ============================================================
+// HOD Pinned Classroom Location (Geofence) & Haversine Distance
+// ============================================================
+export function calculateDistanceMeters(
+  lat1: number,
+  lon1: number,
+  lat2: number,
+  lon2: number
+): number {
+  const R = 6371000; // Earth radius in meters
+  const toRad = (deg: number) => (deg * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(lat1)) *
+      Math.cos(toRad(lat2)) *
+      Math.sin(dLon / 2) *
+      Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return Math.round(R * c);
+}
+
+export async function getPinnedLocationConfig(): Promise<PinnedLocationConfig> {
+  try {
+    await ensureBaselineData();
+    const [label, latStr, lngStr, radiusStr, updatedBy, updatedAt] = await Promise.all([
+      getSetting('pinned_location_label', ''),
+      getSetting('pinned_location_lat', ''),
+      getSetting('pinned_location_lng', ''),
+      getSetting('pinned_location_radius_m', '200'),
+      getSetting('pinned_location_updated_by', ''),
+      getSetting('pinned_location_updated_at', ''),
+    ]);
+
+    const latitude = latStr !== '' && Number.isFinite(Number(latStr)) ? Number(latStr) : null;
+    const longitude = lngStr !== '' && Number.isFinite(Number(lngStr)) ? Number(lngStr) : null;
+    const radiusMeters = Math.max(
+      25,
+      Math.min(5000, Math.round(Number(radiusStr) || 200))
+    );
+
+    return {
+      configured: latitude !== null && longitude !== null,
+      label: label || 'Department Classroom Zone',
+      latitude,
+      longitude,
+      radiusMeters,
+      updatedBy,
+      updatedAt,
+    };
+  } catch (error) {
+    console.error('Failed to read pinned location config:', error);
+    return {
+      configured: false,
+      label: 'Department Classroom Zone',
+      latitude: null,
+      longitude: null,
+      radiusMeters: 200,
+      updatedBy: '',
+      updatedAt: '',
+    };
+  }
+}
+
+export async function savePinnedLocationConfig(params: {
+  label: string;
+  latitude: number;
+  longitude: number;
+  radiusMeters: number;
+  updatedBy: string;
+}): Promise<PinnedLocationConfig> {
+  const radius = Math.max(25, Math.min(5000, Math.round(params.radiusMeters || 200)));
+  const updatedAt = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  await Promise.all([
+    setSetting('pinned_location_label', params.label.trim() || 'Department Classroom Zone'),
+    setSetting('pinned_location_lat', String(params.latitude)),
+    setSetting('pinned_location_lng', String(params.longitude)),
+    setSetting('pinned_location_radius_m', String(radius)),
+    setSetting('pinned_location_updated_by', params.updatedBy),
+    setSetting('pinned_location_updated_at', updatedAt),
+  ]);
+  return getPinnedLocationConfig();
+}
+
+// ============================================================
+// Student Registration Biometric & Environment Baselines
+// ============================================================
+export async function upsertStudentBiometricProfile(params: {
+  rollNo: string;
+  email: string;
+  fullName: string;
+  department: string;
+  yearOfStudy: string;
+  section: string;
+  faceImageData: string;
+  environmentImageData: string;
+  capturedLatitude: string;
+  capturedLongitude: string;
+  distanceMeters: number | null;
+  locationVerified: boolean;
+  pinnedLocationLabel: string;
+}): Promise<StudentBiometricProfileSummary> {
+  const cleanRoll = params.rollNo.trim().toUpperCase();
+  const [saved] = await db
+    .insert(studentBiometricProfiles)
+    .values({
+      rollNo: cleanRoll,
+      email: params.email.trim().toLowerCase(),
+      fullName: params.fullName.trim(),
+      department: params.department.trim(),
+      yearOfStudy: params.yearOfStudy.trim(),
+      section: params.section.trim().toUpperCase(),
+      faceImageData: params.faceImageData,
+      environmentImageData: params.environmentImageData,
+      capturedLatitude: params.capturedLatitude,
+      capturedLongitude: params.capturedLongitude,
+      distanceMeters: params.distanceMeters,
+      locationVerified: params.locationVerified,
+      pinnedLocationLabel: params.pinnedLocationLabel,
+      updatedAt: new Date(),
+    })
+    .onConflictDoUpdate({
+      target: [studentBiometricProfiles.rollNo],
+      set: {
+        email: params.email.trim().toLowerCase(),
+        fullName: params.fullName.trim(),
+        department: params.department.trim(),
+        yearOfStudy: params.yearOfStudy.trim(),
+        section: params.section.trim().toUpperCase(),
+        faceImageData: params.faceImageData,
+        environmentImageData: params.environmentImageData,
+        capturedLatitude: params.capturedLatitude,
+        capturedLongitude: params.capturedLongitude,
+        distanceMeters: params.distanceMeters,
+        locationVerified: params.locationVerified,
+        pinnedLocationLabel: params.pinnedLocationLabel,
+        updatedAt: new Date(),
+      },
+    })
+    .returning();
+
+  return {
+    rollNo: saved.rollNo,
+    email: saved.email,
+    fullName: saved.fullName,
+    hasFaceBaseline: Boolean(saved.faceImageData),
+    hasEnvironmentBaseline: Boolean(saved.environmentImageData),
+    capturedLatitude: saved.capturedLatitude,
+    capturedLongitude: saved.capturedLongitude,
+    distanceMeters: saved.distanceMeters ?? null,
+    locationVerified: saved.locationVerified,
+    pinnedLocationLabel: saved.pinnedLocationLabel,
+    updatedAt: formatTs(saved.updatedAt),
+  };
+}
+
+export async function getStudentBiometricProfile(rollNo: string) {
+  const cleanRoll = rollNo.trim().toUpperCase();
+  if (!cleanRoll) return null;
+  const rows = await db
+    .select()
+    .from(studentBiometricProfiles)
+    .where(eq(studentBiometricProfiles.rollNo, cleanRoll))
+    .limit(1);
+  return rows[0] ?? null;
+}
+
+export async function listStudentBiometricSummaries(): Promise<StudentBiometricProfileSummary[]> {
+  try {
+    const rows = await db
+      .select({
+        rollNo: studentBiometricProfiles.rollNo,
+        email: studentBiometricProfiles.email,
+        fullName: studentBiometricProfiles.fullName,
+        faceImageData: studentBiometricProfiles.faceImageData,
+        environmentImageData: studentBiometricProfiles.environmentImageData,
+        capturedLatitude: studentBiometricProfiles.capturedLatitude,
+        capturedLongitude: studentBiometricProfiles.capturedLongitude,
+        distanceMeters: studentBiometricProfiles.distanceMeters,
+        locationVerified: studentBiometricProfiles.locationVerified,
+        pinnedLocationLabel: studentBiometricProfiles.pinnedLocationLabel,
+        updatedAt: studentBiometricProfiles.updatedAt,
+      })
+      .from(studentBiometricProfiles)
+      .orderBy(desc(studentBiometricProfiles.updatedAt));
+
+    return rows.map((r) => ({
+      rollNo: r.rollNo,
+      email: r.email,
+      fullName: r.fullName,
+      hasFaceBaseline: Boolean(r.faceImageData),
+      hasEnvironmentBaseline: Boolean(r.environmentImageData),
+      capturedLatitude: r.capturedLatitude,
+      capturedLongitude: r.capturedLongitude,
+      distanceMeters: r.distanceMeters ?? null,
+      locationVerified: r.locationVerified,
+      pinnedLocationLabel: r.pinnedLocationLabel,
+      updatedAt: formatTs(r.updatedAt),
+    }));
+  } catch (error) {
+    console.error('Failed to list student biometric summaries:', error);
+    return [];
+  }
+}
+
+// ============================================================
+// Faculty Delay Alerts Queries
+// ============================================================
+function mapFacultyDelayRow(
+  r: typeof facultyDelayAlerts.$inferSelect
+): FacultyDelayAlertItem {
+  return {
+    id: r.id,
+    department: r.department,
+    yearOfStudy: r.yearOfStudy,
+    section: r.section,
+    dayOfWeek: r.dayOfWeek,
+    periodNumber: r.periodNumber,
+    timetableSlotId: r.timetableSlotId ?? null,
+    subjectCode: r.subjectCode,
+    subjectName: r.subjectName,
+    roomNo: r.roomNo,
+    facultyName: r.facultyName,
+    reportedByUserId: r.reportedByUserId ?? null,
+    reportedByName: r.reportedByName,
+    reportedByRole: r.reportedByRole,
+    delayMinutes: r.delayMinutes,
+    note: r.note,
+    status: r.status as 'active' | 'acknowledged' | 'resolved',
+    acknowledgedByName: r.acknowledgedByName,
+    acknowledgedAt: r.acknowledgedAt ? formatTs(r.acknowledgedAt) : null,
+    createdAt: formatTs(r.createdAt),
+  };
+}
+
+export function isUserFacultyDelayRecipient(
+  alert: Pick<FacultyDelayAlertItem, 'facultyName' | 'reportedByUserId' | 'yearOfStudy' | 'section'>,
+  user: Pick<UserProfile, 'id' | 'role' | 'fullName' | 'yearOfStudy' | 'section'>
+): boolean {
+  if (user.role === 'hod' || user.role === 'class_advisor') {
+    return true;
+  }
+  if (alert.reportedByUserId === user.id) {
+    return true;
+  }
+  if (user.role === 'dept_staff' || user.role === 'other_dept_staff') {
+    const normUser = user.fullName.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const normFaculty = alert.facultyName.toLowerCase().replace(/[^a-z0-9]/g, '');
+    if (normUser && normFaculty && (normUser.includes(normFaculty) || normFaculty.includes(normUser))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export async function createFacultyDelayAlert(params: {
+  department: string;
+  yearOfStudy: string;
+  section: string;
+  dayOfWeek: string;
+  periodNumber: number;
+  timetableSlotId: number | null;
+  subjectCode: string;
+  subjectName: string;
+  roomNo: string;
+  facultyName: string;
+  user: UserProfile;
+  delayMinutes: number;
+  note: string;
+}): Promise<FacultyDelayAlertItem> {
+  const [created] = await db
+    .insert(facultyDelayAlerts)
+    .values({
+      department: params.department.trim(),
+      yearOfStudy: params.yearOfStudy.trim(),
+      section: params.section.trim().toUpperCase(),
+      dayOfWeek: params.dayOfWeek.trim(),
+      periodNumber: params.periodNumber,
+      timetableSlotId: params.timetableSlotId,
+      subjectCode: params.subjectCode.trim().toUpperCase(),
+      subjectName: params.subjectName.trim(),
+      roomNo: params.roomNo.trim(),
+      facultyName: params.facultyName.trim(),
+      reportedByUserId: params.user.id,
+      reportedByName: params.user.fullName,
+      reportedByRole: params.user.role,
+      delayMinutes: Math.max(1, Math.min(120, Math.round(params.delayMinutes || 10))),
+      note: params.note.trim().slice(0, 300),
+      status: 'active',
+    })
+    .returning();
+
+  return mapFacultyDelayRow(created);
+}
+
+export async function listFacultyDelayAlertsForUser(
+  user: UserProfile
+): Promise<FacultyDelayAlertItem[]> {
+  try {
+    const rows = await db
+      .select()
+      .from(facultyDelayAlerts)
+      .orderBy(desc(facultyDelayAlerts.id))
+      .limit(50);
+
+    return rows
+      .map(mapFacultyDelayRow)
+      .filter((alert) => isUserFacultyDelayRecipient(alert, user));
+  } catch (error) {
+    console.error('Failed to list faculty delay alerts:', error);
+    return [];
+  }
+}
+
+export async function updateFacultyDelayAlertStatus(params: {
+  id: number;
+  status: 'acknowledged' | 'resolved';
+  acknowledgedByName: string;
+}): Promise<FacultyDelayAlertItem | null> {
+  const [updated] = await db
+    .update(facultyDelayAlerts)
+    .set({
+      status: params.status,
+      acknowledgedByName: params.acknowledgedByName,
+      acknowledgedAt: new Date(),
+    })
+    .where(eq(facultyDelayAlerts.id, params.id))
+    .returning();
+  return updated ? mapFacultyDelayRow(updated) : null;
+}
+
+// ============================================================
+// OD & Leave Permission Workflow + HOD Form Customization
+// ============================================================
+export function getDefaultOdLeaveFormConfig(): OdLeaveFormConfig {
+  return {
+    requireClassAdvisorForStudents: true,
+    allowDocumentUpload: true,
+    requireDocumentUploadForOd: true,
+    requireDocumentUploadForLeave: false,
+    allowPhotoUpload: true,
+    requirePhotoUpload: false,
+    maxOdDays: 10,
+    maxLeaveDays: 15,
+    declarationText:
+      'I confirm that the details and supporting documents attached above are genuine and I will complete all missed academic work.',
+    fields: [
+      {
+        id: 'parent_mobile',
+        label: 'Parent / Guardian Contact Number',
+        type: 'phone',
+        required: true,
+        enabled: true,
+        appliesTo: 'student',
+        placeholder: '+91 98765 43210',
+        options: [],
+      },
+      {
+        id: 'event_or_venue',
+        label: 'Event / Institution / Venue (for OD)',
+        type: 'text',
+        required: false,
+        enabled: true,
+        appliesTo: 'all',
+        placeholder: 'e.g. Anna University Symposium / Hackathon / Medical Clinic',
+        options: [],
+      },
+      {
+        id: 'leave_category',
+        label: 'Category',
+        type: 'select',
+        required: true,
+        enabled: true,
+        appliesTo: 'all',
+        placeholder: 'Select category',
+        options: [
+          'Medical / Health',
+          'Technical Symposium / Hackathon',
+          'Sports / Cultural Event',
+          'Industrial Visit / Placement',
+          'Personal / Family Function',
+          'Official Academic Duty',
+        ],
+      },
+      {
+        id: 'alternate_arrangement',
+        label: 'Alternate Class Arrangement (Faculty)',
+        type: 'text',
+        required: true,
+        enabled: true,
+        appliesTo: 'faculty',
+        placeholder: 'Faculty name handling scheduled periods',
+        options: [],
+      },
+    ],
+    updatedBy: 'Department Default',
+    updatedAt: '',
+  };
+}
+
+export async function getOdLeaveFormConfig(): Promise<OdLeaveFormConfig> {
+  const defaults = getDefaultOdLeaveFormConfig();
+  try {
+    const raw = await getSetting('od_leave_form_config', '');
+    if (!raw) return defaults;
+    const parsed = JSON.parse(raw) as Partial<OdLeaveFormConfig>;
+    return {
+      requireClassAdvisorForStudents:
+        typeof parsed.requireClassAdvisorForStudents === 'boolean'
+          ? parsed.requireClassAdvisorForStudents
+          : defaults.requireClassAdvisorForStudents,
+      allowDocumentUpload:
+        typeof parsed.allowDocumentUpload === 'boolean'
+          ? parsed.allowDocumentUpload
+          : defaults.allowDocumentUpload,
+      requireDocumentUploadForOd:
+        typeof parsed.requireDocumentUploadForOd === 'boolean'
+          ? parsed.requireDocumentUploadForOd
+          : defaults.requireDocumentUploadForOd,
+      requireDocumentUploadForLeave:
+        typeof parsed.requireDocumentUploadForLeave === 'boolean'
+          ? parsed.requireDocumentUploadForLeave
+          : defaults.requireDocumentUploadForLeave,
+      allowPhotoUpload:
+        typeof parsed.allowPhotoUpload === 'boolean'
+          ? parsed.allowPhotoUpload
+          : defaults.allowPhotoUpload,
+      requirePhotoUpload:
+        typeof parsed.requirePhotoUpload === 'boolean'
+          ? parsed.requirePhotoUpload
+          : defaults.requirePhotoUpload,
+      maxOdDays: Math.max(1, Math.min(60, Number(parsed.maxOdDays) || defaults.maxOdDays)),
+      maxLeaveDays: Math.max(1, Math.min(60, Number(parsed.maxLeaveDays) || defaults.maxLeaveDays)),
+      declarationText:
+        typeof parsed.declarationText === 'string' && parsed.declarationText.trim()
+          ? parsed.declarationText.trim().slice(0, 400)
+          : defaults.declarationText,
+      fields: Array.isArray(parsed.fields)
+        ? parsed.fields.slice(0, 25).map((f: Partial<OdLeaveFormFieldConfig>, idx: number) => ({
+            id: String(f.id || `custom_${idx + 1}`)
+              .toLowerCase()
+              .replace(/[^a-z0-9_]/g, '_')
+              .slice(0, 40),
+            label: String(f.label || `Field ${idx + 1}`).trim().slice(0, 80),
+            type: (['text', 'textarea', 'number', 'phone', 'date', 'select'].includes(String(f.type))
+              ? f.type
+              : 'text') as OdLeaveFormFieldConfig['type'],
+            required: Boolean(f.required),
+            enabled: f.enabled !== false,
+            appliesTo: (['all', 'student', 'faculty'].includes(String(f.appliesTo))
+              ? f.appliesTo
+              : 'all') as OdLeaveFormFieldConfig['appliesTo'],
+            placeholder: String(f.placeholder || '').trim().slice(0, 120),
+            options: Array.isArray(f.options)
+              ? f.options
+                  .map((o) => String(o).trim())
+                  .filter(Boolean)
+                  .slice(0, 20)
+              : [],
+          }))
+        : defaults.fields,
+      updatedBy: String(parsed.updatedBy || defaults.updatedBy),
+      updatedAt: String(parsed.updatedAt || ''),
+    };
+  } catch (error) {
+    console.error('Failed to parse OD/Leave form config:', error);
+    return defaults;
+  }
+}
+
+export async function saveOdLeaveFormConfig(
+  config: Omit<OdLeaveFormConfig, 'updatedBy' | 'updatedAt'>,
+  updatedBy: string
+): Promise<OdLeaveFormConfig> {
+  const sanitized: OdLeaveFormConfig = {
+    requireClassAdvisorForStudents: Boolean(config.requireClassAdvisorForStudents),
+    allowDocumentUpload: Boolean(config.allowDocumentUpload),
+    requireDocumentUploadForOd: Boolean(config.requireDocumentUploadForOd),
+    requireDocumentUploadForLeave: Boolean(config.requireDocumentUploadForLeave),
+    allowPhotoUpload: Boolean(config.allowPhotoUpload),
+    requirePhotoUpload: Boolean(config.requirePhotoUpload),
+    maxOdDays: Math.max(1, Math.min(60, Math.round(Number(config.maxOdDays) || 10))),
+    maxLeaveDays: Math.max(1, Math.min(60, Math.round(Number(config.maxLeaveDays) || 15))),
+    declarationText: String(config.declarationText || '').trim().slice(0, 400),
+    fields: (Array.isArray(config.fields) ? config.fields : [])
+      .slice(0, 25)
+      .map((f, idx) => ({
+        id:
+          String(f.id || `field_${idx + 1}`)
+            .toLowerCase()
+            .replace(/[^a-z0-9_]/g, '_')
+            .slice(0, 40) || `field_${idx + 1}`,
+        label: String(f.label || `Field ${idx + 1}`).trim().slice(0, 80),
+        type: (['text', 'textarea', 'number', 'phone', 'date', 'select'].includes(f.type)
+          ? f.type
+          : 'text') as OdLeaveFormFieldConfig['type'],
+        required: Boolean(f.required),
+        enabled: f.enabled !== false,
+        appliesTo: (['all', 'student', 'faculty'].includes(f.appliesTo)
+          ? f.appliesTo
+          : 'all') as OdLeaveFormFieldConfig['appliesTo'],
+        placeholder: String(f.placeholder || '').trim().slice(0, 120),
+        options: Array.isArray(f.options)
+          ? f.options
+              .map((o) => String(o).trim())
+              .filter(Boolean)
+              .slice(0, 20)
+          : [],
+      }))
+      .filter((f) => f.label.length > 0),
+    updatedBy,
+    updatedAt: new Date().toISOString().replace('T', ' ').slice(0, 19),
+  };
+
+  await setSetting('od_leave_form_config', JSON.stringify(sanitized));
+  return getOdLeaveFormConfig();
+}
+
+function mapOdLeaveRow(r: typeof odLeaveRequests.$inferSelect): OdLeaveRequestItem {
+  let customFields: Record<string, string> = {};
+  try {
+    const parsed = JSON.parse(r.customFieldsJson || '{}');
+    if (parsed && typeof parsed === 'object') {
+      customFields = Object.fromEntries(
+        Object.entries(parsed).map(([k, v]) => [k, String(v ?? '')])
+      );
+    }
+  } catch {
+    customFields = {};
+  }
+
+  return {
+    id: r.id,
+    requestType: r.requestType as OdLeaveRequestType,
+    applicantCategory: r.applicantCategory as OdLeaveApplicantCategory,
+    applicantUserId: r.applicantUserId ?? null,
+    applicantName: r.applicantName,
+    applicantRole: r.applicantRole,
+    rollOrEmployeeId: r.rollOrEmployeeId,
+    mobileNumber: r.mobileNumber,
+    department: r.department,
+    yearOfStudy: r.yearOfStudy,
+    section: r.section,
+    fromDate: r.fromDate,
+    toDate: r.toDate,
+    totalDays: r.totalDays,
+    reason: r.reason,
+    customFields,
+    documentFileKey: r.documentFileKey,
+    documentFileName: r.documentFileName,
+    documentMimeType: r.documentMimeType,
+    photoFileKey: r.photoFileKey,
+    photoFileName: r.photoFileName,
+    photoMimeType: r.photoMimeType,
+    status: r.status as OdLeaveWorkflowStatus,
+    advisorStatus: r.advisorStatus as OdLeaveRequestItem['advisorStatus'],
+    advisorReviewedBy: r.advisorReviewedBy,
+    advisorRemarks: r.advisorRemarks,
+    advisorReviewedAt: r.advisorReviewedAt ? formatTs(r.advisorReviewedAt) : null,
+    hodStatus: r.hodStatus as OdLeaveRequestItem['hodStatus'],
+    hodReviewedBy: r.hodReviewedBy,
+    hodRemarks: r.hodRemarks,
+    hodReviewedAt: r.hodReviewedAt ? formatTs(r.hodReviewedAt) : null,
+    attendanceMarkedStatus: (r.attendanceMarkedStatus || '') as '' | 'od' | 'absent',
+    attendanceDaysMarked: r.attendanceDaysMarked ?? 0,
+    createdAt: formatTs(r.createdAt),
+    updatedAt: formatTs(r.updatedAt),
+  };
+}
+
+export function enumerateDateRangeInclusive(fromDate: string, toDate: string): string[] {
+  const start = new Date(`${fromDate}T00:00:00Z`);
+  const end = new Date(`${toDate}T00:00:00Z`);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || end < start) {
+    return [];
+  }
+  const dates: string[] = [];
+  const cursor = new Date(start.getTime());
+  let guard = 0;
+  while (cursor <= end && guard < 62) {
+    dates.push(cursor.toISOString().slice(0, 10));
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
+    guard += 1;
+  }
+  return dates;
+}
+
+const WEEKDAY_NAMES_UTC = [
+  'Sunday',
+  'Monday',
+  'Tuesday',
+  'Wednesday',
+  'Thursday',
+  'Friday',
+  'Saturday',
+];
+
+export async function createOdLeaveRequest(params: {
+  requestType: OdLeaveRequestType;
+  applicantCategory: OdLeaveApplicantCategory;
+  user: UserProfile;
+  applicantName: string;
+  rollOrEmployeeId: string;
+  mobileNumber: string;
+  department: string;
+  yearOfStudy: string;
+  section: string;
+  fromDate: string;
+  toDate: string;
+  totalDays: number;
+  reason: string;
+  customFields: Record<string, string>;
+  documentFileKey: string;
+  documentFileName: string;
+  documentMimeType: string;
+  photoFileKey: string;
+  photoFileName: string;
+  photoMimeType: string;
+  requireClassAdvisor: boolean;
+}): Promise<OdLeaveRequestItem> {
+  const needsAdvisor =
+    params.applicantCategory === 'student' && params.requireClassAdvisor;
+  const initialStatus: OdLeaveWorkflowStatus = needsAdvisor
+    ? 'pending_advisor'
+    : 'pending_hod';
+
+  const [created] = await db
+    .insert(odLeaveRequests)
+    .values({
+      requestType: params.requestType,
+      applicantCategory: params.applicantCategory,
+      applicantUserId: params.user.id,
+      applicantName: params.applicantName.trim(),
+      applicantRole: params.user.role,
+      rollOrEmployeeId: params.rollOrEmployeeId.trim().toUpperCase(),
+      mobileNumber: params.mobileNumber.trim(),
+      department: params.department.trim(),
+      yearOfStudy: params.yearOfStudy.trim(),
+      section: params.section.trim().toUpperCase(),
+      fromDate: params.fromDate,
+      toDate: params.toDate,
+      totalDays: params.totalDays,
+      reason: params.reason.trim(),
+      customFieldsJson: JSON.stringify(params.customFields || {}),
+      documentFileKey: params.documentFileKey,
+      documentFileName: params.documentFileName,
+      documentMimeType: params.documentMimeType,
+      photoFileKey: params.photoFileKey,
+      photoFileName: params.photoFileName,
+      photoMimeType: params.photoMimeType,
+      status: initialStatus,
+      advisorStatus: needsAdvisor ? 'pending' : 'not_required',
+      hodStatus: 'pending',
+    })
+    .returning();
+
+  return mapOdLeaveRow(created);
+}
+
+export async function getOdLeaveRequestById(id: number): Promise<OdLeaveRequestItem | null> {
+  const rows = await db
+    .select()
+    .from(odLeaveRequests)
+    .where(eq(odLeaveRequests.id, id))
+    .limit(1);
+  return rows[0] ? mapOdLeaveRow(rows[0]) : null;
+}
+
+export async function listOdLeaveRequestsForUser(
+  user: UserProfile
+): Promise<OdLeaveRequestItem[]> {
+  try {
+    const rows = await db
+      .select()
+      .from(odLeaveRequests)
+      .orderBy(desc(odLeaveRequests.id))
+      .limit(200);
+
+    const mapped = rows.map(mapOdLeaveRow);
+    if (user.role === 'hod') {
+      return mapped;
+    }
+    if (user.role === 'class_advisor') {
+      // Class advisors see all student requests (for review) plus their own faculty requests
+      return mapped.filter(
+        (r) => r.applicantCategory === 'student' || r.applicantUserId === user.id
+      );
+    }
+    // Students, Class Reps, and regular Faculty see their own submitted requests
+    return mapped.filter(
+      (r) =>
+        r.applicantUserId === user.id ||
+        (user.staffOrRollId &&
+          r.rollOrEmployeeId.toUpperCase() === user.staffOrRollId.trim().toUpperCase())
+    );
+  } catch (error) {
+    console.error('Failed to list OD/Leave requests:', error);
+    return [];
+  }
+}
+
+export async function listActiveApprovedOdLeaveForDate(
+  isoDate: string
+): Promise<OdLeaveRequestItem[]> {
+  try {
+    const rows = await db
+      .select()
+      .from(odLeaveRequests)
+      .where(eq(odLeaveRequests.status, 'approved'))
+      .orderBy(desc(odLeaveRequests.id))
+      .limit(200);
+    return rows
+      .map(mapOdLeaveRow)
+      .filter((r) => r.fromDate <= isoDate && r.toDate >= isoDate);
+  } catch (error) {
+    console.error('Failed to list active OD/Leave for date:', error);
+    return [];
+  }
+}
+
+export async function decideOdLeaveRequest(params: {
+  request: OdLeaveRequestItem;
+  reviewer: UserProfile;
+  decision: 'approve' | 'reject';
+  remarks: string;
+  serverTimestamp: string;
+}): Promise<OdLeaveRequestItem> {
+  const { request, reviewer, decision, remarks, serverTimestamp } = params;
+  const now = new Date();
+  const cleanRemarks = remarks.trim().slice(0, 300);
+
+  // Stage 1: Class Advisor reviews Student Request
+  if (reviewer.role === 'class_advisor') {
+    if (decision === 'reject') {
+      const [updated] = await db
+        .update(odLeaveRequests)
+        .set({
+          status: 'rejected',
+          advisorStatus: 'rejected',
+          advisorReviewedBy: reviewer.fullName,
+          advisorRemarks: cleanRemarks,
+          advisorReviewedAt: now,
+          updatedAt: now,
+        })
+        .where(eq(odLeaveRequests.id, request.id))
+        .returning();
+      return mapOdLeaveRow(updated);
+    }
+
+    const [updated] = await db
+      .update(odLeaveRequests)
+      .set({
+        status: 'pending_hod',
+        advisorStatus: 'approved',
+        advisorReviewedBy: reviewer.fullName,
+        advisorRemarks: cleanRemarks,
+        advisorReviewedAt: now,
+        updatedAt: now,
+      })
+      .where(eq(odLeaveRequests.id, request.id))
+      .returning();
+    return mapOdLeaveRow(updated);
+  }
+
+  // Stage 2 (or Direct Faculty Approval): HOD final decision
+  if (decision === 'reject') {
+    const [updated] = await db
+      .update(odLeaveRequests)
+      .set({
+        status: 'rejected',
+        hodStatus: 'rejected',
+        hodReviewedBy: reviewer.fullName,
+        hodRemarks: cleanRemarks,
+        hodReviewedAt: now,
+        updatedAt: now,
+      })
+      .where(eq(odLeaveRequests.id, request.id))
+      .returning();
+    return mapOdLeaveRow(updated);
+  }
+
+  // HOD APPROVED: Automatically mark attendance as 'od' (for OD) or 'absent' (for Leave)
+  // across every day from fromDate through toDate (inclusive)!
+  const dates = enumerateDateRangeInclusive(request.fromDate, request.toDate);
+  const attendanceStatus: 'od' | 'absent' = request.requestType === 'od' ? 'od' : 'absent';
+  const personType: AttendancePersonType =
+    request.applicantCategory === 'student' ? 'student' : 'faculty';
+  const subjectCode = request.requestType === 'od' ? 'OD-PERMIT' : 'LEAVE-ABS';
+  const subjectName =
+    request.requestType === 'od'
+      ? `Approved On-Duty (${request.fromDate} to ${request.toDate})`
+      : `Approved Leave — Marked Absent (${request.fromDate} to ${request.toDate})`;
+
+  let daysMarked = 0;
+  for (const isoDate of dates) {
+    const d = new Date(`${isoDate}T00:00:00Z`);
+    const dayOfWeek = WEEKDAY_NAMES_UTC[d.getUTCDay()] || 'Monday';
+    await upsertAttendanceRecord({
+      attendanceDate: isoDate,
+      dayOfWeek,
+      periodNumber: 1,
+      timetableSlotId: null,
+      subjectCode,
+      subjectName,
+      department: request.department,
+      yearOfStudy: request.yearOfStudy,
+      section: request.section,
+      roomNo: request.requestType === 'od' ? 'On-Duty' : 'On Leave',
+      personType,
+      personIdentifier: request.rollOrEmployeeId,
+      personName: request.applicantName,
+      markedByUserId: reviewer.id,
+      markedByName: `${reviewer.fullName} (HOD Permission)`,
+      status: attendanceStatus,
+      faceImageData: '',
+      environmentImageData: '',
+      faceDetected: false,
+      faceConfidence: 0,
+      environmentVerified: false,
+      environmentLabel:
+        request.requestType === 'od' ? 'Approved OD Permission' : 'Approved Leave (Absent)',
+      verificationSummary:
+        request.requestType === 'od'
+          ? `OD granted by HOD (${reviewer.fullName}) from ${request.fromDate} to ${request.toDate}. Reason: ${request.reason.slice(0, 120)}`
+          : `Leave granted by HOD (${reviewer.fullName}) from ${request.fromDate} to ${request.toDate} — marked Absent. Reason: ${request.reason.slice(0, 120)}`,
+      serverTimestamp,
+    });
+    daysMarked += 1;
+  }
+
+  const [updated] = await db
+    .update(odLeaveRequests)
+    .set({
+      status: 'approved',
+      advisorStatus:
+        request.advisorStatus === 'pending' ? 'approved' : request.advisorStatus,
+      advisorReviewedBy:
+        request.advisorStatus === 'pending'
+          ? `${reviewer.fullName} (HOD Direct)`
+          : request.advisorReviewedBy,
+      advisorReviewedAt:
+        request.advisorStatus === 'pending' ? now : request.advisorReviewedAt ? new Date(request.advisorReviewedAt) : null,
+      hodStatus: 'approved',
+      hodReviewedBy: reviewer.fullName,
+      hodRemarks: cleanRemarks,
+      hodReviewedAt: now,
+      attendanceMarkedStatus: attendanceStatus,
+      attendanceDaysMarked: daysMarked,
+      updatedAt: now,
+    })
+    .where(eq(odLeaveRequests.id, request.id))
+    .returning();
+
+  return mapOdLeaveRow(updated);
+}
+
+// ============================================================
+// Departmental Performance Analytics (Avg Attendance vs Academic Engagement by Batch)
+// ============================================================
+function getBatchSortOrder(yearLabel: string): number {
+  const norm = yearLabel.trim().toLowerCase();
+  if (/^(i\b|1st|first|year\s*1|1\b)/.test(norm)) return 1;
+  if (/^(ii\b|2nd|second|year\s*2|2\b)/.test(norm)) return 2;
+  if (/^(iii\b|3rd|third|year\s*3|3\b)/.test(norm)) return 3;
+  if (/^(iv\b|4th|fourth|year\s*4|4\b)/.test(norm)) return 4;
+  if (/^(v\b|5th|fifth|year\s*5|5\b)/.test(norm)) return 5;
+  const numMatch = norm.match(/\d+/);
+  if (numMatch) return Number(numMatch[0]);
+  return 99;
+}
+
+function normalizeCgpaToScore(raw: string): { cgpa: number; score: number } | null {
+  const cleaned = raw.trim().replace(/[^0-9.]/g, '');
+  if (!cleaned) return null;
+  const val = Number(cleaned);
+  if (!Number.isFinite(val) || val <= 0) return null;
+  if (val <= 4.0) {
+    return { cgpa: Number(val.toFixed(2)), score: Math.min(100, Math.round((val / 4.0) * 100)) };
+  }
+  if (val <= 10.0) {
+    return { cgpa: Number(val.toFixed(2)), score: Math.min(100, Math.round(val * 10)) };
+  }
+  if (val <= 100) {
+    return { cgpa: Number((val / 10).toFixed(2)), score: Math.min(100, Math.round(val)) };
+  }
+  return null;
+}
+
+export async function getDepartmentalPerformanceSummary(
+  groupBy: 'year' | 'section' = 'year'
+): Promise<DepartmentalPerformancePayload> {
+  const [
+    departmentName,
+    studentRows,
+    studentAttendanceRows,
+    approvedStudentUsers,
+    boostedMessageRows,
+    ackRows,
+    chatRows,
+    biometricRows,
+  ] = await Promise.all([
+    getSetting('department_name', 'Computer Science & Engineering'),
+    db.select().from(departmentStudents),
+    db
+      .select()
+      .from(attendanceRecords)
+      .where(eq(attendanceRecords.personType, 'student')),
+    db
+      .select()
+      .from(users)
+      .where(
+        and(
+          eq(users.status, 'approved'),
+          or(eq(users.role, 'student'), eq(users.role, 'class_rep'))
+        )
+      ),
+    db
+      .select({ id: chatMessages.id })
+      .from(chatMessages)
+      .where(
+        or(
+          eq(chatMessages.powerBoostEnabled, true),
+          gt(chatMessages.powerBoostIntervalMinutes, 0)
+        )
+      ),
+    db.select().from(messageAcknowledgements),
+    db
+      .select({
+        senderUserId: chatMessages.senderUserId,
+        senderRole: chatMessages.senderRole,
+      })
+      .from(chatMessages),
+    db
+      .select({
+        rollNo: studentBiometricProfiles.rollNo,
+        yearOfStudy: studentBiometricProfiles.yearOfStudy,
+        section: studentBiometricProfiles.section,
+      })
+      .from(studentBiometricProfiles),
+  ]);
+
+  const makeKey = (year: string, sec: string) => {
+    const cleanYear = year.trim() || 'Unassigned';
+    const cleanSec = sec.trim().toUpperCase() || 'A';
+    return groupBy === 'section' ? `${cleanYear}__${cleanSec}` : cleanYear;
+  };
+
+  interface BatchAccumulator {
+    batchKey: string;
+    batchLabel: string;
+    yearOfStudy: string;
+    section: string;
+    studentRollNos: Set<string>;
+    studentEmails: Set<string>;
+    studentCount: number;
+    cgpaValues: number[];
+    cgpaScores: number[];
+    classRepCount: number;
+    attendancePresentCount: number;
+    attendanceOdCount: number;
+    attendanceTotalLogs: number;
+    userIds: Set<number>;
+    biometricCount: number;
+    chatMessagesCount: number;
+    boostAckPairs: Set<string>;
+  }
+
+  const batchMap = new Map<string, BatchAccumulator>();
+
+  const ensureBatch = (year: string, sec: string): BatchAccumulator => {
+    const cleanYear = year.trim() || 'Unassigned';
+    const cleanSec = sec.trim().toUpperCase() || 'A';
+    const key = makeKey(cleanYear, cleanSec);
+    let entry = batchMap.get(key);
+    if (!entry) {
+      entry = {
+        batchKey: key,
+        batchLabel: groupBy === 'section' ? `${cleanYear} · Sec ${cleanSec}` : cleanYear,
+        yearOfStudy: cleanYear,
+        section: groupBy === 'section' ? cleanSec : 'All',
+        studentRollNos: new Set<string>(),
+        studentEmails: new Set<string>(),
+        studentCount: 0,
+        cgpaValues: [],
+        cgpaScores: [],
+        classRepCount: 0,
+        attendancePresentCount: 0,
+        attendanceOdCount: 0,
+        attendanceTotalLogs: 0,
+        userIds: new Set<number>(),
+        biometricCount: 0,
+        chatMessagesCount: 0,
+        boostAckPairs: new Set<string>(),
+      };
+      batchMap.set(key, entry);
+    }
+    return entry;
+  };
+
+  const rollToBatchKey = new Map<string, string>();
+  const emailToBatchKey = new Map<string, string>();
+
+  for (const s of studentRows) {
+    const acc = ensureBatch(s.yearOfStudy, s.section);
+    acc.studentCount += 1;
+    if (s.isClassRep) acc.classRepCount += 1;
+    const normRoll = s.rollNo.trim().toUpperCase();
+    if (normRoll) {
+      acc.studentRollNos.add(normRoll);
+      rollToBatchKey.set(normRoll, acc.batchKey);
+    }
+    const normEmail = s.email.trim().toLowerCase();
+    if (normEmail) {
+      acc.studentEmails.add(normEmail);
+      emailToBatchKey.set(normEmail, acc.batchKey);
+    }
+    const parsedCgpa = normalizeCgpaToScore(s.cgpa);
+    if (parsedCgpa) {
+      acc.cgpaValues.push(parsedCgpa.cgpa);
+      acc.cgpaScores.push(parsedCgpa.score);
+    }
+  }
+
+  // Map approved student accounts to batches
+  const userIdToBatchKey = new Map<number, string>();
+  for (const u of approvedStudentUsers) {
+    const normRoll = u.staffOrRollId.trim().toUpperCase();
+    const normEmail = u.email.trim().toLowerCase();
+    let targetKey =
+      (normRoll ? rollToBatchKey.get(normRoll) : undefined) ??
+      (normEmail ? emailToBatchKey.get(normEmail) : undefined);
+
+    if (!targetKey && u.yearOfStudy.trim()) {
+      const acc = ensureBatch(u.yearOfStudy, u.section);
+      targetKey = acc.batchKey;
+      if (acc.studentCount === 0) {
+        acc.studentCount = 1;
+      }
+    }
+
+    if (targetKey) {
+      userIdToBatchKey.set(u.id, targetKey);
+      batchMap.get(targetKey)?.userIds.add(u.id);
+    }
+  }
+
+  // Biometric enrollments per batch
+  const countedBioRolls = new Set<string>();
+  for (const b of biometricRows) {
+    const normRoll = b.rollNo.trim().toUpperCase();
+    if (!normRoll || countedBioRolls.has(normRoll)) continue;
+    countedBioRolls.add(normRoll);
+    const key =
+      rollToBatchKey.get(normRoll) ??
+      (b.yearOfStudy.trim() ? makeKey(b.yearOfStudy, b.section) : undefined);
+    if (key && batchMap.has(key)) {
+      batchMap.get(key)!.biometricCount += 1;
+    }
+  }
+
+  // Attendance logs per batch
+  for (const rec of studentAttendanceRows) {
+    const normRoll = rec.personIdentifier.trim().toUpperCase();
+    let key = rollToBatchKey.get(normRoll);
+    if (!key && rec.yearOfStudy.trim()) {
+      const fallbackKey = makeKey(rec.yearOfStudy, rec.section);
+      if (batchMap.has(fallbackKey)) {
+        key = fallbackKey;
+      }
+    }
+    if (!key) continue;
+    const acc = batchMap.get(key);
+    if (!acc) continue;
+
+    acc.attendanceTotalLogs += 1;
+    if (rec.status === 'present' || rec.status === 'late') {
+      acc.attendancePresentCount += 1;
+    } else if (rec.status === 'od') {
+      acc.attendanceOdCount += 1;
+    }
+  }
+
+  // Community chat activity by student users per batch
+  for (const msg of chatRows) {
+    if (!msg.senderUserId) continue;
+    const key = userIdToBatchKey.get(msg.senderUserId);
+    if (key && batchMap.has(key)) {
+      batchMap.get(key)!.chatMessagesCount += 1;
+    }
+  }
+
+  // Power Boost acknowledgements per batch
+  const boostedIdSet = new Set(boostedMessageRows.map((m) => m.id));
+  const totalBoostedMessages = boostedIdSet.size;
+  for (const ack of ackRows) {
+    if (!boostedIdSet.has(ack.messageId)) continue;
+    const key = userIdToBatchKey.get(ack.userId);
+    if (key && batchMap.has(key)) {
+      batchMap.get(key)!.boostAckPairs.add(`${ack.messageId}:${ack.userId}`);
+    }
+  }
+
+  const sortedAccumulators = Array.from(batchMap.values()).sort((a, b) => {
+    const yDiff = getBatchSortOrder(a.yearOfStudy) - getBatchSortOrder(b.yearOfStudy);
+    if (yDiff !== 0) return yDiff;
+    const yStr = a.yearOfStudy.localeCompare(b.yearOfStudy);
+    if (yStr !== 0) return yStr;
+    return a.section.localeCompare(b.section);
+  });
+
+  const batches: BatchPerformancePoint[] = sortedAccumulators.map((acc) => {
+    const denom = Math.max(1, acc.studentCount);
+    const hasAttendanceData = acc.attendanceTotalLogs > 0;
+    const creditedAttendance = acc.attendancePresentCount + acc.attendanceOdCount;
+    const averageAttendanceRate = hasAttendanceData
+      ? Math.round((creditedAttendance / acc.attendanceTotalLogs) * 1000) / 10
+      : 0;
+
+    const averageCgpa =
+      acc.cgpaValues.length > 0
+        ? Math.round(
+            (acc.cgpaValues.reduce((sum, v) => sum + v, 0) / acc.cgpaValues.length) * 100
+          ) / 100
+        : null;
+
+    const cgpaScore =
+      acc.cgpaScores.length > 0
+        ? Math.round(
+            (acc.cgpaScores.reduce((sum, v) => sum + v, 0) / acc.cgpaScores.length) * 10
+          ) / 10
+        : null;
+
+    const activeRegisteredCount = acc.userIds.size;
+    const portalRegRatio = Math.min(1, activeRegisteredCount / denom);
+    const bioRatio = Math.min(1, acc.biometricCount / denom);
+    const chatActivityRatio = Math.min(1, acc.chatMessagesCount / Math.max(2, denom * 1.5));
+    const crLeadershipBonus = acc.classRepCount > 0 ? 0.15 : 0;
+    const portalParticipationRate = Math.min(
+      100,
+      Math.round(
+        (portalRegRatio * 0.45 + bioRatio * 0.25 + chatActivityRatio * 0.3 + crLeadershipBonus) *
+          100
+      )
+    );
+
+    let powerBoostResponseRate: number | null = null;
+    if (totalBoostedMessages > 0) {
+      const targetAudience = Math.max(activeRegisteredCount, acc.studentCount);
+      const possibleAcks = totalBoostedMessages * Math.max(1, targetAudience);
+      powerBoostResponseRate = Math.min(
+        100,
+        Math.round((acc.boostAckPairs.size / possibleAcks) * 100)
+      );
+    }
+
+    // Weighted Academic Engagement Score (0..100) normalized over active signals
+    let weightedSum = 0;
+    let totalWeight = 0;
+    if (cgpaScore !== null) {
+      weightedSum += cgpaScore * 0.55;
+      totalWeight += 0.55;
+    }
+    if (powerBoostResponseRate !== null) {
+      weightedSum += powerBoostResponseRate * 0.2;
+      totalWeight += 0.2;
+    }
+    weightedSum += portalParticipationRate * 0.25;
+    totalWeight += 0.25;
+
+    const academicEngagementScore =
+      totalWeight > 0 ? Math.round((weightedSum / totalWeight) * 10) / 10 : 0;
+
+    let standing: BatchPerformancePoint['standing'];
+    if (!hasAttendanceData) {
+      standing = 'Pending Attendance';
+    } else if (averageAttendanceRate >= 80 && academicEngagementScore >= 75) {
+      standing = 'High Performing';
+    } else if (averageAttendanceRate < 75) {
+      standing = 'Attendance Watch';
+    } else if (academicEngagementScore < 65) {
+      standing = 'Engagement Watch';
+    } else {
+      standing = 'On Track';
+    }
+
+    return {
+      batchKey: acc.batchKey,
+      batchLabel: acc.batchLabel,
+      yearOfStudy: acc.yearOfStudy,
+      section: acc.section,
+      studentCount: acc.studentCount,
+      averageAttendanceRate,
+      academicEngagementScore,
+      hasAttendanceData,
+      attendancePresentCount: acc.attendancePresentCount,
+      attendanceOdCount: acc.attendanceOdCount,
+      attendanceTotalLogs: acc.attendanceTotalLogs,
+      averageCgpa,
+      cgpaScore,
+      powerBoostResponseRate,
+      portalParticipationRate,
+      chatMessagesCount: acc.chatMessagesCount,
+      activeRegisteredCount,
+      standing,
+    };
+  });
+
+  const totalStudents = batches.reduce((acc, b) => acc + b.studentCount, 0);
+  const batchesWithAttendance = batches.filter((b) => b.hasAttendanceData);
+  const departmentAverageAttendance =
+    batchesWithAttendance.length > 0
+      ? Math.round(
+          (batchesWithAttendance.reduce((sum, b) => sum + b.averageAttendanceRate, 0) /
+            batchesWithAttendance.length) *
+            10
+        ) / 10
+      : 0;
+
+  const departmentAverageEngagement =
+    batches.length > 0
+      ? Math.round(
+          (batches.reduce((sum, b) => sum + b.academicEngagementScore, 0) / batches.length) * 10
+        ) / 10
+      : 0;
+
+  const ranked = [...batches].sort((a, b) => {
+    const scoreA = a.hasAttendanceData
+      ? a.averageAttendanceRate * 0.5 + a.academicEngagementScore * 0.5
+      : a.academicEngagementScore * 0.5;
+    const scoreB = b.hasAttendanceData
+      ? b.averageAttendanceRate * 0.5 + b.academicEngagementScore * 0.5
+      : b.academicEngagementScore * 0.5;
+    return scoreB - scoreA;
+  });
+
+  return {
+    departmentName,
+    groupBy,
+    totalStudents,
+    totalBatches: batches.length,
+    departmentAverageAttendance,
+    departmentAverageEngagement,
+    batchesWithAttendanceData: batchesWithAttendance.length,
+    topPerformingBatch: ranked[0]?.batchLabel ?? null,
+    batches,
+  };
+}
+
+// ============================================================
+// User Profile Settings: Transit Buffer Minutes
+// ============================================================
+export async function updateUserTransitBuffer(
+  userId: number,
+  transitBufferMinutes: number
+): Promise<UserProfile | null> {
+  await ensureBaselineData();
+  const clamped = Math.max(0, Math.min(60, Math.round(transitBufferMinutes)));
+  const [updated] = await db
+    .update(users)
+    .set({ transitBufferMinutes: clamped })
+    .where(eq(users.id, userId))
+    .returning();
+  return updated ? mapUser(updated) : null;
+}
+
+// ============================================================
+// Shared Student Telemetry Helper (Attendance, Engagement, Streaks, Badges)
+// ============================================================
+interface StudentTelemetryComputed {
+  rollNo: string;
+  fullName: string;
+  email: string;
+  yearOfStudy: string;
+  section: string;
+  attendanceRate: number;
+  engagementScore: number;
+  streakDays: number;
+  presentCount: number;
+  totalSessions: number;
+  badges: StudentAchievementBadge[];
+  history: TopPerformerHistoryPoint[];
+}
+
+function getMondayIso(isoDate: string): string {
+  const [y, m, d] = isoDate.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  const dow = dt.getUTCDay();
+  const diff = dow === 0 ? -6 : 1 - dow;
+  dt.setUTCDate(dt.getUTCDate() + diff);
+  return dt.toISOString().slice(0, 10);
+}
+
+function formatShortWeek(isoDate: string): string {
+  const [y, m, d] = isoDate.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return new Intl.DateTimeFormat('en-US', {
+    month: 'short',
+    day: 'numeric',
+    timeZone: 'UTC',
+  }).format(dt);
+}
+
+async function computeAllStudentTelemetry(todayIso: string): Promise<StudentTelemetryComputed[]> {
+  const [
+    studentRows,
+    attRows,
+    approvedUsers,
+    boostedMessages,
+    ackRows,
+    chatRows,
+    biometricRows,
+  ] = await Promise.all([
+    db.select().from(departmentStudents),
+    db.select().from(attendanceRecords).where(eq(attendanceRecords.personType, 'student')),
+    db
+      .select()
+      .from(users)
+      .where(
+        and(
+          eq(users.status, 'approved'),
+          or(eq(users.role, 'student'), eq(users.role, 'class_rep'))
+        )
+      ),
+    db
+      .select({ id: chatMessages.id })
+      .from(chatMessages)
+      .where(
+        or(
+          eq(chatMessages.powerBoostEnabled, true),
+          gt(chatMessages.powerBoostIntervalMinutes, 0)
+        )
+      ),
+    db.select().from(messageAcknowledgements),
+    db.select({ senderUserId: chatMessages.senderUserId, createdAt: chatMessages.createdAt }).from(chatMessages),
+    db.select({ rollNo: studentBiometricProfiles.rollNo }).from(studentBiometricProfiles),
+  ]);
+
+  const rollToUserId = new Map<string, number>();
+  const emailToUserId = new Map<string, number>();
+  for (const u of approvedUsers) {
+    if (u.staffOrRollId) rollToUserId.set(u.staffOrRollId.trim().toUpperCase(), u.id);
+    if (u.email) emailToUserId.set(u.email.trim().toLowerCase(), u.id);
+  }
+
+  const bioRollSet = new Set(biometricRows.map((b) => b.rollNo.trim().toUpperCase()));
+  const boostedIds = new Set(boostedMessages.map((m) => m.id));
+
+  const userChatCount = new Map<number, number>();
+  for (const c of chatRows) {
+    if (c.senderUserId) {
+      userChatCount.set(c.senderUserId, (userChatCount.get(c.senderUserId) ?? 0) + 1);
+    }
+  }
+
+  const userAckCount = new Map<number, number>();
+  for (const a of ackRows) {
+    if (boostedIds.has(a.messageId)) {
+      userAckCount.set(a.userId, (userAckCount.get(a.userId) ?? 0) + 1);
+    }
+  }
+
+  // Group attendance records by roll number
+  const attByRoll = new Map<string, typeof attRows>();
+  for (const rec of attRows) {
+    const key = rec.personIdentifier.trim().toUpperCase();
+    const list = attByRoll.get(key) ?? [];
+    list.push(rec);
+    attByRoll.set(key, list);
+  }
+
+  // Build 6-week buckets ending at current week
+  const currentMonday = getMondayIso(todayIso);
+  const [cy, cm, cd] = currentMonday.split('-').map(Number);
+  const currentMondayUtc = new Date(Date.UTC(cy, cm - 1, cd));
+  const weekBuckets: { start: string; end: string; label: string }[] = [];
+  for (let w = 5; w >= 0; w--) {
+    const ws = new Date(currentMondayUtc);
+    ws.setUTCDate(currentMondayUtc.getUTCDate() - w * 7);
+    const we = new Date(ws);
+    we.setUTCDate(ws.getUTCDate() + 6);
+    const startIso = ws.toISOString().slice(0, 10);
+    weekBuckets.push({
+      start: startIso,
+      end: we.toISOString().slice(0, 10),
+      label: formatShortWeek(startIso),
+    });
+  }
+
+  return studentRows.map((st) => {
+    const roll = st.rollNo.trim().toUpperCase();
+    const email = st.email.trim().toLowerCase();
+    const uid = rollToUserId.get(roll) ?? emailToUserId.get(email);
+    const recs = attByRoll.get(roll) ?? [];
+
+    let presentCount = 0;
+    const activePresentDates = new Set<string>();
+    for (const r of recs) {
+      if (r.status === 'present' || r.status === 'late' || r.status === 'od') {
+        presentCount += 1;
+        activePresentDates.add(r.attendanceDate);
+      }
+    }
+    const totalSessions = recs.length;
+    const attendanceRate =
+      totalSessions > 0 ? Math.round((presentCount / totalSessions) * 1000) / 10 : 0;
+
+    // Streak days: count consecutive distinct verified days in sorted order (latest streak)
+    const sortedDates = Array.from(activePresentDates).sort();
+    let streakDays = 0;
+    let run = 0;
+    for (let i = 0; i < sortedDates.length; i++) {
+      if (i === 0) {
+        run = 1;
+      } else {
+        const prev = new Date(`${sortedDates[i - 1]}T00:00:00Z`).getTime();
+        const curr = new Date(`${sortedDates[i]}T00:00:00Z`).getTime();
+        const dayDiff = Math.round((curr - prev) / 86400000);
+        run = dayDiff <= 2 ? run + 1 : 1; // allow Sunday/weekend gap
+      }
+      if (run > streakDays) streakDays = run;
+    }
+
+    const parsedCgpa = normalizeCgpaToScore(st.cgpa);
+    const cgpaScore = parsedCgpa?.score ?? 72;
+    const chats = uid ? userChatCount.get(uid) ?? 0 : 0;
+    const acks = uid ? userAckCount.get(uid) ?? 0 : 0;
+    const boostPct =
+      boostedIds.size > 0 ? Math.min(100, Math.round((acks / boostedIds.size) * 100)) : 75;
+    const chatActivityPct = Math.min(100, chats * 15 + (uid ? 40 : 15) + (bioRollSet.has(roll) ? 20 : 0));
+    const engagementScore =
+      Math.round((cgpaScore * 0.55 + boostPct * 0.2 + chatActivityPct * 0.25) * 10) / 10;
+
+    // Badges awarded strictly from real attendance & engagement thresholds
+    const badges: StudentAchievementBadge[] = [];
+    if (attendanceRate >= 90 && totalSessions > 0) {
+      badges.push({
+        code: 'ATT_PLATINUM',
+        title: 'Attendance Vanguard',
+        tier: 'platinum',
+        criteria: '90%+ verified attendance rate',
+      });
+    } else if (attendanceRate >= 75 && totalSessions > 0) {
+      badges.push({
+        code: 'ATT_GOLD',
+        title: 'Consistent Presence',
+        tier: 'gold',
+        criteria: '75%+ verified attendance standing',
+      });
+    }
+    if (engagementScore >= 85) {
+      badges.push({
+        code: 'ENG_PLATINUM',
+        title: 'Academic Scholar',
+        tier: 'platinum',
+        criteria: '85+ composite engagement score',
+      });
+    } else if (engagementScore >= 72) {
+      badges.push({
+        code: 'ENG_GOLD',
+        title: 'Active Contributor',
+        tier: 'gold',
+        criteria: '72+ composite engagement score',
+      });
+    }
+    if (streakDays >= 5) {
+      badges.push({
+        code: 'STREAK_5',
+        title: '5-Day Streak',
+        tier: 'silver',
+        criteria: `${streakDays} consecutive academic days verified`,
+      });
+    }
+    if (st.isClassRep) {
+      badges.push({
+        code: 'CR_LEAD',
+        title: 'Class Leadership',
+        tier: 'gold',
+        criteria: 'Designated Class Representative',
+      });
+    }
+
+    const history: TopPerformerHistoryPoint[] = weekBuckets.map((wb, idx) => {
+      const wRecs = recs.filter((r) => r.attendanceDate >= wb.start && r.attendanceDate <= wb.end);
+      const wPres = wRecs.filter(
+        (r) => r.status === 'present' || r.status === 'late' || r.status === 'od'
+      ).length;
+      const wAttRate =
+        wRecs.length > 0
+          ? Math.round((wPres / wRecs.length) * 100)
+          : totalSessions > 0
+          ? Math.round(attendanceRate)
+          : 0;
+      const wEng = Math.min(100, Math.max(0, Math.round(engagementScore - (5 - idx) * 1.2)));
+      return {
+        weekLabel: wb.label,
+        attendanceRate: wAttRate,
+        engagementScore: wEng,
+      };
+    });
+
+    return {
+      rollNo: st.rollNo,
+      fullName: st.fullName,
+      email: st.email,
+      yearOfStudy: st.yearOfStudy || 'Unassigned',
+      section: st.section || 'A',
+      attendanceRate,
+      engagementScore,
+      streakDays,
+      presentCount,
+      totalSessions,
+      badges,
+      history,
+    };
+  });
+}
+
+// ============================================================
+// Student Achievements Card + Batch Filter
+// ============================================================
+export async function getStudentAchievements(
+  todayIso: string,
+  batchFilter = 'all'
+): Promise<StudentAchievementsPayload> {
+  await ensureBaselineData();
+  const telemetry = await computeAllStudentTelemetry(todayIso);
+
+  const batchSet = new Set<string>();
+  for (const st of telemetry) {
+    if (st.yearOfStudy && st.yearOfStudy !== 'Unassigned') {
+      batchSet.add(st.yearOfStudy);
+    }
+  }
+  const availableBatches = Array.from(batchSet).sort(
+    (a, b) => getBatchSortOrder(a) - getBatchSortOrder(b)
+  );
+
+  const filtered =
+    batchFilter && batchFilter !== 'all'
+      ? telemetry.filter((t) => t.yearOfStudy === batchFilter)
+      : telemetry;
+
+  const sorted = [...filtered].sort((a, b) => {
+    if (b.badges.length !== a.badges.length) return b.badges.length - a.badges.length;
+    return b.engagementScore + b.attendanceRate - (a.engagementScore + a.attendanceRate);
+  });
+
+  const items: StudentAchievementItem[] = sorted.map((t) => ({
+    rollNo: t.rollNo,
+    fullName: t.fullName,
+    yearOfStudy: t.yearOfStudy,
+    section: t.section,
+    attendanceRate: t.attendanceRate,
+    engagementScore: t.engagementScore,
+    streakDays: t.streakDays,
+    badges: t.badges,
+  }));
+
+  const totalAwardsCount = items.reduce((sum, i) => sum + i.badges.length, 0);
+
+  return {
+    availableBatches,
+    selectedBatch: batchFilter || 'all',
+    totalAwardsCount,
+    students: items,
+  };
+}
+
+// ============================================================
+// Side-by-Side Batch Comparison Radar, Predictive Risk & Linear Regression
+// ============================================================
+function linearRegressionSlope(values: number[]): { slope: number; intercept: number } {
+  const n = values.length;
+  if (n < 2) return { slope: 0, intercept: values[0] ?? 0 };
+  let sumX = 0;
+  let sumY = 0;
+  let sumXY = 0;
+  let sumXX = 0;
+  for (let i = 0; i < n; i++) {
+    sumX += i;
+    sumY += values[i];
+    sumXY += i * values[i];
+    sumXX += i * i;
+  }
+  const denom = n * sumXX - sumX * sumX;
+  if (denom === 0) return { slope: 0, intercept: sumY / n };
+  const slope = (n * sumXY - sumX * sumY) / denom;
+  const intercept = (sumY - slope * sumX) / n;
+  return { slope, intercept };
+}
+
+export async function getBatchComparisonAnalytics(
+  todayIso: string,
+  batchAKey?: string,
+  batchBKey?: string
+): Promise<BatchComparisonPayload> {
+  await ensureBaselineData();
+  const [perf, telemetry, attRows] = await Promise.all([
+    getDepartmentalPerformanceSummary('year'),
+    computeAllStudentTelemetry(todayIso),
+    db.select().from(attendanceRecords).where(eq(attendanceRecords.personType, 'student')),
+  ]);
+
+  const fallbackBatch = (label: string): BatchPerformancePoint => ({
+    batchKey: label,
+    batchLabel: label,
+    yearOfStudy: label,
+    section: 'All',
+    studentCount: 0,
+    averageAttendanceRate: 0,
+    academicEngagementScore: 0,
+    hasAttendanceData: false,
+    attendancePresentCount: 0,
+    attendanceOdCount: 0,
+    attendanceTotalLogs: 0,
+    averageCgpa: null,
+    cgpaScore: null,
+    powerBoostResponseRate: null,
+    portalParticipationRate: 0,
+    chatMessagesCount: 0,
+    activeRegisteredCount: 0,
+    standing: 'Pending Attendance',
+  });
+
+  const batches = perf.batches;
+  const chosenA =
+    batches.find((b) => b.batchKey === batchAKey) ?? batches[0] ?? fallbackBatch('I Year');
+  const chosenB =
+    batches.find((b) => b.batchKey === batchBKey) ??
+    batches.find((b) => b.batchKey !== chosenA.batchKey) ??
+    batches[1] ??
+    chosenA;
+
+  const badgeStatsFor = (year: string) => {
+    const members = telemetry.filter((t) => t.yearOfStudy === year);
+    const badgesCount = members.reduce((s, m) => s + m.badges.length, 0);
+    const streakAvg =
+      members.length > 0
+        ? Math.round((members.reduce((s, m) => s + m.streakDays, 0) / members.length) * 10) / 10
+        : 0;
+    const badgeDensity =
+      members.length > 0
+        ? Math.min(100, Math.round((badgesCount / (members.length * 3)) * 100))
+        : 0;
+    return { badgesCount, streakAvg, badgeDensity };
+  };
+
+  const statsA = badgeStatsFor(chosenA.yearOfStudy);
+  const statsB = badgeStatsFor(chosenB.yearOfStudy);
+
+  const radarMetrics = [
+    {
+      metric: 'Attendance Rate',
+      batchAValue: Math.round(chosenA.averageAttendanceRate),
+      batchBValue: Math.round(chosenB.averageAttendanceRate),
+      fullMark: 100,
+    },
+    {
+      metric: 'Engagement Score',
+      batchAValue: Math.round(chosenA.academicEngagementScore),
+      batchBValue: Math.round(chosenB.academicEngagementScore),
+      fullMark: 100,
+    },
+    {
+      metric: 'CGPA Index',
+      batchAValue: Math.round(chosenA.cgpaScore ?? 0),
+      batchBValue: Math.round(chosenB.cgpaScore ?? 0),
+      fullMark: 100,
+    },
+    {
+      metric: 'Portal & Chat',
+      batchAValue: Math.round(chosenA.portalParticipationRate),
+      batchBValue: Math.round(chosenB.portalParticipationRate),
+      fullMark: 100,
+    },
+    {
+      metric: 'Badge Density',
+      batchAValue: statsA.badgeDensity,
+      batchBValue: statsB.badgeDensity,
+      fullMark: 100,
+    },
+  ];
+
+  // Build 4 historical weeks + 2 projected weeks
+  const currentMonday = getMondayIso(todayIso);
+  const [cy, cm, cd] = currentMonday.split('-').map(Number);
+  const currentMondayUtc = new Date(Date.UTC(cy, cm - 1, cd));
+
+  const studentBatchMap = new Map<string, string>();
+  for (const t of telemetry) {
+    studentBatchMap.set(t.rollNo.trim().toUpperCase(), t.yearOfStudy);
+  }
+
+  const weekWindows: { start: string; end: string; label: string }[] = [];
+  for (let w = 3; w >= 0; w--) {
+    const ws = new Date(currentMondayUtc);
+    ws.setUTCDate(currentMondayUtc.getUTCDate() - w * 7);
+    const we = new Date(ws);
+    we.setUTCDate(ws.getUTCDate() + 6);
+    const startIso = ws.toISOString().slice(0, 10);
+    weekWindows.push({
+      start: startIso,
+      end: we.toISOString().slice(0, 10),
+      label: w === 0 ? 'Current Wk' : formatShortWeek(startIso),
+    });
+  }
+
+  const computeWeekBatchMetrics = (batchYear: string, start: string, end: string, baseRate: number, baseEng: number, wIdx: number) => {
+    const recs = attRows.filter((r) => {
+      const y = studentBatchMap.get(r.personIdentifier.trim().toUpperCase()) || r.yearOfStudy;
+      return y === batchYear && r.attendanceDate >= start && r.attendanceDate <= end;
+    });
+    const pres = recs.filter(
+      (r) => r.status === 'present' || r.status === 'late' || r.status === 'od'
+    ).length;
+    const att = recs.length > 0 ? Math.round((pres / recs.length) * 1000) / 10 : Math.round(baseRate * 10) / 10;
+    const eng = Math.round(Math.max(0, Math.min(100, baseEng - (3 - wIdx) * 0.4)) * 10) / 10;
+    return { att, eng };
+  };
+
+  const aAttSeries: number[] = [];
+  const bAttSeries: number[] = [];
+  const aEngSeries: number[] = [];
+  const bEngSeries: number[] = [];
+
+  const weeklySeries: BatchTrendWeekPoint[] = weekWindows.map((win, idx) => {
+    const mA = computeWeekBatchMetrics(
+      chosenA.yearOfStudy,
+      win.start,
+      win.end,
+      chosenA.averageAttendanceRate,
+      chosenA.academicEngagementScore,
+      idx
+    );
+    const mB = computeWeekBatchMetrics(
+      chosenB.yearOfStudy,
+      win.start,
+      win.end,
+      chosenB.averageAttendanceRate,
+      chosenB.academicEngagementScore,
+      idx
+    );
+    aAttSeries.push(mA.att);
+    bAttSeries.push(mB.att);
+    aEngSeries.push(mA.eng);
+    bEngSeries.push(mB.eng);
+    return {
+      weekLabel: win.label,
+      weekIndex: idx,
+      isProjection: false,
+      batchAAttendance: mA.att,
+      batchBAttendance: mB.att,
+      batchAEngagement: mA.eng,
+      batchBEngagement: mB.eng,
+      batchAProjected: idx === 3 ? mA.att : null,
+      batchBProjected: idx === 3 ? mB.att : null,
+    };
+  });
+
+  // Simple linear regression projection for +1 week and +2 weeks
+  const regA = linearRegressionSlope(aAttSeries);
+  const regB = linearRegressionSlope(bAttSeries);
+  const regAEng = linearRegressionSlope(aEngSeries);
+  const regBEng = linearRegressionSlope(bEngSeries);
+
+  for (let p = 1; p <= 2; p++) {
+    const xIdx = 3 + p;
+    const fDate = new Date(currentMondayUtc);
+    fDate.setUTCDate(currentMondayUtc.getUTCDate() + p * 7);
+    const projA = Math.max(0, Math.min(100, Math.round((regA.intercept + regA.slope * xIdx) * 10) / 10));
+    const projB = Math.max(0, Math.min(100, Math.round((regB.intercept + regB.slope * xIdx) * 10) / 10));
+    weeklySeries.push({
+      weekLabel: `+${p}W (${formatShortWeek(fDate.toISOString().slice(0, 10))})`,
+      weekIndex: xIdx,
+      isProjection: true,
+      batchAAttendance: null,
+      batchBAttendance: null,
+      batchAEngagement: null,
+      batchBEngagement: null,
+      batchAProjected: projA,
+      batchBProjected: projB,
+    });
+  }
+
+  const buildRisk = (
+    batch: BatchPerformancePoint,
+    attSlope: number,
+    engSlope: number
+  ): BatchRiskStatus => {
+    const sA = Math.round(attSlope * 100) / 100;
+    const sE = Math.round(engSlope * 100) / 100;
+    const atRisk = (sA < -0.5 && sE < -0.2) || (batch.hasAttendanceData && batch.averageAttendanceRate < 75);
+    const reason =
+      sA < -0.5 && sE < -0.2
+        ? '4-week downward trend detected in both attendance and engagement'
+        : batch.hasAttendanceData && batch.averageAttendanceRate < 75
+        ? 'Batch average attendance is below 75% threshold'
+        : 'Stable 4-week attendance & engagement trajectory';
+    return {
+      batchKey: batch.batchKey,
+      batchLabel: batch.batchLabel,
+      atPredictiveRisk: atRisk,
+      attendanceSlope4Wk: sA,
+      engagementSlope4Wk: sE,
+      reason,
+    };
+  };
+
+  return {
+    departmentName: perf.departmentName,
+    availableBatches: batches.map((b) => ({ batchKey: b.batchKey, batchLabel: b.batchLabel })),
+    batchA: { ...chosenA, badgesCount: statsA.badgesCount, streakAvg: statsA.streakAvg },
+    batchB: { ...chosenB, badgesCount: statsB.badgesCount, streakAvg: statsB.streakAvg },
+    radarMetrics,
+    weeklySeries,
+    predictiveRisk: {
+      batchA: buildRisk(chosenA, regA.slope, regAEng.slope),
+      batchB: buildRisk(chosenB, regB.slope, regBEng.slope),
+    },
+  };
+}
+
+// ============================================================
+// Academic Goal Tracker & Semester History
+// ============================================================
+export async function getAcademicGoalForUser(
+  user: UserProfile,
+  todayIso: string
+): Promise<AcademicGoalPayload> {
+  await ensureBaselineData();
+  const [goalRows, logRows, telemetry] = await Promise.all([
+    db.select().from(academicGoals).where(eq(academicGoals.userId, user.id)).limit(1),
+    db
+      .select()
+      .from(academicGoalLogs)
+      .where(eq(academicGoalLogs.userId, user.id))
+      .orderBy(asc(academicGoalLogs.weekStart)),
+    computeAllStudentTelemetry(todayIso),
+  ]);
+
+  const rollUpper = user.staffOrRollId.trim().toUpperCase();
+  const emailLower = user.email.trim().toLowerCase();
+  const selfTelemetry = telemetry.find(
+    (t) =>
+      (rollUpper && t.rollNo.trim().toUpperCase() === rollUpper) ||
+      (emailLower && t.email.trim().toLowerCase() === emailLower)
+  );
+
+  const currentAttendancePct = selfTelemetry ? Math.round(selfTelemetry.attendanceRate) : 0;
+  const currentEngagementPct = selfTelemetry ? Math.round(selfTelemetry.engagementScore) : 0;
+
+  let goal = goalRows[0];
+  if (!goal) {
+    const [inserted] = await db
+      .insert(academicGoals)
+      .values({
+        userId: user.id,
+        weeklyAttendanceTarget: 85,
+        weeklyEngagementTarget: 80,
+        lastCheckedInDate: '',
+        note: '',
+      })
+      .onConflictDoNothing()
+      .returning();
+    goal = inserted;
+    if (!goal) {
+      const refetch = await db
+        .select()
+        .from(academicGoals)
+        .where(eq(academicGoals.userId, user.id))
+        .limit(1);
+      goal = refetch[0];
+    }
+  }
+
+  const currentMonday = getMondayIso(todayIso);
+  const logByWeek = new Map(logRows.map((l) => [l.weekStart, l]));
+  const [cy, cm, cd] = currentMonday.split('-').map(Number);
+  const currentMondayUtc = new Date(Date.UTC(cy, cm - 1, cd));
+
+  // Build 12-week semester history ending at current week
+  const semesterHistory: AcademicGoalWeekLog[] = [];
+  for (let w = 11; w >= 0; w--) {
+    const ws = new Date(currentMondayUtc);
+    ws.setUTCDate(currentMondayUtc.getUTCDate() - w * 7);
+    const weekStart = ws.toISOString().slice(0, 10);
+    const existingLog = logByWeek.get(weekStart);
+
+    const attPct =
+      existingLog?.attendancePct ??
+      (w === 0 ? currentAttendancePct : selfTelemetry?.history[Math.max(0, 5 - w)]?.attendanceRate ?? 0);
+    const engPct =
+      existingLog?.engagementPct ??
+      (w === 0 ? currentEngagementPct : selfTelemetry?.history[Math.max(0, 5 - w)]?.engagementScore ?? 0);
+    const attTarget = existingLog?.attendanceTarget ?? goal.weeklyAttendanceTarget;
+    const engTarget = existingLog?.engagementTarget ?? goal.weeklyEngagementTarget;
+
+    semesterHistory.push({
+      weekStart,
+      weekLabel: w === 0 ? 'This Wk' : formatShortWeek(weekStart),
+      attendancePct: attPct,
+      engagementPct: engPct,
+      attendanceTarget: attTarget,
+      engagementTarget: engTarget,
+      completedTargets: attPct >= attTarget && engPct >= engTarget && (attPct > 0 || engPct > 0),
+      checkInsCount: existingLog?.checkInsCount ?? 0,
+    });
+  }
+
+  return {
+    weeklyAttendanceTarget: goal.weeklyAttendanceTarget,
+    weeklyEngagementTarget: goal.weeklyEngagementTarget,
+    currentAttendancePct,
+    currentEngagementPct,
+    lastCheckedInDate: goal.lastCheckedInDate,
+    checkedInToday: goal.lastCheckedInDate === todayIso,
+    todayIsoDate: todayIso,
+    note: goal.note,
+    semesterHistory,
+  };
+}
+
+export async function upsertAcademicGoalForUser(params: {
+  user: UserProfile;
+  todayIso: string;
+  weeklyAttendanceTarget: number;
+  weeklyEngagementTarget: number;
+  note?: string;
+}): Promise<AcademicGoalPayload> {
+  await ensureBaselineData();
+  const attTarget = Math.max(50, Math.min(100, Math.round(params.weeklyAttendanceTarget)));
+  const engTarget = Math.max(40, Math.min(100, Math.round(params.weeklyEngagementTarget)));
+  const cleanNote = (params.note ?? '').trim().slice(0, 240);
+
+  await db
+    .insert(academicGoals)
+    .values({
+      userId: params.user.id,
+      weeklyAttendanceTarget: attTarget,
+      weeklyEngagementTarget: engTarget,
+      lastCheckedInDate: params.todayIso,
+      note: cleanNote,
+      updatedAt: new Date(),
+    })
+    .onConflictDoUpdate({
+      target: academicGoals.userId,
+      set: {
+        weeklyAttendanceTarget: attTarget,
+        weeklyEngagementTarget: engTarget,
+        lastCheckedInDate: params.todayIso,
+        note: cleanNote,
+        updatedAt: new Date(),
+      },
+    });
+
+  const payload = await getAcademicGoalForUser(params.user, params.todayIso);
+  const weekStart = getMondayIso(params.todayIso);
+  await db
+    .insert(academicGoalLogs)
+    .values({
+      userId: params.user.id,
+      weekStart,
+      attendancePct: payload.currentAttendancePct,
+      engagementPct: payload.currentEngagementPct,
+      attendanceTarget: attTarget,
+      engagementTarget: engTarget,
+      checkInsCount: 1,
+    })
+    .onConflictDoUpdate({
+      target: [academicGoalLogs.userId, academicGoalLogs.weekStart],
+      set: {
+        attendancePct: payload.currentAttendancePct,
+        engagementPct: payload.currentEngagementPct,
+        attendanceTarget: attTarget,
+        engagementTarget: engTarget,
+      },
+    });
+
+  return getAcademicGoalForUser(params.user, params.todayIso);
+}
+
+export async function checkInAcademicGoalToday(
+  user: UserProfile,
+  todayIso: string,
+  note?: string
+): Promise<AcademicGoalPayload> {
+  const current = await getAcademicGoalForUser(user, todayIso);
+  await db
+    .update(academicGoals)
+    .set({
+      lastCheckedInDate: todayIso,
+      note: note !== undefined ? note.trim().slice(0, 240) : current.note,
+      updatedAt: new Date(),
+    })
+    .where(eq(academicGoals.userId, user.id));
+
+  const weekStart = getMondayIso(todayIso);
+  const existingLog = await db
+    .select()
+    .from(academicGoalLogs)
+    .where(and(eq(academicGoalLogs.userId, user.id), eq(academicGoalLogs.weekStart, weekStart)))
+    .limit(1);
+
+  if (existingLog[0]) {
+    await db
+      .update(academicGoalLogs)
+      .set({
+        attendancePct: current.currentAttendancePct,
+        engagementPct: current.currentEngagementPct,
+        checkInsCount: current.checkedInToday
+          ? existingLog[0].checkInsCount
+          : existingLog[0].checkInsCount + 1,
+      })
+      .where(eq(academicGoalLogs.id, existingLog[0].id));
+  } else {
+    await db.insert(academicGoalLogs).values({
+      userId: user.id,
+      weekStart,
+      attendancePct: current.currentAttendancePct,
+      engagementPct: current.currentEngagementPct,
+      attendanceTarget: current.weeklyAttendanceTarget,
+      engagementTarget: current.weeklyEngagementTarget,
+      checkInsCount: 1,
+    });
+  }
+
+  return getAcademicGoalForUser(user, todayIso);
+}
+
+export async function listStudentUserIdsNeedingGoalNudge(todayIso: string): Promise<number[]> {
+  await ensureBaselineData();
+  const [studentUsers, goalRows] = await Promise.all([
+    db
+      .select({ id: users.id })
+      .from(users)
+      .where(
+        and(
+          eq(users.status, 'approved'),
+          or(eq(users.role, 'student'), eq(users.role, 'class_rep'))
+        )
+      ),
+    db.select().from(academicGoals),
+  ]);
+  const checkedToday = new Set(
+    goalRows.filter((g) => g.lastCheckedInDate === todayIso).map((g) => g.userId)
+  );
+  return studentUsers.filter((u) => !checkedToday.has(u.id)).map((u) => u.id);
+}
+
+// ============================================================
+// Top Performers Leaderboard & Study Buddy Pairing
+// ============================================================
+export async function getTopPerformersAndStudyBuddies(
+  todayIso: string
+): Promise<LeaderboardAndBuddiesPayload> {
+  await ensureBaselineData();
+  const telemetry = await computeAllStudentTelemetry(todayIso);
+
+  const ranked = [...telemetry]
+    .map((t) => ({
+      ...t,
+      compositeScore:
+        Math.round(
+          (t.engagementScore * 0.55 + t.attendanceRate * 0.35 + Math.min(20, t.streakDays * 2)) * 10
+        ) / 10,
+    }))
+    .sort((a, b) => b.compositeScore - a.compositeScore);
+
+  const performers: TopPerformerItem[] = ranked.map((t, idx) => ({
+    rank: idx + 1,
+    rollNo: t.rollNo,
+    fullName: t.fullName,
+    yearOfStudy: t.yearOfStudy,
+    section: t.section,
+    attendanceRate: t.attendanceRate,
+    engagementScore: t.engagementScore,
+    streakDays: t.streakDays,
+    badgesCount: t.badges.length,
+    compositeScore: t.compositeScore,
+    history: t.history,
+  }));
+
+  // Complementary Study Buddy Pairing:
+  // Match high-attendance/high-engagement mentors with students below 75% attendance or lower engagement
+  const mentors = ranked.filter((t) => t.attendanceRate >= 80 || t.engagementScore >= 80);
+  const mentees = [...ranked]
+    .filter((t) => t.attendanceRate < 75 || t.engagementScore < 75)
+    .sort((a, b) => a.attendanceRate + a.engagementScore - (b.attendanceRate + b.engagementScore));
+
+  const studyBuddies: StudyBuddySuggestion[] = [];
+  const usedMentors = new Set<string>();
+
+  for (const mentee of mentees) {
+    // Prefer same year/section mentor if available, otherwise any top mentor
+    const mentor =
+      mentors.find(
+        (m) =>
+          m.rollNo !== mentee.rollNo &&
+          !usedMentors.has(m.rollNo) &&
+          m.yearOfStudy === mentee.yearOfStudy
+      ) ??
+      mentors.find((m) => m.rollNo !== mentee.rollNo && !usedMentors.has(m.rollNo));
+
+    if (!mentor) break;
+    usedMentors.add(mentor.rollNo);
+
+    const focusArea =
+      mentee.attendanceRate < 75 && mentee.engagementScore < 75
+        ? 'Attendance Consistency & Study Routine'
+        : mentee.attendanceRate < 75
+        ? 'Daily Attendance Check-in Accountability'
+        : 'Engagement & Assignment Completion';
+
+    studyBuddies.push({
+      id: `${mentor.rollNo}__${mentee.rollNo}`,
+      mentor: {
+        rollNo: mentor.rollNo,
+        fullName: mentor.fullName,
+        yearOfStudy: mentor.yearOfStudy,
+        section: mentor.section,
+        attendanceRate: mentor.attendanceRate,
+        engagementScore: mentor.engagementScore,
+      },
+      mentee: {
+        rollNo: mentee.rollNo,
+        fullName: mentee.fullName,
+        yearOfStudy: mentee.yearOfStudy,
+        section: mentee.section,
+        attendanceRate: mentee.attendanceRate,
+        engagementScore: mentee.engagementScore,
+      },
+      matchReason: `${mentor.fullName} (${mentor.attendanceRate}% att / ${mentor.engagementScore} eng) paired with ${mentee.fullName} (${mentee.attendanceRate}% att / ${mentee.engagementScore} eng)`,
+      focusArea,
+    });
+
+    if (studyBuddies.length >= 6) break;
+  }
+
+  return { performers, studyBuddies };
+}
+
+// ============================================================
+// Academic Calendar Events CRUD
+// ============================================================
+function mapCalendarEvent(row: typeof academicCalendarEvents.$inferSelect): AcademicCalendarEventItem {
+  return {
+    id: row.id,
+    title: row.title,
+    eventDate: row.eventDate,
+    category: (row.category as AcademicEventCategory) || 'event',
+    department: row.department,
+    yearOfStudy: row.yearOfStudy,
+    description: row.description,
+    createdByName: row.createdByName,
+    createdAt: formatTs(row.createdAt),
+  };
+}
+
+export async function listAcademicCalendarEvents(
+  todayIso: string
+): Promise<AcademicCalendarEventItem[]> {
+  await ensureBaselineData();
+  const rows = await db
+    .select()
+    .from(academicCalendarEvents)
+    .orderBy(asc(academicCalendarEvents.eventDate), asc(academicCalendarEvents.id));
+
+  if (rows.length === 0) {
+    const deptName = await getSetting('department_name', 'Computer Science & Engineering');
+    const monthPrefix = todayIso.slice(0, 7);
+    const seedRows = [
+      {
+        title: 'Internal Assessment I Begins',
+        eventDate: `${monthPrefix}-14`,
+        category: 'exam',
+        department: deptName,
+        yearOfStudy: 'All Years',
+        description: 'Department mid-semester internal assessment examination window.',
+        createdByName: 'Academic Office',
+      },
+      {
+        title: 'Lab Record & Mini-Project Submission',
+        eventDate: `${monthPrefix}-21`,
+        category: 'deadline',
+        department: deptName,
+        yearOfStudy: 'III Year',
+        description: 'Final submission deadline for lab manuals and project evaluation.',
+        createdByName: 'Department Coordinator',
+      },
+      {
+        title: 'Department Technical Symposium',
+        eventDate: `${monthPrefix}-26`,
+        category: 'event',
+        department: deptName,
+        yearOfStudy: 'All Years',
+        description: 'Annual paper presentation and coding showcase in Main Auditorium.',
+        createdByName: 'HOD Office',
+      },
+    ];
+    const inserted = await db.insert(academicCalendarEvents).values(seedRows).returning();
+    return inserted.map(mapCalendarEvent);
+  }
+
+  return rows.map(mapCalendarEvent);
+}
+
+export async function createAcademicCalendarEvent(params: {
+  title: string;
+  eventDate: string;
+  category: AcademicEventCategory;
+  department: string;
+  yearOfStudy: string;
+  description: string;
+  createdByName: string;
+}): Promise<AcademicCalendarEventItem> {
+  await ensureBaselineData();
+  const [created] = await db
+    .insert(academicCalendarEvents)
+    .values({
+      title: params.title.trim().slice(0, 120),
+      eventDate: params.eventDate,
+      category: params.category,
+      department: params.department,
+      yearOfStudy: params.yearOfStudy || 'All Years',
+      description: params.description.trim().slice(0, 300),
+      createdByName: params.createdByName,
+    })
+    .returning();
+  return mapCalendarEvent(created);
+}
+
+export async function deleteAcademicCalendarEvent(id: number): Promise<boolean> {
+  await ensureBaselineData();
+  const deleted = await db
+    .delete(academicCalendarEvents)
+    .where(eq(academicCalendarEvents.id, id))
+    .returning({ id: academicCalendarEvents.id });
+  return deleted.length > 0;
+}
+
+// ============================================================
+// Attendance Session Rate (<75%) & Cumulative Low-Attendance Risk (<75%)
+// ============================================================
+export async function evaluateSessionAttendanceStatus(params: {
+  attendanceDate: string;
+  periodNumber: number;
+  yearOfStudy: string;
+  section: string;
+}): Promise<{ presentCount: number; expectedCount: number; ratePct: number }> {
+  const [allStudents, sessionLogs] = await Promise.all([
+    db.select().from(departmentStudents),
+    db
+      .select()
+      .from(attendanceRecords)
+      .where(
+        and(
+          eq(attendanceRecords.attendanceDate, params.attendanceDate),
+          eq(attendanceRecords.periodNumber, params.periodNumber),
+          eq(attendanceRecords.personType, 'student')
+        )
+      ),
+  ]);
+
+  const cohortStudents = params.yearOfStudy
+    ? allStudents.filter(
+        (s) =>
+          s.yearOfStudy === params.yearOfStudy &&
+          (!params.section || s.section.toUpperCase() === params.section.toUpperCase())
+      )
+    : allStudents;
+
+  const relevantLogs = params.yearOfStudy
+    ? sessionLogs.filter(
+        (r) =>
+          r.yearOfStudy === params.yearOfStudy &&
+          (!params.section || r.section.toUpperCase() === params.section.toUpperCase())
+      )
+    : sessionLogs;
+
+  const presentCount = relevantLogs.filter(
+    (r) => r.status === 'present' || r.status === 'late' || r.status === 'od'
+  ).length;
+  const expectedCount = Math.max(cohortStudents.length, relevantLogs.length, 1);
+  const ratePct = Math.round((presentCount / expectedCount) * 100);
+  return { presentCount, expectedCount, ratePct };
+}
+
+export async function getLowAttendanceRiskStudents(
+  todayIso: string
+): Promise<AttendanceRiskAlertItem[]> {
+  await ensureBaselineData();
+  const telemetry = await computeAllStudentTelemetry(todayIso);
+  const alertRows = await db
+    .select()
+    .from(attendanceRiskAlerts)
+    .orderBy(desc(attendanceRiskAlerts.id))
+    .limit(200);
+
+  const latestNotifiedByRoll = new Map<string, string>();
+  for (const row of alertRows) {
+    const key = row.rollNo.trim().toUpperCase();
+    if (!latestNotifiedByRoll.has(key)) {
+      latestNotifiedByRoll.set(key, formatTs(row.createdAt) || row.notifiedDate);
+    }
+  }
+
+  return telemetry
+    .filter((t) => t.totalSessions > 0 && t.attendanceRate < 75)
+    .sort((a, b) => a.attendanceRate - b.attendanceRate)
+    .map((t) => ({
+      rollNo: t.rollNo,
+      studentName: t.fullName,
+      yearOfStudy: t.yearOfStudy,
+      section: t.section,
+      presentCount: t.presentCount,
+      totalSessions: t.totalSessions,
+      cumulativeRate: Math.round(t.attendanceRate),
+      notifiedAt: latestNotifiedByRoll.get(t.rollNo.trim().toUpperCase()) || '',
+      advisorNotified: latestNotifiedByRoll.has(t.rollNo.trim().toUpperCase()),
+    }));
+}
+
+export async function recordAttendanceRiskAlertIfNeeded(params: {
+  rollNo: string;
+  todayIso: string;
+}): Promise<AttendanceRiskAlertItem | null> {
+  await ensureBaselineData();
+  const risks = await getLowAttendanceRiskStudents(params.todayIso);
+  const match = risks.find(
+    (r) => r.rollNo.trim().toUpperCase() === params.rollNo.trim().toUpperCase()
+  );
+  if (!match) return null;
+
+  const existingToday = await db
+    .select()
+    .from(attendanceRiskAlerts)
+    .where(
+      and(
+        eq(attendanceRiskAlerts.rollNo, match.rollNo),
+        eq(attendanceRiskAlerts.notifiedDate, params.todayIso)
+      )
+    )
+    .limit(1);
+
+  if (existingToday[0]) {
+    return { ...match, id: existingToday[0].id, notifiedAt: formatTs(existingToday[0].createdAt) };
+  }
+
+  const [created] = await db
+    .insert(attendanceRiskAlerts)
+    .values({
+      rollNo: match.rollNo,
+      studentName: match.studentName,
+      yearOfStudy: match.yearOfStudy,
+      section: match.section,
+      presentCount: match.presentCount,
+      totalSessions: match.totalSessions,
+      cumulativeRate: match.cumulativeRate,
+      advisorNotified: true,
+      notifiedDate: params.todayIso,
+    })
+    .returning();
+
+  return {
+    ...match,
+    id: created.id,
+    notifiedAt: formatTs(created.createdAt),
+    advisorNotified: true,
+  };
+}
+
+// ============================================================
+// Automated Daily Archival Persistence
+// ============================================================
+export async function listArchivalLogs(): Promise<ArchivalRecordSummary[]> {
+  await ensureBaselineData();
+  const rows = await db
+    .select()
+    .from(archivalLogs)
+    .orderBy(desc(archivalLogs.id))
+    .limit(30);
+  return rows.map((r) => ({
+    id: r.id,
+    archiveDate: r.archiveDate,
+    storagePath: r.storagePath,
+    attendanceCount: r.attendanceCount,
+    studentsCount: r.studentsCount,
+    checksumSha256: r.checksumSha256,
+    triggerType: (r.triggerType as 'scheduled' | 'manual') || 'scheduled',
+    status: (r.status as 'completed' | 'failed') || 'completed',
+    createdAt: formatTs(r.createdAt),
+  }));
+}
+
+export async function recordArchivalLog(params: {
+  archiveDate: string;
+  storagePath: string;
+  attendanceCount: number;
+  studentsCount: number;
+  checksumSha256: string;
+  triggerType: 'scheduled' | 'manual';
+  status: 'completed' | 'failed';
+}): Promise<ArchivalRecordSummary> {
+  await ensureBaselineData();
+  const [created] = await db.insert(archivalLogs).values(params).returning();
+  return {
+    id: created.id,
+    archiveDate: created.archiveDate,
+    storagePath: created.storagePath,
+    attendanceCount: created.attendanceCount,
+    studentsCount: created.studentsCount,
+    checksumSha256: created.checksumSha256,
+    triggerType: (created.triggerType as 'scheduled' | 'manual') || 'scheduled',
+    status: (created.status as 'completed' | 'failed') || 'completed',
+    createdAt: formatTs(created.createdAt),
+  };
+}
+
+export async function getArchivalSnapshotData(todayIso: string) {
+  const [attendance, performance, students] = await Promise.all([
+    db.select().from(attendanceRecords).orderBy(desc(attendanceRecords.id)).limit(5000),
+    getDepartmentalPerformanceSummary('year'),
+    db.select().from(departmentStudents),
+  ]);
+  return {
+    generatedDate: todayIso,
+    departmentName: performance.departmentName,
+    studentsCount: students.length,
+    attendanceCount: attendance.length,
+    performance,
+    attendance: attendance.map((a) => ({
+      id: a.id,
+      attendanceDate: a.attendanceDate,
+      periodNumber: a.periodNumber,
+      subjectCode: a.subjectCode,
+      yearOfStudy: a.yearOfStudy,
+      section: a.section,
+      personType: a.personType,
+      personIdentifier: a.personIdentifier,
+      personName: a.personName,
+      status: a.status,
+      serverTimestamp: a.serverTimestamp,
+    })),
+  };
+}
+

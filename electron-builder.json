@@ -1,0 +1,29 @@
+{
+  "appId": "in.ac.esec.academia",
+  "productName": "Academia-ESEC",
+  "directories": {
+    "output": "release"
+  },
+  "files": [
+    "dist/**/*",
+    "electron/**/*",
+    "public/pwa-512x512.png"
+  ],
+  "extraMetadata": {
+    "main": "electron/main.cjs"
+  },
+  "win": {
+    "target": ["nsis"],
+    "icon": "public/pwa-512x512.png"
+  },
+  "mac": {
+    "target": ["dmg"],
+    "category": "public.app-category.education",
+    "icon": "public/pwa-512x512.png"
+  },
+  "linux": {
+    "target": ["AppImage", "deb"],
+    "category": "Education",
+    "icon": "public/pwa-512x512.png"
+  }
+}

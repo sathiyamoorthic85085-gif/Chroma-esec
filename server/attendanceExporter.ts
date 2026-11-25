@@ -1,4 +1,5 @@
-import type { AttendanceRecordItem } from '../src/types.ts';
+import ExcelJS from 'exceljs';
+import type { AttendanceRecordItem, BatchComparisonPayload } from '../src/types.ts';
 
 export interface AttendanceExportMeta {
   departmentName: string;
@@ -607,4 +608,287 @@ export function buildMonthlySummaryPdfBuffer(
 
   return Buffer.from(pdf, 'utf8');
 }
+
+export async function buildAttendanceXlsxBuffer(
+  records: AttendanceRecordItem[],
+  meta: AttendanceExportMeta
+): Promise<Buffer> {
+  const wb = new ExcelJS.Workbook();
+  wb.creator = 'ChromaGrade';
+  wb.created = new Date();
+  const ws = wb.addWorksheet('Daily Attendance');
+
+  ws.addRow([
+    `ChromaGrade Daily Attendance Register — ${meta.departmentName}`,
+  ]);
+  ws.addRow([
+    `Date: ${meta.attendanceDate}`,
+    `Scope: ${meta.scopeLabel}`,
+    `Generated: ${meta.generatedAt}`,
+  ]);
+  ws.addRow([]);
+
+  const headerRow = ws.addRow([
+    'Date',
+    'Day',
+    'Period',
+    'Subject Code',
+    'Subject Name',
+    'Room',
+    'Year',
+    'Section',
+    'Role',
+    'ID / Roll No',
+    'Full Name',
+    'Status',
+    'Face Verified',
+    'Face Confidence (%)',
+    'Environment Verified',
+    'Environment Label',
+    'Verification Summary',
+    'Marked By',
+    'Server Timestamp',
+  ]);
+  headerRow.font = { bold: true };
+
+  for (const r of records) {
+    ws.addRow([
+      r.attendanceDate || meta.attendanceDate,
+      r.dayOfWeek,
+      `P${r.periodNumber}`,
+      r.subjectCode,
+      r.subjectName,
+      r.roomNo,
+      r.yearOfStudy,
+      r.section,
+      r.personType === 'faculty' ? 'Department Faculty' : 'Student',
+      r.personIdentifier,
+      r.personName,
+      r.status.toUpperCase(),
+      r.faceDetected ? 'Yes' : 'No',
+      r.faceConfidence,
+      r.environmentVerified ? 'Yes' : 'No',
+      r.environmentLabel,
+      r.verificationSummary,
+      r.markedByName,
+      r.serverTimestamp,
+    ]);
+  }
+
+  ws.columns.forEach((col) => {
+    col.width = 18;
+  });
+
+  const arrayBuffer = await wb.xlsx.writeBuffer();
+  return Buffer.from(arrayBuffer);
+}
+
+export async function buildMonthlySummaryXlsxBuffer(
+  records: AttendanceRecordItem[],
+  meta: AttendanceExportMeta & { monthLabel: string }
+): Promise<Buffer> {
+  const summaries = aggregateMonthlyIndividuals(records);
+  const wb = new ExcelJS.Workbook();
+  wb.creator = 'ChromaGrade';
+  wb.created = new Date();
+  const ws = wb.addWorksheet('Monthly Summary');
+
+  ws.addRow([`ChromaGrade Monthly Attendance Summary — ${meta.monthLabel}`]);
+  ws.addRow([
+    `Department: ${meta.departmentName}`,
+    `Scope: ${meta.scopeLabel}`,
+    `Generated: ${meta.generatedAt}`,
+  ]);
+  ws.addRow([]);
+
+  const headerRow = ws.addRow([
+    'ID / Roll No',
+    'Full Name',
+    'Role',
+    'Department',
+    'Year',
+    'Section',
+    'Days Present',
+    'Present Sessions',
+    'Late Sessions',
+    'Rejected Sessions',
+    'Total Sessions',
+    'Verification Rate (%)',
+  ]);
+  headerRow.font = { bold: true };
+
+  for (const s of summaries) {
+    ws.addRow([
+      s.personIdentifier,
+      s.personName,
+      s.personType === 'faculty' ? 'Department Faculty' : 'Student',
+      s.department,
+      s.yearOfStudy,
+      s.section,
+      s.activeDays,
+      s.presentSessions,
+      s.lateSessions,
+      s.rejectedSessions,
+      s.totalSessions,
+      s.attendanceRate,
+    ]);
+  }
+
+  ws.columns.forEach((col) => {
+    col.width = 18;
+  });
+
+  const arrayBuffer = await wb.xlsx.writeBuffer();
+  return Buffer.from(arrayBuffer);
+}
+
+export function buildBatchComparisonPdfBuffer(
+  payload: BatchComparisonPayload,
+  generatedAt: string
+): Buffer {
+  const pageWidth = 842;
+  const pageHeight = 595;
+  const cmds: string[] = [];
+
+  cmds.push('0.12 0.16 0.24 rg');
+  cmds.push(
+    `BT /F2 15 Tf 36 554 Td (${escapePdfString(
+      `ChromaGrade - Batch Comparison Summary Report (${payload.batchA.batchLabel} vs ${payload.batchB.batchLabel})`
+    )}) Tj ET`
+  );
+
+  cmds.push('0.32 0.37 0.45 rg');
+  cmds.push(
+    `BT /F1 9 Tf 36 536 Td (${escapePdfString(
+      `${payload.departmentName}  |  Exported: ${generatedAt}`
+    )}) Tj ET`
+  );
+  cmds.push('0.80 0.84 0.89 RG 0.8 w 36 524 m 806 524 l S');
+
+  // Side-by-side summary table
+  cmds.push('0.95 0.96 0.98 rg 36 498 770 20 re f');
+  cmds.push('0.18 0.22 0.30 rg');
+  cmds.push('BT /F2 9 Tf 44 505 Td (Comparison Dimension) Tj ET');
+  cmds.push(`BT /F2 9 Tf 300 505 Td (${escapePdfString(fitText(payload.batchA.batchLabel, 24))}) Tj ET`);
+  cmds.push(`BT /F2 9 Tf 540 505 Td (${escapePdfString(fitText(payload.batchB.batchLabel, 24))}) Tj ET`);
+
+  const rows: [string, string, string][] = [
+    ['Enrolled Students', String(payload.batchA.studentCount), String(payload.batchB.studentCount)],
+    [
+      'Average Attendance Rate',
+      `${payload.batchA.averageAttendanceRate.toFixed(1)}%`,
+      `${payload.batchB.averageAttendanceRate.toFixed(1)}%`,
+    ],
+    [
+      'Composite Engagement Score',
+      `${payload.batchA.academicEngagementScore.toFixed(1)} / 100`,
+      `${payload.batchB.academicEngagementScore.toFixed(1)} / 100`,
+    ],
+    [
+      'Average CGPA',
+      payload.batchA.averageCgpa !== null ? payload.batchA.averageCgpa.toFixed(2) : '-',
+      payload.batchB.averageCgpa !== null ? payload.batchB.averageCgpa.toFixed(2) : '-',
+    ],
+    [
+      'Portal & Chat Activity',
+      `${payload.batchA.portalParticipationRate}%`,
+      `${payload.batchB.portalParticipationRate}%`,
+    ],
+    [
+      'Achievement Badges Awarded',
+      String(payload.batchA.badgesCount),
+      String(payload.batchB.badgesCount),
+    ],
+    [
+      'Standing',
+      payload.batchA.standing,
+      payload.batchB.standing,
+    ],
+    [
+      '4-Wk Predictive Risk Status',
+      payload.predictiveRisk.batchA.atPredictiveRisk ? 'RISK ALERT' : 'Stable',
+      payload.predictiveRisk.batchB.atPredictiveRisk ? 'RISK ALERT' : 'Stable',
+    ],
+  ];
+
+  let y = 478;
+  rows.forEach(([label, valA, valB], idx) => {
+    if (idx % 2 === 1) {
+      cmds.push(`0.98 0.985 0.995 rg 36 ${y - 4} 770 18 re f`);
+    }
+    cmds.push('0.15 0.20 0.28 rg');
+    cmds.push(`BT /F2 8.5 Tf 44 ${y} Td (${escapePdfString(label)}) Tj ET`);
+    cmds.push(`BT /F1 8.5 Tf 300 ${y} Td (${escapePdfString(valA)}) Tj ET`);
+    cmds.push(`BT /F1 8.5 Tf 540 ${y} Td (${escapePdfString(valB)}) Tj ET`);
+    cmds.push(`0.91 0.93 0.95 RG 0.4 w 36 ${y - 4} m 806 ${y - 4} l S`);
+    y -= 22;
+  });
+
+  // 4-Week History + 2-Week Linear Regression Projection section
+  y -= 14;
+  cmds.push('0.12 0.16 0.24 rg');
+  cmds.push(
+    `BT /F2 10.5 Tf 36 ${y} Td (Weekly Attendance & 2-Week Linear Regression Forecast) Tj ET`
+  );
+  y -= 20;
+  cmds.push(`0.95 0.96 0.98 rg 36 ${y - 4} 770 18 re f`);
+  cmds.push('0.20 0.25 0.33 rg');
+  cmds.push(`BT /F2 8.5 Tf 44 ${y} Td (Week Window) Tj ET`);
+  cmds.push(`BT /F2 8.5 Tf 240 ${y} Td (Type) Tj ET`);
+  cmds.push(`BT /F2 8.5 Tf 400 ${y} Td (${escapePdfString(fitText(payload.batchA.batchLabel, 22))}) Tj ET`);
+  cmds.push(`BT /F2 8.5 Tf 600 ${y} Td (${escapePdfString(fitText(payload.batchB.batchLabel, 22))}) Tj ET`);
+  y -= 20;
+
+  for (const pt of payload.weeklySeries) {
+    const valA = pt.isProjection
+      ? `${pt.batchAProjected ?? 0}% (Projected)`
+      : `${pt.batchAAttendance ?? 0}%`;
+    const valB = pt.isProjection
+      ? `${pt.batchBProjected ?? 0}% (Projected)`
+      : `${pt.batchBAttendance ?? 0}%`;
+    cmds.push('0.15 0.20 0.28 rg');
+    cmds.push(`BT /F1 8.5 Tf 44 ${y} Td (${escapePdfString(pt.weekLabel)}) Tj ET`);
+    cmds.push(
+      `BT /F1 8.5 Tf 240 ${y} Td (${escapePdfString(
+        pt.isProjection ? 'Regression Forecast' : 'Recorded'
+      )}) Tj ET`
+    );
+    cmds.push(`BT /F1 8.5 Tf 400 ${y} Td (${escapePdfString(valA)}) Tj ET`);
+    cmds.push(`BT /F1 8.5 Tf 600 ${y} Td (${escapePdfString(valB)}) Tj ET`);
+    cmds.push(`0.91 0.93 0.95 RG 0.4 w 36 ${y - 4} m 806 ${y - 4} l S`);
+    y -= 18;
+  }
+
+  cmds.push('0.80 0.84 0.89 RG 0.6 w 36 42 m 806 42 l S');
+  cmds.push('0.42 0.47 0.55 rg');
+  cmds.push(
+    'BT /F1 8 Tf 36 28 Td (ChromaGrade Batch Comparison & Predictive Analytics Report) Tj ET'
+  );
+  cmds.push(`BT /F1 8 Tf ${pageWidth - 96} 28 Td (Page 1 of 1) Tj ET`);
+
+  const stream = cmds.join('\n');
+  const objects = [
+    '1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n',
+    '2 0 obj\n<< /Type /Pages /Kids [5 0 R] /Count 1 >>\nendobj\n',
+    '3 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n',
+    '4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>\nendobj\n',
+    `5 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${pageWidth} ${pageHeight}] /Contents 6 0 R /Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> >>\nendobj\n`,
+    `6 0 obj\n<< /Length ${Buffer.byteLength(stream, 'utf8')} >>\nstream\n${stream}\nendstream\nendobj\n`,
+  ];
+
+  let pdf = '%PDF-1.4\n';
+  const offsets: number[] = [0];
+  for (const obj of objects) {
+    offsets.push(Buffer.byteLength(pdf, 'utf8'));
+    pdf += obj;
+  }
+  const xrefPos = Buffer.byteLength(pdf, 'utf8');
+  pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  for (let i = 1; i < offsets.length; i++) {
+    pdf += `${String(offsets[i]).padStart(10, '0')} 00000 n \n`;
+  }
+  pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefPos}\n%%EOF\n`;
+  return Buffer.from(pdf, 'utf8');
+}
+
 

@@ -62,6 +62,7 @@ interface WhatsAppCommunityViewProps {
   deptStaff?: DepartmentStaff[];
   otherStaff?: OtherDepartmentStaff[];
   initialGroupId?: number | null;
+  initialSubTab?: 'chat' | 'analytics';
   incomingShare?: SharedContentPayload | null;
   onClearIncomingShare?: () => void;
   onPowerBoostChanged?: () => void;
@@ -263,6 +264,7 @@ export function WhatsAppCommunityView({
   deptStaff = [],
   otherStaff = [],
   initialGroupId = null,
+  initialSubTab = 'chat',
   incomingShare = null,
   onClearIncomingShare,
   onPowerBoostChanged,
@@ -275,10 +277,14 @@ export function WhatsAppCommunityView({
   const [searchQuery, setSearchQuery] = useState('');
   const [loading, setLoading] = useState(true);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  const [communityTab, setCommunityTab] = useState<'chat' | 'analytics'>('chat');
+  const [communityTab, setCommunityTab] = useState<'chat' | 'analytics'>(initialSubTab);
   const [statsRefreshTick, setStatsRefreshTick] = useState(0);
   const [quickBoostStats, setQuickBoostStats] =
     useState<PowerBoostEngagementSummaryData | null>(null);
+
+  useEffect(() => {
+    setCommunityTab(initialSubTab);
+  }, [initialSubTab]);
 
   // Real-time WebSocket presence, typing, & call signaling
   const [onlineUsers, setOnlineUsers] = useState<OnlineUser[]>([]);

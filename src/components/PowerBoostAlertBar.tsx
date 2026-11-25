@@ -18,6 +18,7 @@ interface PowerBoostAlertBarProps {
   refreshSignal: number;
   onOpenChat: (groupId?: number) => void;
   onAcknowledged?: (messageId: number) => void;
+  onActiveCountChange?: (count: number) => void;
 }
 
 function getSafeExternalUrl(raw: string): string | null {
@@ -70,6 +71,7 @@ export function PowerBoostAlertBar({
   refreshSignal,
   onOpenChat,
   onAcknowledged,
+  onActiveCountChange,
 }: PowerBoostAlertBarProps) {
   const [alerts, setAlerts] = useState<ActivePowerBoostAlert[]>([]);
   const [noteByMsg, setNoteByMsg] = useState<Record<number, string>>({});
@@ -98,32 +100,21 @@ export function PowerBoostAlertBar({
         if (!seenIdsRef.current.has(alert.messageId)) {
           seenIdsRef.current.add(alert.messageId);
           lastNotifiedRef.current.set(alert.messageId, now);
-          if (soundEnabled) playPowerBoostChime();
           setPulseMsgId(alert.messageId);
-          if (
-            typeof window !== 'undefined' &&
-            'Notification' in window &&
-            Notification.permission === 'granted'
-          ) {
-            try {
-              new Notification(`Power Boost · ${alert.senderName} (${alert.groupName})`, {
-                body: alert.content.slice(0, 140),
-                tag: `power-boost-${alert.messageId}`,
-              });
-            } catch {
-              // Ignore notification error
-            }
-          }
         }
       }
     } catch {
       // Ignore transient network errors
     }
-  }, [token, soundEnabled]);
+  }, [token]);
 
   useEffect(() => {
     loadActiveAlerts();
   }, [loadActiveAlerts, refreshSignal]);
+
+  useEffect(() => {
+    onActiveCountChange?.(alerts.length);
+  }, [alerts.length, onActiveCountChange]);
 
   // Lightweight background WebSocket listener so Power Boost alerts arrive & clear on ANY tab
   useEffect(() => {

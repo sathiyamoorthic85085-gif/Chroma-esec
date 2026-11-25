@@ -4,12 +4,14 @@ import {
   CalendarClock,
   Camera,
   CheckSquare,
+  FileCheck2,
   FileUp,
   GraduationCap,
   LayoutDashboard,
   LogOut,
   Menu,
   MessageSquare,
+  SlidersHorizontal,
   Users,
   UserCheck,
   X,
@@ -25,12 +27,16 @@ import {
   DepartmentStudentsView,
   OtherDepartmentStaffView,
 } from './components/HodDirectoryViews';
+import { ExportConfirmationToast } from './components/ExportConfirmationToast';
+import { OdLeaveView } from './components/OdLeaveView';
 import { OfflineIndicator } from './components/OfflineIndicator';
 import { OverviewView, type NavSection } from './components/OverviewView';
 import { PowerBoostAlertBar } from './components/PowerBoostAlertBar';
 import { PWAInstallButton } from './components/PWAInstallButton';
+import { SplashScreen } from './components/SplashScreen';
 import { TimetableView } from './components/TimetableView';
 import { WhatsAppCommunityView } from './components/WhatsAppCommunityView';
+import { WorkspaceNotificationCenter } from './components/WorkspaceNotificationCenter';
 import { useServerTime } from './hooks/useServerTime';
 import { api } from './lib/api';
 import {
@@ -61,8 +67,50 @@ export default function App() {
   const [activeSection, setActiveSection] = useState<NavSection>('overview');
   const [uploadTargetModule, setUploadTargetModule] = useState<UploadModule>('department_students');
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [showSplash, setShowSplash] = useState<boolean>(() => {
+    try {
+      return sessionStorage.getItem('academia_esec_splash_played') !== '1';
+    } catch {
+      return true;
+    }
+  });
 
-  // Incoming PWA Web Share Target payload (e.g., Instagram Reel / website shared to ChromaGrade)
+  const handleSplashComplete = useCallback(() => {
+    try {
+      sessionStorage.setItem('academia_esec_splash_played', '1');
+    } catch {
+      // Ignore storage errors
+    }
+    setShowSplash(false);
+  }, []);
+
+  // Capture incoming PWA Shortcut (?tab=communities&sub=analytics) and Web Share Target params
+  const [initialLaunchTarget] = useState<{
+    tab: NavSection | null;
+    sub: 'chat' | 'analytics';
+  }>(() => {
+    if (typeof window === 'undefined') return { tab: null, sub: 'chat' };
+    const params = new URLSearchParams(window.location.search);
+    const rawTab = params.get('tab');
+    const rawSub = params.get('sub');
+    const validTabs: NavSection[] = [
+      'overview',
+      'communities',
+      'attendance',
+      'od_leave',
+      'approvals',
+      'students',
+      'dept_staff',
+      'other_staff',
+      'advisor_class',
+      'timetable',
+      'uploads',
+    ];
+    const tab = rawTab && validTabs.includes(rawTab as NavSection) ? (rawTab as NavSection) : null;
+    const sub: 'chat' | 'analytics' = rawSub === 'analytics' ? 'analytics' : 'chat';
+    return { tab, sub };
+  });
+
   const [incomingShare, setIncomingShare] = useState<SharedContentPayload | null>(() => {
     if (typeof window === 'undefined') return null;
     const params = new URLSearchParams(window.location.search);
@@ -72,12 +120,19 @@ export default function App() {
     // Some Android apps place the URL inside share_text instead of share_url
     const extractedUrl =
       rawUrl || (text.match(/https?:\/\/[^\s<>"]+/)?.[0] ?? '');
+    if (params.has('tab') || params.has('sub') || title || text || extractedUrl) {
+      window.history.replaceState({}, '', window.location.pathname);
+    }
     if (!title && !text && !extractedUrl) return null;
-    window.history.replaceState({}, '', window.location.pathname);
     return { title, text, url: extractedUrl };
   });
   const [targetChatGroupId, setTargetChatGroupId] = useState<number | null>(null);
+  const [communityInitialSubTab, setCommunityInitialSubTab] = useState<'chat' | 'analytics'>(
+    initialLaunchTarget.sub
+  );
   const [powerBoostRefreshSignal, setPowerBoostRefreshSignal] = useState(0);
+  const [activePowerBoostCount, setActivePowerBoostCount] = useState(0);
+  const [activeFacultyDelayCount, setActiveFacultyDelayCount] = useState(0);
 
   // Academic dataset state
   const [students, setStudents] = useState<DepartmentStudent[]>([]);
@@ -88,6 +143,13 @@ export default function App() {
   const [registrations, setRegistrations] = useState<UserProfile[]>([]);
   const [intimations, setIntimations] = useState<EmailIntimation[]>([]);
   const [dataLoading, setDataLoading] = useState(false);
+
+  // Transit buffer settings state
+  const [transitSettingsOpen, setTransitSettingsOpen] = useState(false);
+  const [transitBufferInput, setTransitBufferInput] = useState<number>(15);
+  const [savingTransit, setSavingTransit] = useState(false);
+  const [transitError, setTransitError] = useState<string | null>(null);
+  const [transitSavedMsg, setTransitSavedMsg] = useState<string | null>(null);
 
   const { serverTime, displayTime, refreshServerTime } = useServerTime();
 
@@ -137,8 +199,13 @@ export default function App() {
   const handleAuthenticated = (newToken: string, newUser: UserProfile) => {
     setToken(newToken);
     setUser(newUser);
+    setTransitBufferInput(newUser.transitBufferMinutes ?? 15);
     if (incomingShare) {
+      setCommunityInitialSubTab('chat');
       setActiveSection('communities');
+    } else if (initialLaunchTarget.tab) {
+      setCommunityInitialSubTab(initialLaunchTarget.sub);
+      setActiveSection(initialLaunchTarget.tab);
     } else if (newUser.role === 'class_advisor') {
       setActiveSection('advisor_class');
     } else {
@@ -152,8 +219,37 @@ export default function App() {
     }
     setToken(null);
     setUser(null);
+    setActivePowerBoostCount(0);
     setActiveSection('overview');
     setMobileMenuOpen(false);
+    setTransitSettingsOpen(false);
+  };
+
+  const handleOpenTransitSettings = () => {
+    setTransitBufferInput(user?.transitBufferMinutes ?? 15);
+    setTransitError(null);
+    setTransitSavedMsg(null);
+    setTransitSettingsOpen(true);
+    setMobileMenuOpen(false);
+  };
+
+  const handleSaveTransitSettings = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!token) return;
+    setSavingTransit(true);
+    setTransitError(null);
+    setTransitSavedMsg(null);
+    try {
+      const clamped = Math.min(60, Math.max(0, Math.round(Number(transitBufferInput) || 0)));
+      const res = await api.updateProfileSettings(token, { transitBufferMinutes: clamped });
+      setUser(res.user);
+      setTransitBufferInput(res.user.transitBufferMinutes ?? clamped);
+      setTransitSavedMsg(`Transit buffer updated to ${res.user.transitBufferMinutes ?? clamped} min.`);
+    } catch (err) {
+      setTransitError(err instanceof Error ? err.message : 'Unable to save transit buffer.');
+    } finally {
+      setSavingTransit(false);
+    }
   };
 
   const openUploadFor = (mod: UploadModule) => {
@@ -167,6 +263,48 @@ export default function App() {
     [registrations]
   );
 
+  // Native OS App Icon Badging (iOS Home Screen, Android Launcher, Windows/macOS Dock)
+  useEffect(() => {
+    const navWithBadge = navigator as Navigator & {
+      setAppBadge?: (count?: number) => Promise<void>;
+      clearAppBadge?: () => Promise<void>;
+    };
+    if (!navWithBadge.setAppBadge && !navWithBadge.clearAppBadge) return;
+
+    const totalBadge =
+      (user ? activePowerBoostCount + activeFacultyDelayCount : 0) +
+      (user?.role === 'hod' ? pendingApprovalsCount : 0);
+
+    if (totalBadge > 0) {
+      navWithBadge.setAppBadge?.(totalBadge).catch(() => {});
+    } else {
+      navWithBadge.clearAppBadge?.().catch(() => {});
+    }
+  }, [user, activePowerBoostCount, activeFacultyDelayCount, pendingApprovalsCount]);
+
+  // Desktop App Keyboard Navigation (Alt+1..4)
+  useEffect(() => {
+    if (!user) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (!e.altKey || e.ctrlKey || e.metaKey) return;
+      if (e.key === '1') {
+        e.preventDefault();
+        setActiveSection(user.role === 'class_advisor' ? 'advisor_class' : 'overview');
+      } else if (e.key === '2') {
+        e.preventDefault();
+        setActiveSection('communities');
+      } else if (e.key === '3') {
+        e.preventDefault();
+        setActiveSection('attendance');
+      } else if (e.key === '4') {
+        e.preventDefault();
+        setActiveSection('timetable');
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [user]);
+
   const navItems: NavItem[] = useMemo(() => {
     if (!user) return [];
 
@@ -175,6 +313,7 @@ export default function App() {
         { id: 'overview', label: 'HOD Overview', icon: LayoutDashboard },
         { id: 'communities', label: 'Communities & Chat', icon: MessageSquare },
         { id: 'attendance', label: 'Camera Attendance', icon: Camera },
+        { id: 'od_leave', label: 'OD & Leave Permission', icon: FileCheck2 },
         {
           id: 'approvals',
           label: 'Approvals & Emails',
@@ -195,6 +334,7 @@ export default function App() {
         { id: 'advisor_class', label: 'Students & Class Reps', icon: UserCheck },
         { id: 'communities', label: 'Communities & Chat', icon: MessageSquare },
         { id: 'attendance', label: 'Camera Attendance', icon: Camera },
+        { id: 'od_leave', label: 'OD & Leave Permission', icon: FileCheck2 },
         { id: 'timetable', label: 'Server-Time Timetable', icon: CalendarClock },
         { id: 'uploads', label: 'Upload & Manual Entry', icon: FileUp },
         { id: 'dept_staff', label: 'Department Staff', icon: Users },
@@ -208,6 +348,7 @@ export default function App() {
         { id: 'overview', label: 'Faculty Overview', icon: LayoutDashboard },
         { id: 'communities', label: 'Communities & Chat', icon: MessageSquare },
         { id: 'attendance', label: 'Camera Attendance', icon: Camera },
+        { id: 'od_leave', label: 'OD & Leave Permission', icon: FileCheck2 },
         { id: 'timetable', label: 'Server-Time Timetable', icon: CalendarClock },
         { id: 'students', label: 'Department Students', icon: GraduationCap },
         { id: 'dept_staff', label: 'Department Staff', icon: Users },
@@ -220,6 +361,7 @@ export default function App() {
       { id: 'overview', label: 'Student Overview', icon: LayoutDashboard },
       { id: 'communities', label: 'Communities & Chat', icon: MessageSquare },
       { id: 'attendance', label: 'Camera Attendance', icon: Camera },
+      { id: 'od_leave', label: 'OD & Leave Permission', icon: FileCheck2 },
       { id: 'timetable', label: 'Class Timetable', icon: CalendarClock },
       { id: 'advisor_class', label: 'Class Reps & Roster', icon: UserCheck },
       { id: 'dept_staff', label: 'Department Faculty', icon: Users },
@@ -229,11 +371,14 @@ export default function App() {
 
   if (!token || !user) {
     return (
-      <AuthPortal
-        serverTime={serverTime}
-        displayTime={displayTime}
-        onAuthenticated={handleAuthenticated}
-      />
+      <>
+        {showSplash && <SplashScreen onComplete={handleSplashComplete} />}
+        <AuthPortal
+          serverTime={serverTime}
+          displayTime={displayTime}
+          onAuthenticated={handleAuthenticated}
+        />
+      </>
     );
   }
 
@@ -241,6 +386,7 @@ export default function App() {
     overview: user.role === 'hod' ? 'HOD Overview' : 'Academic Overview',
     communities: 'Department Communities & Live Messaging',
     attendance: 'Daily Dual-Camera Timetable Attendance',
+    od_leave: 'OD & Leave Permission Portal',
     approvals: 'Registration Approvals & Email Intimations',
     students: 'Department Students Directory',
     dept_staff: 'Department Staff Directory',
@@ -266,10 +412,19 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-slate-50 flex">
+      {showSplash && <SplashScreen onComplete={handleSplashComplete} />}
       {/* Desktop Sidebar */}
       <aside className="hidden lg:flex lg:flex-col lg:w-64 lg:shrink-0 bg-white border-r border-slate-200">
-        <div className="h-16 px-6 flex items-center border-b border-slate-200">
-          <ChromaGradeMark size="md" />
+        <div className="h-16 px-5 flex items-center border-b border-slate-200">
+          <button
+            type="button"
+            onClick={() => setShowSplash(true)}
+            title="Replay Academia-ESEC intro animation"
+            aria-label="Replay Academia-ESEC intro animation"
+            className="text-left hover:opacity-90 transition-opacity focus:outline-none"
+          >
+            <ChromaGradeMark size="md" showSubline />
+          </button>
         </div>
 
         <nav className="flex-1 px-3 py-4 space-y-1 overflow-y-auto" aria-label="Workspace navigation">
@@ -315,6 +470,19 @@ export default function App() {
             </div>
           </div>
           <PWAInstallButton variant="sidebar" />
+          <button
+            type="button"
+            onClick={handleOpenTransitSettings}
+            className="w-full inline-flex items-center justify-between gap-2 px-3 py-2 min-h-[38px] text-xs font-medium text-slate-700 border border-slate-200 hover:bg-slate-50 rounded-lg transition-colors whitespace-nowrap"
+          >
+            <span className="inline-flex items-center gap-2">
+              <SlidersHorizontal className="w-3.5 h-3.5 text-slate-500" />
+              Transit Buffer
+            </span>
+            <span className="font-mono tabular-nums text-slate-500">
+              {user.transitBufferMinutes ?? 15}m
+            </span>
+          </button>
           <button
             type="button"
             onClick={handleSignOut}
@@ -389,6 +557,19 @@ export default function App() {
               <PWAInstallButton variant="sidebar" />
               <button
                 type="button"
+                onClick={handleOpenTransitSettings}
+                className="w-full inline-flex items-center justify-between gap-2 px-3 py-2.5 min-h-[44px] text-xs font-medium text-slate-700 border border-slate-200 rounded-lg"
+              >
+                <span className="inline-flex items-center gap-2">
+                  <SlidersHorizontal className="w-3.5 h-3.5 text-slate-500" />
+                  Transit Buffer
+                </span>
+                <span className="font-mono tabular-nums text-slate-500">
+                  {user.transitBufferMinutes ?? 15}m
+                </span>
+              </button>
+              <button
+                type="button"
                 onClick={handleSignOut}
                 className="w-full inline-flex items-center justify-center gap-2 px-3 py-2.5 min-h-[44px] text-xs font-medium text-slate-700 border border-slate-300 rounded-lg"
               >
@@ -436,9 +617,23 @@ export default function App() {
                 <span>{serverTime?.academicTimezone ?? 'Server'}</span>
               </div>
 
-              <div className="lg:hidden">
-                <PWAInstallButton compact />
-              </div>
+              <WorkspaceNotificationCenter
+                token={token}
+                user={user}
+                activeSection={activeSection}
+                onOpenChat={(groupId) => {
+                  if (groupId) setTargetChatGroupId(groupId);
+                  setCommunityInitialSubTab('chat');
+                  setActiveSection('communities');
+                }}
+                onOpenTimetable={() => setActiveSection('timetable')}
+                onOpenOdLeave={() => setActiveSection('od_leave')}
+                onOpenAttendance={() => setActiveSection('attendance')}
+                onOpenOverview={() => setActiveSection('overview')}
+                onFacultyDelayCountChange={setActiveFacultyDelayCount}
+              />
+
+              <PWAInstallButton compact />
 
               {canUpload && activeSection !== 'uploads' && (
                 <button
@@ -461,13 +656,15 @@ export default function App() {
           refreshSignal={powerBoostRefreshSignal}
           onOpenChat={(groupId) => {
             if (groupId) setTargetChatGroupId(groupId);
+            setCommunityInitialSubTab('chat');
             setActiveSection('communities');
           }}
           onAcknowledged={() => setPowerBoostRefreshSignal((n) => n + 1)}
+          onActiveCountChange={setActivePowerBoostCount}
         />
 
         {/* Main Content Viewport */}
-        <main className="flex-1 p-4 sm:p-8 pb-24 lg:pb-8 max-w-[1440px] w-full mx-auto">
+        <main className="flex-1 p-4 sm:p-8 pb-24 lg:pb-8 pl-safe pr-safe max-w-[1440px] w-full mx-auto">
           {dataLoading && students.length === 0 ? (
             <div className="bg-white border border-slate-200 rounded-lg p-10 text-center text-sm text-slate-500">
               Loading ChromaGrade department records...
@@ -500,6 +697,7 @@ export default function App() {
                   deptStaff={deptStaff}
                   otherStaff={otherStaff}
                   initialGroupId={targetChatGroupId}
+                  initialSubTab={communityInitialSubTab}
                   incomingShare={incomingShare}
                   onClearIncomingShare={() => setIncomingShare(null)}
                   onPowerBoostChanged={() => setPowerBoostRefreshSignal((n) => n + 1)}
@@ -514,6 +712,15 @@ export default function App() {
                   deptStaff={deptStaff}
                   serverTime={serverTime}
                   displayTime={displayTime}
+                />
+              )}
+
+              {activeSection === 'od_leave' && (
+                <OdLeaveView
+                  token={token}
+                  user={user}
+                  serverTime={serverTime}
+                  onAttendanceUpdated={() => loadWorkspaceData(token, user)}
                 />
               )}
 
@@ -639,6 +846,104 @@ export default function App() {
         </div>
       </nav>
 
+      {transitSettingsOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/50"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Transit Buffer Profile Settings"
+        >
+          <div className="bg-white border border-slate-200 rounded-lg w-full max-w-md overflow-hidden">
+            <div className="px-6 py-4 border-b border-slate-200 flex items-center justify-between gap-4">
+              <div>
+                <h3 className="text-sm font-semibold text-slate-900">
+                  Faculty Transit Buffer Settings
+                </h3>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Automatically extends your busy window between consecutive sessions in different rooms
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setTransitSettingsOpen(false)}
+                className="p-1.5 text-slate-500 hover:text-slate-900 rounded-lg"
+                aria-label="Close transit buffer settings"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <form onSubmit={handleSaveTransitSettings} className="p-6 space-y-4">
+              <div>
+                <div className="flex items-center justify-between text-xs mb-2">
+                  <label htmlFor="transit-buffer-range" className="font-medium text-slate-800">
+                    Transit Buffer Duration
+                  </label>
+                  <span className="font-mono font-semibold tabular-nums text-indigo-700">
+                    {transitBufferInput} minutes
+                  </span>
+                </div>
+                <input
+                  id="transit-buffer-range"
+                  type="range"
+                  min={0}
+                  max={60}
+                  step={5}
+                  value={transitBufferInput}
+                  onChange={(e) => setTransitBufferInput(Number(e.target.value))}
+                  className="w-full accent-indigo-700"
+                />
+                <div className="mt-2 flex items-center justify-between text-[11px] text-slate-500 font-mono tabular-nums">
+                  <span>0 min</span>
+                  <span>15 min (default)</span>
+                  <span>60 min</span>
+                </div>
+              </div>
+
+              <div>
+                <label htmlFor="transit-buffer-number" className="block text-xs text-slate-600 mb-1">
+                  Exact Minutes (0–60)
+                </label>
+                <input
+                  id="transit-buffer-number"
+                  type="number"
+                  min={0}
+                  max={60}
+                  value={transitBufferInput}
+                  onChange={(e) => setTransitBufferInput(Number(e.target.value))}
+                  className="w-full px-3 py-2 text-xs font-mono tabular-nums border border-slate-300 rounded-lg bg-white text-slate-900 focus:outline-none focus:border-indigo-700"
+                />
+              </div>
+
+              {transitError && <div className="text-xs text-rose-700">{transitError}</div>}
+              {transitSavedMsg && (
+                <div className="text-xs text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2">
+                  {transitSavedMsg}
+                </div>
+              )}
+
+              <div className="flex items-center justify-end gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setTransitSettingsOpen(false)}
+                  className="px-3.5 py-2 text-xs font-medium text-slate-700 border border-slate-300 hover:bg-slate-50 rounded-lg"
+                >
+                  Close
+                </button>
+                <button
+                  type="submit"
+                  disabled={savingTransit}
+                  className="px-4 py-2 text-xs font-medium text-white bg-indigo-700 hover:bg-indigo-800 disabled:opacity-60 rounded-lg"
+                >
+                  {savingTransit ? 'Saving...' : 'Save Buffer'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      <ExportConfirmationToast />
       <OfflineIndicator />
     </div>
   );

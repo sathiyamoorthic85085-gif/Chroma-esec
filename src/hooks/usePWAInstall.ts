@@ -7,16 +7,36 @@ interface BeforeInstallPromptEvent extends Event {
 
 export type DevicePlatform = 'ios' | 'android' | 'desktop';
 
+function detectOsLabel(platform: DevicePlatform, ua: string): string {
+  if (platform === 'ios') return /ipad/.test(ua) ? 'iPadOS' : 'iOS';
+  if (platform === 'android') return 'Android';
+  if (/macintosh|mac os x/.test(ua)) return 'macOS';
+  if (/windows/.test(ua)) return 'Windows';
+  if (/cros/.test(ua)) return 'ChromeOS';
+  if (/linux/.test(ua)) return 'Linux';
+  return 'Desktop';
+}
+
 export function usePWAInstall() {
   const [deferredPrompt, setDeferredPrompt] = useState<BeforeInstallPromptEvent | null>(null);
   const [isInstalled, setIsInstalled] = useState(false);
   const [platform, setPlatform] = useState<DevicePlatform>('desktop');
+  const [osLabel, setOsLabel] = useState('Desktop');
+  const [isInIframe, setIsInIframe] = useState(false);
+  const [swActive, setSwActive] = useState(false);
 
   useEffect(() => {
     const isStandalone =
       window.matchMedia('(display-mode: standalone)').matches ||
+      window.matchMedia('(display-mode: window-controls-overlay)').matches ||
       (window.navigator as unknown as { standalone?: boolean }).standalone === true;
     setIsInstalled(isStandalone);
+
+    try {
+      setIsInIframe(window.self !== window.top);
+    } catch {
+      setIsInIframe(true);
+    }
 
     const ua = window.navigator.userAgent.toLowerCase();
     const isIOSDevice =
@@ -24,12 +44,21 @@ export function usePWAInstall() {
       (window.navigator.platform === 'MacIntel' && window.navigator.maxTouchPoints > 1);
     const isAndroidDevice = /android/.test(ua);
 
-    if (isIOSDevice) {
-      setPlatform('ios');
-    } else if (isAndroidDevice) {
-      setPlatform('android');
-    } else {
-      setPlatform('desktop');
+    const detected: DevicePlatform = isIOSDevice
+      ? 'ios'
+      : isAndroidDevice
+      ? 'android'
+      : 'desktop';
+    setPlatform(detected);
+    setOsLabel(detectOsLabel(detected, ua));
+
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker
+        .getRegistration()
+        .then((reg) => {
+          setSwActive(Boolean(reg?.active || reg?.installing || reg?.waiting));
+        })
+        .catch(() => {});
     }
 
     const handleBeforeInstallPrompt = (e: Event) => {
@@ -79,6 +108,9 @@ export function usePWAInstall() {
     isIOS: platform === 'ios',
     isAndroid: platform === 'android',
     platform,
+    osLabel,
+    isInIframe,
+    swActive,
     install,
   };
 }
